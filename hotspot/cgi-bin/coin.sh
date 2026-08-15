@@ -204,10 +204,22 @@ if [ "$ACTION" = "config" ]; then
         fi
     fi
 
-    if [ -f /tmp/coin_enabled ]; then
+    # Same "don't disrupt an in-flight session" logic as the start action: only
+    # report the coin feature as unavailable over a missing internet
+    # connection when this client has no active/pending session of its own to
+    # resume — otherwise the frontend's checkCoinEnabled() would treat a
+    # real, already-paid session as nonexistent (enabled:false skips its
+    # resume/pending handling entirely) during a brief outage.
+    NO_INET_BLOCK="false"
+    if [ "${COIN_REQUIRE_INTERNET:-0}" = "1" ] && [ ! -f "${INTERNET_UP_FILE:-/tmp/internet_up}" ] \
+        && [ "$RESUME_FLAG" != "true" ] && [ "$PENDING_FLAG" != "true" ]; then
+        NO_INET_BLOCK="true"
+    fi
+
+    if [ -f /tmp/coin_enabled ] && [ "$NO_INET_BLOCK" != "true" ]; then
         SUSPENDED_FLAG="false"
         COOLDOWN_REMAINING=0
-        if [ -n "$CLIENT_MAC" ] && [ -f /tmp/coin_strikes.txt ]; then
+        if [ "${COIN_STRIKE_ENABLED:-1}" = "1" ] && [ -n "$CLIENT_MAC" ] && [ -f /tmp/coin_strikes.txt ]; then
             SUSP_DATA=$($BB grep "^$CLIENT_MAC " /tmp/coin_strikes.txt 2>/dev/null)
             if [ -n "$SUSP_DATA" ]; then
                 SUSP_STRIKES=$(printf '%s' "$SUSP_DATA" | $BB awk '{print $2}')
@@ -263,20 +275,22 @@ start)
     touch /tmp/coin_strikes.txt
 
     # --- DoS PREVENTION 3: ANTI-GRIEFING STRIKE SYSTEM ---
-    STRIKE_DATA=$($BB grep "^$CLIENT_MAC " /tmp/coin_strikes.txt 2>/dev/null)
-    if [ -n "$STRIKE_DATA" ]; then
-        STRIKES=$(printf '%s' "$STRIKE_DATA" | $BB awk '{print $2}')
-        LAST_STRIKE=$(printf '%s' "$STRIKE_DATA" | $BB awk '{print $3}')
-        _ST=${COIN_STRIKE_THRESHOLD:-3}
-        _CD=${COIN_COOLDOWN:-300}
-        if [ "$STRIKES" -ge "$_ST" ]; then
-            _SINCE=$(( NOW - LAST_STRIKE ))
-            if [ "$_SINCE" -lt "$_CD" ]; then
-                _WAIT_MINS=$(( (_CD - _SINCE + 59) / 60 ))
-                _err "Temporarily suspended. Please wait ${_WAIT_MINS} more minute(s)."
-            else
-                $BB grep -v "^$CLIENT_MAC " /tmp/coin_strikes.txt > /tmp/cs.tmp 2>/dev/null
-                $BB mv /tmp/cs.tmp /tmp/coin_strikes.txt
+    if [ "${COIN_STRIKE_ENABLED:-1}" = "1" ]; then
+        STRIKE_DATA=$($BB grep "^$CLIENT_MAC " /tmp/coin_strikes.txt 2>/dev/null)
+        if [ -n "$STRIKE_DATA" ]; then
+            STRIKES=$(printf '%s' "$STRIKE_DATA" | $BB awk '{print $2}')
+            LAST_STRIKE=$(printf '%s' "$STRIKE_DATA" | $BB awk '{print $3}')
+            _ST=${COIN_STRIKE_THRESHOLD:-3}
+            _CD=${COIN_COOLDOWN:-300}
+            if [ "$STRIKES" -ge "$_ST" ]; then
+                _SINCE=$(( NOW - LAST_STRIKE ))
+                if [ "$_SINCE" -lt "$_CD" ]; then
+                    _WAIT_MINS=$(( (_CD - _SINCE + 59) / 60 ))
+                    _err "Temporarily suspended. Please wait ${_WAIT_MINS} more minute(s)."
+                else
+                    $BB grep -v "^$CLIENT_MAC " /tmp/coin_strikes.txt > /tmp/cs.tmp 2>/dev/null
+                    $BB mv /tmp/cs.tmp /tmp/coin_strikes.txt
+                fi
             fi
         fi
     fi
@@ -376,6 +390,16 @@ start)
                 "/tmp/coin_sessions/${LOCK_SID}.miss" "/tmp/coin_sessions/${LOCK_SID}.amt" \
                 "/tmp/coin_sessions/${LOCK_SID}.rem"
         fi
+    fi
+
+    # If we get here, this request isn't resuming/pending/cancelling an
+    # existing lock of ours (those branches above all _ok/_err and exit
+    # before reaching this point) — it's about to open a brand new session
+    # or queue for one. Gate that specifically on internet connectivity so
+    # an outage never interrupts coins someone already has in flight, only
+    # blocks new ones from starting.
+    if [ "${COIN_REQUIRE_INTERNET:-0}" = "1" ] && [ ! -f "${INTERNET_UP_FILE:-/tmp/internet_up}" ]; then
+        _err "No internet connection. Coin insertion is temporarily unavailable."
     fi
 
     # 3. Check Queue & Determine Flow

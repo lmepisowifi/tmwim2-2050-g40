@@ -264,20 +264,22 @@ else
 fi
 
 if [ "${AMOUNT:-0}" -eq 0 ]; then
-    STRIKES=$($BB grep "^$CLIENT_MAC " /tmp/coin_strikes.txt 2>/dev/null | $BB awk '{print $2}')
-    STRIKES=$(( ${STRIKES:-0} + 1 ))
-    $BB grep -v "^$CLIENT_MAC " /tmp/coin_strikes.txt > /tmp/cs.tmp 2>/dev/null
-    printf '%s %s %s\n' "$CLIENT_MAC" "$STRIKES" "$NOW" >> /tmp/cs.tmp
-    $BB mv /tmp/cs.tmp /tmp/coin_strikes.txt
+    if [ "${COIN_STRIKE_ENABLED:-1}" = "1" ]; then
+        STRIKES=$($BB grep "^$CLIENT_MAC " /tmp/coin_strikes.txt 2>/dev/null | $BB awk '{print $2}')
+        STRIKES=$(( ${STRIKES:-0} + 1 ))
+        $BB grep -v "^$CLIENT_MAC " /tmp/coin_strikes.txt > /tmp/cs.tmp 2>/dev/null
+        printf '%s %s %s\n' "$CLIENT_MAC" "$STRIKES" "$NOW" >> /tmp/cs.tmp
+        $BB mv /tmp/cs.tmp /tmp/coin_strikes.txt
 
-    # Notify once when suspension is first triggered (strikes exactly == threshold)
-    _ST=${COIN_STRIKE_THRESHOLD:-3}
-    _CD=${COIN_COOLDOWN:-300}
-    if [ "$STRIKES" -eq "$_ST" ]; then
-        _CD_MINS=$(( _CD / 60 ))
-        _SUSP_MSG=$(tpl_render "$TPL_ANTI_TROLL" \
-            mac "$CLIENT_MAC" strikes "$STRIKES" strikemax "$_ST" cooldownmins "$_CD_MINS")
-        ( /lmepisowifi/hotspot/notify.sh "$_SUSP_MSG" "" anti_troll >/dev/null 2>&1 </dev/null & )
+        # Notify once when suspension is first triggered (strikes exactly == threshold)
+        _ST=${COIN_STRIKE_THRESHOLD:-3}
+        _CD=${COIN_COOLDOWN:-300}
+        if [ "$STRIKES" -eq "$_ST" ]; then
+            _CD_MINS=$(( _CD / 60 ))
+            _SUSP_MSG=$(tpl_render "$TPL_ANTI_TROLL" \
+                mac "$CLIENT_MAC" strikes "$STRIKES" strikemax "$_ST" cooldownmins "$_CD_MINS")
+            ( /lmepisowifi/hotspot/notify.sh "$_SUSP_MSG" "" anti_troll >/dev/null 2>&1 </dev/null & )
+        fi
     fi
 
     printf '0 0\n' > "$RESULT_PATH"

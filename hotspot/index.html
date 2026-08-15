@@ -1707,12 +1707,16 @@ function doLogin() {
       document.getElementById('login-code').value = '';
       show('v-status');
       checkStatus();
+    } else if (d.error === 'voucher_suspended') {
+      var vmins = d.wait_minutes || 1;
+      toastr.error('Too many wrong voucher codes. Please wait ' + vmins + ' more minute' + (vmins !== 1 ? 's' : '') + '.');
     } else {
       var msgs = {
         no_mac:    "Can't detect your device MAC yet — wait a few seconds and try again.",
         no_voucher:'Please enter a voucher code.',
         invalid:   'Invalid or already-used voucher code.',
         expired:   'This voucher has expired and can no longer be redeemed.',
+        no_internet:'No internet connection right now — voucher redemption is temporarily unavailable.',
         cooldown:'Too many attempts. Please wait a moment.'
       };
       toastr.error(msgs[d.error] || 'Something went wrong — please try again.');
@@ -1743,11 +1747,15 @@ function doAddTime() {
           ? '\u2714\ufe0f Time stacked! ' + fmtCountdown(d.remaining) + ' remaining total.'
           : '\u2714\ufe0f Connected! '    + fmtCountdown(d.remaining) + ' remaining.'
       );
+    } else if (d.error === 'voucher_suspended') {
+      var vmins2 = d.wait_minutes || 1;
+      toastr.error('Too many wrong voucher codes. Please wait ' + vmins2 + ' more minute' + (vmins2 !== 1 ? 's' : '') + '.');
     } else {
       var msgs = {
         no_mac:  "Can't detect your device MAC.",
         invalid: 'Invalid or already-used voucher code.',
         expired: 'This voucher has expired.',
+        no_internet:'No internet connection right now — voucher redemption is temporarily unavailable.',
         cooldown:'Too many attempts. Please wait a moment.'
       };
       toastr.error(msgs[d.error] || 'Error — please try again.');

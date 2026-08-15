@@ -193,6 +193,18 @@
             </div>
         </div>
         <div class="card-body">
+            <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+                <div style="min-width:0;">
+                    <div style="font-weight:500;">Anti-Troll Suspension</div>
+                    <div class="field-hint">Temporarily suspend a device that inserts the coin slot but drops no coins, repeatedly.</div>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                    <span id="cs-badge" class="at-badge on">On</span>
+                    <div id="cs-toggle" class="wlan-toggle" onclick="toggleCoinStrike()" title="Toggle coin anti-troll suspension">
+                        <div class="wlan-toggle-knob"></div>
+                    </div>
+                </div>
+            </div>
             <div class="row g-3">
                 <div class="col-sm-6">
                     <label class="form-label">Coin Session Timeout <span class="field-hint d-inline">(seconds)</span></label>
@@ -213,6 +225,73 @@
             <div class="d-flex gap-2 flex-wrap">
                 <button class="btn btn-primary" onclick="saveCoin()">Save Coin Settings</button>
                 <button class="btn btn-outline-secondary" onclick="loadConfig()">Discard</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══ Voucher Suspension ═══ -->
+    <div class="card mb-3">
+        <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <span>Voucher Suspension</span>
+            <div class="d-flex align-items-center gap-2">
+                <span id="vs-badge" class="at-badge off">Off</span>
+                <div id="vs-toggle" class="wlan-toggle" onclick="toggleVoucherStrike()" title="Toggle wrong-voucher suspension">
+                    <div class="wlan-toggle-knob"></div>
+                </div>
+            </div>
+        </div>
+        <div class="card-body">
+            <div class="field-hint mb-2">Temporarily blocks a device from redeeming vouchers after too many wrong codes in a row.</div>
+            <div class="row g-3">
+                <div class="col-sm-6">
+                    <label class="form-label">Wrong Attempts Threshold</label>
+                    <input type="number" class="form-control" id="v-strike-threshold" placeholder="3" min="1" max="20">
+                    <div class="field-hint">Wrong voucher codes before suspension</div>
+                </div>
+                <div class="col-sm-6">
+                    <label class="form-label">Suspension Cooldown <span class="field-hint d-inline">(seconds)</span></label>
+                    <input type="number" class="form-control" id="v-cooldown" placeholder="60" min="30">
+                    <div class="field-hint">Duration of voucher suspension after threshold reached</div>
+                </div>
+            </div>
+            <hr class="my-3" style="border-color:var(--border-color);">
+            <div class="d-flex gap-2 flex-wrap">
+                <button class="btn btn-primary" onclick="saveVoucherStrike()">Save Voucher Settings</button>
+                <button class="btn btn-outline-secondary" onclick="loadConfig()">Discard</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══ Internet Requirement ═══ -->
+    <div class="card">
+        <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <span>Internet Requirement</span>
+            <span id="inet-status-badge" class="status-badge stopped"><span class="dot"></span><span id="inet-status-text">…</span></span>
+        </div>
+        <div class="card-body">
+            <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+                <div style="min-width:0;">
+                    <div style="font-weight:500;">Disable Insert Coin (no internet)</div>
+                    <div class="field-hint">Refuse to start a new coin session while the router has no internet. Coins already in a session are never interrupted.</div>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                    <span id="ci-badge" class="at-badge off">Off</span>
+                    <div id="ci-toggle" class="wlan-toggle" onclick="toggleCoinInternet()" title="Require internet to insert coins">
+                        <div class="wlan-toggle-knob"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="d-flex align-items-center justify-content-between gap-3">
+                <div style="min-width:0;">
+                    <div style="font-weight:500;">Disable Voucher Conversion (no internet)</div>
+                    <div class="field-hint">Refuse to redeem a voucher code while the router has no internet.</div>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                    <span id="vi-badge" class="at-badge off">Off</span>
+                    <div id="vi-toggle" class="wlan-toggle" onclick="toggleVoucherInternet()" title="Require internet to redeem vouchers">
+                        <div class="wlan-toggle-knob"></div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -304,10 +383,17 @@ function loadConfig(){
             document.getElementById('c-coin-timeout').value  = d.coin_timeout||'';
             document.getElementById('c-strike-threshold').value = d.coin_strike_threshold||'';
             document.getElementById('c-cooldown').value       = d.coin_cooldown||'';
+            setCoinStrikeUI(d.coin_strike_enabled===true||d.coin_strike_enabled==='1'||d.coin_strike_enabled===1);
             setCoinToggleUI(d.coin_on);
             setAntiTetherUI(d.anti_tether===true||d.anti_tether==='1'||d.anti_tether===1);
             setLanIsolateUI(d.lan_isolate===true||d.lan_isolate==='1'||d.lan_isolate===1);
             setMacFixUI(d.mac_randomization_fix===true||d.mac_randomization_fix==='1'||d.mac_randomization_fix===1);
+            setCoinInternetUI(d.coin_require_internet===true||d.coin_require_internet==='1'||d.coin_require_internet===1);
+            setVoucherInternetUI(d.voucher_require_internet===true||d.voucher_require_internet==='1'||d.voucher_require_internet===1);
+            document.getElementById('v-strike-threshold').value = d.voucher_strike_threshold||'';
+            document.getElementById('v-cooldown').value          = d.voucher_cooldown||'';
+            setVoucherStrikeUI(d.voucher_strike_enabled===true||d.voucher_strike_enabled==='1'||d.voucher_strike_enabled===1);
+            setInetStatusUI(d.internet_up===true||d.internet_up==='1'||d.internet_up===1);
         })
         .catch(function(){toastr.error('Network error loading config');});
 }
@@ -418,6 +504,25 @@ function toggleCoin(){
     });
 }
 
+/* ── Coin anti-troll suspension toggle ── */
+function setCoinStrikeUI(on){
+    var tog=document.getElementById('cs-toggle');
+    var badge=document.getElementById('cs-badge');
+    if(on){ tog.classList.add('on'); badge.textContent='On'; badge.className='at-badge on'; }
+    else  { tog.classList.remove('on'); badge.textContent='Off'; badge.className='at-badge off'; }
+}
+function toggleCoinStrike(){
+    var tog=document.getElementById('cs-toggle');
+    if(tog.classList.contains('busy')) return;
+    var newVal=tog.classList.contains('on')?0:1;
+    tog.classList.add('busy');
+    postForm('coin_strike_set','enabled='+newVal,function(d){
+        tog.classList.remove('busy');
+        if(d.ok){ setCoinStrikeUI(d.coin_strike_enabled); toastr.success('Coin anti-troll suspension '+(d.coin_strike_enabled?'enabled':'disabled')); }
+        else toastr.error('Failed: '+(d.error||'unknown'));
+    });
+}
+
 function saveCoin(){
     var p={
         coin_timeout:   document.getElementById('c-coin-timeout').value.trim(),
@@ -429,6 +534,81 @@ function saveCoin(){
         +'&coin_strike_threshold='+encodeURIComponent(p.coin_strike_threshold)
         +'&coin_cooldown='+encodeURIComponent(p.coin_cooldown);
     postForm('config_set',body,function(d){hideOverlay();if(d.ok)toastr.success('Coin settings saved');else toastr.error('Save failed: '+(d.error||''));});
+}
+
+/* ── Voucher suspension toggle ── */
+function setVoucherStrikeUI(on){
+    var tog=document.getElementById('vs-toggle');
+    var badge=document.getElementById('vs-badge');
+    if(on){ tog.classList.add('on'); badge.textContent='On'; badge.className='at-badge on'; }
+    else  { tog.classList.remove('on'); badge.textContent='Off'; badge.className='at-badge off'; }
+}
+function toggleVoucherStrike(){
+    var tog=document.getElementById('vs-toggle');
+    if(tog.classList.contains('busy')) return;
+    var newVal=tog.classList.contains('on')?0:1;
+    tog.classList.add('busy');
+    postForm('voucher_strike_set','enabled='+newVal,function(d){
+        tog.classList.remove('busy');
+        if(d.ok){ setVoucherStrikeUI(d.voucher_strike_enabled); toastr.success('Voucher suspension '+(d.voucher_strike_enabled?'enabled':'disabled')); }
+        else toastr.error('Failed: '+(d.error||'unknown'));
+    });
+}
+function saveVoucherStrike(){
+    var p={
+        voucher_strike_threshold: document.getElementById('v-strike-threshold').value.trim(),
+        voucher_cooldown:  document.getElementById('v-cooldown').value.trim()
+    };
+    showOverlay('Saving voucher settings…');
+    var body='voucher_strike_threshold='+encodeURIComponent(p.voucher_strike_threshold)
+        +'&voucher_cooldown='+encodeURIComponent(p.voucher_cooldown);
+    postForm('config_set',body,function(d){hideOverlay();if(d.ok)toastr.success('Voucher settings saved');else toastr.error('Save failed: '+(d.error||''));});
+}
+
+/* ── Internet status (read-only indicator) ── */
+function setInetStatusUI(up){
+    var badge=document.getElementById('inet-status-badge');
+    var txt=document.getElementById('inet-status-text');
+    if(up){ badge.className='status-badge running'; txt.textContent='Online'; }
+    else  { badge.className='status-badge stopped'; txt.textContent='Offline'; }
+}
+
+/* ── Disable Insert Coin when no internet ── */
+function setCoinInternetUI(on){
+    var tog=document.getElementById('ci-toggle');
+    var badge=document.getElementById('ci-badge');
+    if(on){ tog.classList.add('on'); badge.textContent='On'; badge.className='at-badge on'; }
+    else  { tog.classList.remove('on'); badge.textContent='Off'; badge.className='at-badge off'; }
+}
+function toggleCoinInternet(){
+    var tog=document.getElementById('ci-toggle');
+    if(tog.classList.contains('busy')) return;
+    var newVal=tog.classList.contains('on')?0:1;
+    tog.classList.add('busy');
+    postForm('coin_internet_set','enabled='+newVal,function(d){
+        tog.classList.remove('busy');
+        if(d.ok){ setCoinInternetUI(d.coin_require_internet); toastr.success('Insert Coin internet requirement '+(d.coin_require_internet?'enabled':'disabled')); }
+        else toastr.error('Failed: '+(d.error||'unknown'));
+    });
+}
+
+/* ── Disable Voucher Conversion when no internet ── */
+function setVoucherInternetUI(on){
+    var tog=document.getElementById('vi-toggle');
+    var badge=document.getElementById('vi-badge');
+    if(on){ tog.classList.add('on'); badge.textContent='On'; badge.className='at-badge on'; }
+    else  { tog.classList.remove('on'); badge.textContent='Off'; badge.className='at-badge off'; }
+}
+function toggleVoucherInternet(){
+    var tog=document.getElementById('vi-toggle');
+    if(tog.classList.contains('busy')) return;
+    var newVal=tog.classList.contains('on')?0:1;
+    tog.classList.add('busy');
+    postForm('voucher_internet_set','enabled='+newVal,function(d){
+        tog.classList.remove('busy');
+        if(d.ok){ setVoucherInternetUI(d.voucher_require_internet); toastr.success('Voucher internet requirement '+(d.voucher_require_internet?'enabled':'disabled')); }
+        else toastr.error('Failed: '+(d.error||'unknown'));
+    });
 }
 
 /* ── Shared fetch helper ── */

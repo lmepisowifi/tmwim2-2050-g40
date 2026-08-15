@@ -296,6 +296,108 @@ _dhcp_renormalize_ips() {
         $BB mv /tmp/nm_renorm.tmp "$NODEMCU_EXTRA_FILE"; sync
     fi
 }
+# ── DHCP dynamic lease helpers (leases page: list/renew/delete) ────────────
+# busybox udhcpd's lease file is a binary struct dump (see upstream
+# networking/udhcp/dhcpd.h):
+#   [8-byte big-endian "written_at" unix time]
+#   then repeating 36-byte records: expires(4,BE) + lease_nip(4,BE) +
+#   mac(6) + hostname(20) + pad(2)
+# "expires" on disk is REMAINING seconds as of written_at, not absolute
+# time (busybox rewrites it that way on every flush so a device with no
+# RTC across reboots doesn't lose leases). We never trust this layout
+# blind: every write below is cross-checked against `busybox dumpleases`
+# (the same binary's own parser) before a byte is touched, and falls back
+# to "unsupported"/"not_found" rather than risk corrupting the file.
+LEASES_FILE="/tmp/udhcpd.leases"
+LEASE_REC_SIZE=36
+
+# Is $1 a compiled-in busybox applet? (bare `busybox` lists its applets.)
+_bb_has() { $BB 2>&1 | $BB grep -qw "$1"; }
+
+# Lowercase, colon-stripped MACs of every configured NodeMCU (static
+# leases) — dumpleases dumps the raw file regardless of static_lease
+# config, so a MAC that's since been pinned static can leave a stale
+# dynamic-looking row in the file. Hide those rather than offer
+# renew/delete on a unit that's actually served statically.
+_static_lease_macs() {
+    _slm="${NODEMCU_MAC:-$(read_lmehspt_var NODEMCU_MAC)}"
+    [ -n "$_slm" ] && printf '%s\n' "$_slm" | $BB tr 'A-F' 'a-f' | $BB tr -d ':'
+    [ -f "$NODEMCU_EXTRA_FILE" ] && $BB awk -F'|' '$1 ~ /^[0-9]+$/ && $4!="" {print $4}' "$NODEMCU_EXTRA_FILE" \
+        | $BB tr 'A-F' 'a-f' | $BB tr -d ':'
+}
+
+# Decimal value of the big-endian uint32 at byte offset $2 in file $1.
+_read_be32() {
+    $BB dd if="$1" bs=1 skip="$2" count=4 2>/dev/null \
+        | $BB od -An -tu1 -v \
+        | $BB awk '{print ($1*16777216)+($2*65536)+($3*256)+$4}'
+}
+
+# Overwrite the 4 bytes at byte offset $2 in file $1 with decimal value
+# $3, big-endian, in place — every other byte in the file is untouched.
+_write_be32() {
+    _wf="$1"; _woff="$2"; _wval="$3"
+    _wb0=$(( (_wval / 16777216) % 256 )); _wb1=$(( (_wval / 65536) % 256 ))
+    _wb2=$(( (_wval / 256)      % 256 )); _wb3=$(( _wval           % 256 ))
+    $BB printf "\\$(printf '%03o' "$_wb0")\\$(printf '%03o' "$_wb1")\\$(printf '%03o' "$_wb2")\\$(printf '%03o' "$_wb3")" \
+        | $BB dd of="$_wf" bs=1 seek="$_woff" count=4 conv=notrunc 2>/dev/null
+}
+
+# Lowercase hex (no separators) of the 6 MAC bytes at byte offset $2 in
+# file $1.
+_read_mac_hex() {
+    $BB dd if="$1" bs=1 skip="$2" count=6 2>/dev/null | $BB od -An -tx1 -v | $BB tr -d ' \n'
+}
+
+# Header size in bytes: 8 for every busybox in real-world use (the
+# "written_at" format), 0 for the pre-written_at format some very old
+# builds used. Empty = file size doesn't cleanly divide either way —
+# treat as unreadable rather than guess.
+_lease_header_size() {
+    _lfsz=$($BB wc -c < "$LEASES_FILE" 2>/dev/null); _lfsz=${_lfsz:-0}
+    [ "$_lfsz" -eq 0 ] && { printf ''; return; }
+    if [ "$_lfsz" -ge 8 ] && [ $(( (_lfsz - 8) % LEASE_REC_SIZE )) -eq 0 ]; then
+        printf '8'
+    elif [ $(( _lfsz % LEASE_REC_SIZE )) -eq 0 ]; then
+        printf '0'
+    else
+        printf ''
+    fi
+}
+
+# Dedicated lock for lease-file edits — separate from the session _lock
+# above (a different resource; sharing that one would serialize unrelated
+# kicks/add_time calls behind a udhcpd restart for no reason).
+_dhcp_lease_unlock() { rm -f /tmp/hotspot_dhcp_lease.lock/pid 2>/dev/null; rmdir /tmp/hotspot_dhcp_lease.lock 2>/dev/null; }
+_dhcp_lease_lock() {
+    _dli=0
+    while ! mkdir /tmp/hotspot_dhcp_lease.lock 2>/dev/null; do
+        if [ "$((_dli % 10))" -eq 0 ] && [ "$_dli" -gt 0 ]; then
+            _DLPID=$($BB cat /tmp/hotspot_dhcp_lease.lock/pid 2>/dev/null)
+            if [ -z "$_DLPID" ] || ! kill -0 "$_DLPID" 2>/dev/null || [ "$_dli" -ge 100 ]; then
+                rm -f /tmp/hotspot_dhcp_lease.lock/pid 2>/dev/null
+                rmdir /tmp/hotspot_dhcp_lease.lock 2>/dev/null
+            fi
+        fi
+        $BB sleep 0.1 2>/dev/null || sleep 0.1
+        _dli=$(( _dli + 1 ))
+    done
+    $BB echo $$ > /tmp/hotspot_dhcp_lease.lock/pid 2>/dev/null
+}
+
+# Kill + relaunch udhcpd WITHOUT wiping the lease file (unlike the
+# hotspot_dhcp_reload path elsewhere, which intentionally wipes every
+# lease because the pool itself moved). Caller must already have
+# `load_coin_env`'d and sourced lmehspt.sh --lib so start_dhcp() is in
+# scope.
+_dhcp_restart_preserving_leases() {
+    [ -f /tmp/hotspot_dhcp.pid ] && kill -9 "$(cat /tmp/hotspot_dhcp.pid)" 2>/dev/null
+    for _rpid in $($BB ps ww | $BB grep "hotspot_dhcp.conf" | $BB grep -v grep | $BB awk '{print $1}'); do
+        kill -9 "$_rpid" 2>/dev/null
+    done
+    start_dhcp
+}
+
 LMEHSPT="/lmepisowifi/lmehspt.sh"
 COIN_CONFIG="/tmp/coin_config.env"
 GLOBALS_ENV="/lmepisowifi/globals.env"
@@ -476,6 +578,8 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
     CPSK="${COIN_PSK:-$(read_lmehspt_var COIN_PSK)}"
     CST="${COIN_STRIKE_THRESHOLD:-$(read_lmehspt_var COIN_STRIKE_THRESHOLD)}"
     CCD="${COIN_COOLDOWN:-$(read_lmehspt_var COIN_COOLDOWN)}"
+    CSE="${COIN_STRIKE_ENABLED:-$(read_lmehspt_var COIN_STRIKE_ENABLED)}"
+    CSE_BOOL="true"; [ "${CSE:-1}" = "0" ] && CSE_BOOL="false"
     PIP="${PORTAL_IP:-$(read_lmehspt_var PORTAL_IP)}"
     PPT="${PORTAL_PORT:-$(read_lmehspt_var PORTAL_PORT)}"
     HBR="${HOTSPOT_BR:-$(read_lmehspt_var HOTSPOT_BR)}"
@@ -486,9 +590,18 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
     LI_BOOL="true"; [ "${LI:-1}" = "0" ] && LI_BOOL="false"
     MRF="${MAC_RANDOMIZATION_FIX:-$(read_lmehspt_var MAC_RANDOMIZATION_FIX)}"
     MRF_BOOL="true"; [ "${MRF:-1}" = "0" ] && MRF_BOOL="false"
+    CRI="${COIN_REQUIRE_INTERNET:-$(read_lmehspt_var COIN_REQUIRE_INTERNET)}"
+    CRI_BOOL="true"; [ "${CRI:-0}" = "0" ] && CRI_BOOL="false"
+    VRI="${VOUCHER_REQUIRE_INTERNET:-$(read_lmehspt_var VOUCHER_REQUIRE_INTERNET)}"
+    VRI_BOOL="true"; [ "${VRI:-0}" = "0" ] && VRI_BOOL="false"
+    VSE="${VOUCHER_STRIKE_ENABLED:-$(read_lmehspt_var VOUCHER_STRIKE_ENABLED)}"
+    VSE_BOOL="false"; [ "${VSE:-0}" = "1" ] && VSE_BOOL="true"
+    VST="${VOUCHER_STRIKE_THRESHOLD:-$(read_lmehspt_var VOUCHER_STRIKE_THRESHOLD)}"
+    VCD="${VOUCHER_COOLDOWN:-$(read_lmehspt_var VOUCHER_COOLDOWN)}"
 
     HSP_RUNNING="false"; hotspot_running && HSP_RUNNING="true"
     COIN_ON="false"; [ -f /tmp/coin_enabled ] && COIN_ON="true"
+    INET_UP="false"; [ -f "${INTERNET_UP_FILE:-/tmp/internet_up}" ] && INET_UP="true"
 
     ok_json "{\"ok\":true,
 \"global_rate\":\"$(esc_json "$GR")\",
@@ -509,6 +622,7 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
 \"coin_psk\":\"$(esc_json "$CPSK")\",
 \"coin_strike_threshold\":\"$(esc_json "$CST")\",
 \"coin_cooldown\":\"$(esc_json "$CCD")\",
+\"coin_strike_enabled\":$CSE_BOOL,
 \"portal_ip\":\"$(esc_json "$PIP")\",
 \"portal_port\":\"$(esc_json "$PPT")\",
 \"hotspot_br\":\"$(esc_json "$HBR")\",
@@ -516,6 +630,12 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
 \"anti_tether\":$AT_BOOL,
 \"lan_isolate\":$LI_BOOL,
 \"mac_randomization_fix\":$MRF_BOOL,
+\"coin_require_internet\":$CRI_BOOL,
+\"voucher_require_internet\":$VRI_BOOL,
+\"voucher_strike_enabled\":$VSE_BOOL,
+\"voucher_strike_threshold\":\"$(esc_json "$VST")\",
+\"voucher_cooldown\":\"$(esc_json "$VCD")\",
+\"internet_up\":$INET_UP,
 \"hotspot_running\":$HSP_RUNNING}"
 fi
 
@@ -567,6 +687,8 @@ if echo "$QS" | $BB grep -q "action=config_set"; then
     apply_if "COIN_PSK"            "$(fget coin_psk)"
     apply_if "COIN_STRIKE_THRESHOLD" "$(fget coin_strike_threshold)"
     apply_if "COIN_COOLDOWN"       "$(fget coin_cooldown)"
+    apply_if "VOUCHER_STRIKE_THRESHOLD" "$(fget voucher_strike_threshold)"
+    apply_if "VOUCHER_COOLDOWN"    "$(fget voucher_cooldown)"
     apply_if "PORTAL_IP"           "$(fget portal_ip)"
     apply_if "PORTAL_PORT"         "$(fget portal_port)"
 
@@ -1585,6 +1707,165 @@ if echo "$QS" | $BB grep -q "action=dhcp_set"; then
     fi
     ok_json "{\"ok\":true,\"max_nodemcus\":$NEW_POOL}"
 fi
+
+# ================================================================
+# GET ?action=dhcp_leases  -> current dynamic DHCP leases on the hotspot
+# subnet (NOT NodeMCU/static units — see the NodeMCUs page for those).
+# Reads via `busybox dumpleases`, the same binary that wrote the file, so
+# this is immune to guessing the on-disk struct layout.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=dhcp_leases"; then
+    if ! _bb_has dumpleases; then
+        ok_json "{\"ok\":true,\"supported\":false,\"leases\":[]}"
+    fi
+    load_coin_env
+    OUT="["; SEP=""
+    if [ -s "$LEASES_FILE" ]; then
+        STATIC_MACS=$(_static_lease_macs)
+        $BB dumpleases -r -d -f "$LEASES_FILE" 2>/dev/null \
+            | $BB grep -E '^([0-9a-f]{2}:){5}[0-9a-f]{2}[[:space:]]' \
+            > /tmp/dhcp_leases_dump.tmp
+        while IFS= read -r LN; do
+            LMAC=$(printf '%s' "$LN" | $BB awk '{print $1}')
+            LMAC_HEX=$(printf '%s' "$LMAC" | $BB tr -d ':')
+            printf '%s\n' "$STATIC_MACS" | $BB grep -qx "$LMAC_HEX" && continue
+            LIP=$(printf '%s' "$LN" | $BB awk '{print $2}')
+            LTAIL=$(printf '%s' "$LN" | $BB awk '{print $NF}')
+            case "$LTAIL" in
+                expired)   LREM=0; LEXP=true ;;
+                *[!0-9]*)  continue ;;
+                *)         LREM=$LTAIL; LEXP=false ;;
+            esac
+            OUT="${OUT}${SEP}{\"mac\":\"$(esc_json "$LMAC")\",\"ip\":\"$(esc_json "$LIP")\",\"remaining\":$LREM,\"expired\":$LEXP}"
+            SEP=","
+        done < /tmp/dhcp_leases_dump.tmp
+        rm -f /tmp/dhcp_leases_dump.tmp
+    fi
+    ok_json "{\"ok\":true,\"supported\":true,\"leases\":${OUT}]}"
+fi
+
+# ================================================================
+# POST ?action=dhcp_lease_renew   body: mac, minutes
+# Extends one lease's expiry and restarts udhcpd so it takes effect —
+# busybox udhcpd only reads the lease file at startup, so an on-disk-only
+# edit would get silently overwritten by the daemon's own next flush.
+# Only the matched record's 4-byte "expires" field is modified; every
+# other byte (and every other lease) is copied through untouched, and the
+# target MAC is cross-checked against `dumpleases` before anything is
+# written, so a layout surprise on some other busybox build fails safely
+# ("not_found"/"unsupported") instead of corrupting the file. No station
+# kick here on purpose — the device's association is undisturbed, only
+# the server-side timer for its lease resets.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=dhcp_lease_renew"; then
+    read -n "$CONTENT_LENGTH" POST_DATA
+    RMAC=$(printf '%s' "$POST_DATA" | $BB sed -n 's/.*mac=\([^&]*\).*/\1/p' | urldecode | $BB tr 'A-Z' 'a-z' | $BB tr -cd 'a-f0-9:')
+    RMIN=$(printf '%s' "$POST_DATA" | $BB sed -n 's/.*minutes=\([^&]*\).*/\1/p' | $BB tr -cd '0-9')
+    case "$RMAC" in
+        [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+        *) err_json "bad_mac" ;;
+    esac
+    [ -z "$RMIN" ] && err_json "missing_minutes"
+    [ "$RMIN" -le 0 ] 2>/dev/null && err_json "bad_minutes"
+
+    _bb_has dumpleases && _bb_has dd && _bb_has od || err_json "unsupported"
+    [ -s "$LEASES_FILE" ] || err_json "not_found"
+    H=$(_lease_header_size)
+    [ "$H" = "8" ] || err_json "unsupported"   # relative-expiry math needs the written_at header
+
+    $BB dumpleases -f "$LEASES_FILE" 2>/dev/null | $BB grep -q "^$RMAC[[:space:]]" || err_json "not_found"
+
+    RMAC_HEX=$(printf '%s' "$RMAC" | $BB tr -d ':')
+    FSZ=$($BB wc -c < "$LEASES_FILE"); N=$(( (FSZ - H) / LEASE_REC_SIZE ))
+    IDX=-1; _ri=0
+    while [ "$_ri" -lt "$N" ]; do
+        _roff=$(( H + _ri * LEASE_REC_SIZE ))
+        [ "$(_read_mac_hex "$LEASES_FILE" $(( _roff + 8 )))" = "$RMAC_HEX" ] && { IDX=$_ri; break; }
+        _ri=$(( _ri + 1 ))
+    done
+    [ "$IDX" -ge 0 ] || err_json "not_found"
+
+    _dhcp_lease_lock
+    HI=$(_read_be32 "$LEASES_FILE" 0)
+    WRITTEN_AT=$(_read_be32 "$LEASES_FILE" 4)
+    if [ "$HI" != "0" ] || [ -z "$WRITTEN_AT" ]; then
+        _dhcp_lease_unlock; err_json "unreadable_lease_file"
+    fi
+    NOW=$($BB date +%s)
+    NEWVAL=$(( RMIN * 60 + (NOW - WRITTEN_AT) ))
+    [ "$NEWVAL" -lt 0 ] && NEWVAL=$(( RMIN * 60 ))
+    _write_be32 "$LEASES_FILE" "$(( H + IDX * LEASE_REC_SIZE ))" "$NEWVAL"
+
+    load_coin_env
+    LMEHSPT_LIB_ONLY=1
+    . /lmepisowifi/lmehspt.sh --lib
+    _dhcp_restart_preserving_leases
+    _dhcp_lease_unlock
+
+    ok_json "{\"ok\":true}"
+fi
+
+# ================================================================
+# POST ?action=dhcp_lease_delete   body: mac
+# Drops one lease record entirely (freeing its IP for reuse) and restarts
+# udhcpd so it takes effect, then kicks the station off wifi so the
+# device actually loses its connection rather than quietly keeping an IP
+# the server no longer remembers. Every other lease is copied through
+# byte-for-byte untouched — delete doesn't need to interpret the record
+# at all beyond its length, so (unlike renew) it works even on the older
+# no-header lease format.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=dhcp_lease_delete"; then
+    read -n "$CONTENT_LENGTH" POST_DATA
+    DMAC=$(printf '%s' "$POST_DATA" | $BB sed -n 's/.*mac=\([^&]*\).*/\1/p' | urldecode | $BB tr 'A-Z' 'a-z' | $BB tr -cd 'a-f0-9:')
+    case "$DMAC" in
+        [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+        *) err_json "bad_mac" ;;
+    esac
+
+    _bb_has dumpleases && _bb_has dd && _bb_has od || err_json "unsupported"
+    [ -s "$LEASES_FILE" ] || err_json "not_found"
+    H=$(_lease_header_size)
+    [ -n "$H" ] || err_json "unsupported"
+
+    DIP=$($BB dumpleases -f "$LEASES_FILE" 2>/dev/null | $BB awk -v m="$DMAC" '$1==m{print $2; exit}')
+    [ -n "$DIP" ] || err_json "not_found"
+
+    DMAC_HEX=$(printf '%s' "$DMAC" | $BB tr -d ':')
+    FSZ=$($BB wc -c < "$LEASES_FILE"); N=$(( (FSZ - H) / LEASE_REC_SIZE ))
+    IDX=-1; _di=0
+    while [ "$_di" -lt "$N" ]; do
+        _doff=$(( H + _di * LEASE_REC_SIZE ))
+        [ "$(_read_mac_hex "$LEASES_FILE" $(( _doff + 8 )))" = "$DMAC_HEX" ] && { IDX=$_di; break; }
+        _di=$(( _di + 1 ))
+    done
+    [ "$IDX" -ge 0 ] || err_json "not_found"
+
+    _dhcp_lease_lock
+    rm -f /tmp/udhcpd_leases.tmp
+    [ "$H" -gt 0 ] && $BB dd if="$LEASES_FILE" of=/tmp/udhcpd_leases.tmp bs=1 count="$H" 2>/dev/null
+    _di=0
+    while [ "$_di" -lt "$N" ]; do
+        if [ "$_di" -ne "$IDX" ]; then
+            $BB dd if="$LEASES_FILE" bs=1 skip=$(( H + _di * LEASE_REC_SIZE )) count="$LEASE_REC_SIZE" 2>/dev/null >> /tmp/udhcpd_leases.tmp
+        fi
+        _di=$(( _di + 1 ))
+    done
+    $BB mv /tmp/udhcpd_leases.tmp "$LEASES_FILE"
+
+    load_coin_env
+    LMEHSPT_LIB_ONLY=1
+    . /lmepisowifi/lmehspt.sh --lib
+    _dhcp_restart_preserving_leases
+    ip neigh del "$DIP" dev "$HOTSPOT_BR" 2>/dev/null
+    $BB arp -d "$DIP" 2>/dev/null
+    kick_sta_mac "$DMAC"
+    ping -c 1 -W 1 "$DIP" >/dev/null 2>&1
+    _dhcp_lease_unlock
+
+    ok_json "{\"ok\":true}"
+fi
+
 # ================================================================
 # POST ?action=nodemcu_del  body: id
 # ================================================================
@@ -1750,6 +2031,118 @@ if echo "$QS" | $BB grep -q "action=mac_fix_set"; then
             set_lmehspt_var   "MAC_RANDOMIZATION_FIX" "0"
             set_globals_var   "MAC_RANDOMIZATION_FIX" "0"
             ok_json '{"ok":true,"mac_randomization_fix":false}'
+            ;;
+        *) err_json "bad_value" ;;
+    esac
+fi
+
+# ================================================================
+# POST ?action=coin_internet_set   body: enabled=1|0
+# When on, coin.sh's "start" action refuses to open a brand new coin
+# session while the router has no internet connectivity (an in-flight
+# session someone already paid for is never interrupted by this — see
+# coin.sh's own comments). Same simple three-tier persistence as every
+# other on/off toggle here.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=coin_internet_set"; then
+    read -n "${CONTENT_LENGTH:-0}" POST_DATA
+    VAL=$(printf '%s' "$POST_DATA" | $BB sed -n 's/.*enabled=\([^&]*\).*/\1/p')
+    case "$VAL" in
+        1)
+            save_coin_env_var "COIN_REQUIRE_INTERNET" "1"
+            set_lmehspt_var   "COIN_REQUIRE_INTERNET" "1"
+            set_globals_var   "COIN_REQUIRE_INTERNET" "1"
+            ok_json '{"ok":true,"coin_require_internet":true}'
+            ;;
+        0)
+            save_coin_env_var "COIN_REQUIRE_INTERNET" "0"
+            set_lmehspt_var   "COIN_REQUIRE_INTERNET" "0"
+            set_globals_var   "COIN_REQUIRE_INTERNET" "0"
+            ok_json '{"ok":true,"coin_require_internet":false}'
+            ;;
+        *) err_json "bad_value" ;;
+    esac
+fi
+
+# ================================================================
+# POST ?action=voucher_internet_set   body: enabled=1|0
+# When on, login.sh refuses to redeem (burn) a voucher code while the
+# router has no internet connectivity — returns error "no_internet"
+# instead. Resuming an already-paused session is unaffected.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=voucher_internet_set"; then
+    read -n "${CONTENT_LENGTH:-0}" POST_DATA
+    VAL=$(printf '%s' "$POST_DATA" | $BB sed -n 's/.*enabled=\([^&]*\).*/\1/p')
+    case "$VAL" in
+        1)
+            save_coin_env_var "VOUCHER_REQUIRE_INTERNET" "1"
+            set_lmehspt_var   "VOUCHER_REQUIRE_INTERNET" "1"
+            set_globals_var   "VOUCHER_REQUIRE_INTERNET" "1"
+            ok_json '{"ok":true,"voucher_require_internet":true}'
+            ;;
+        0)
+            save_coin_env_var "VOUCHER_REQUIRE_INTERNET" "0"
+            set_lmehspt_var   "VOUCHER_REQUIRE_INTERNET" "0"
+            set_globals_var   "VOUCHER_REQUIRE_INTERNET" "0"
+            ok_json '{"ok":true,"voucher_require_internet":false}'
+            ;;
+        *) err_json "bad_value" ;;
+    esac
+fi
+
+# ================================================================
+# POST ?action=voucher_strike_set   body: enabled=1|0
+# Master switch for the wrong-voucher anti-troll strike system (see
+# login.sh). When on, login.sh temporarily suspends further voucher
+# attempts from a device after VOUCHER_STRIKE_THRESHOLD wrong codes in a
+# row, for VOUCHER_COOLDOWN seconds — same shape as the coin acceptor's
+# own anti-griefing strike system. Same simple three-tier persistence as
+# every other on/off toggle here.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=voucher_strike_set"; then
+    read -n "${CONTENT_LENGTH:-0}" POST_DATA
+    VAL=$(printf '%s' "$POST_DATA" | $BB sed -n 's/.*enabled=\([^&]*\).*/\1/p')
+    case "$VAL" in
+        1)
+            save_coin_env_var "VOUCHER_STRIKE_ENABLED" "1"
+            set_lmehspt_var   "VOUCHER_STRIKE_ENABLED" "1"
+            set_globals_var   "VOUCHER_STRIKE_ENABLED" "1"
+            ok_json '{"ok":true,"voucher_strike_enabled":true}'
+            ;;
+        0)
+            save_coin_env_var "VOUCHER_STRIKE_ENABLED" "0"
+            set_lmehspt_var   "VOUCHER_STRIKE_ENABLED" "0"
+            set_globals_var   "VOUCHER_STRIKE_ENABLED" "0"
+            ok_json '{"ok":true,"voucher_strike_enabled":false}'
+            ;;
+        *) err_json "bad_value" ;;
+    esac
+fi
+
+# ================================================================
+# POST ?action=coin_strike_set   body: enabled=1|0
+# Master switch for the coin acceptor's own anti-griefing strike system
+# (see coin.sh / coin_result.sh). When off, repeated empty coin sessions
+# never accumulate strikes or trigger a suspension — the coin acceptor
+# itself stays on and works normally, only this specific check is
+# skipped. On by default, matching the system's original always-on
+# behavior. Same simple three-tier persistence as every other toggle.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=coin_strike_set"; then
+    read -n "${CONTENT_LENGTH:-0}" POST_DATA
+    VAL=$(printf '%s' "$POST_DATA" | $BB sed -n 's/.*enabled=\([^&]*\).*/\1/p')
+    case "$VAL" in
+        1)
+            save_coin_env_var "COIN_STRIKE_ENABLED" "1"
+            set_lmehspt_var   "COIN_STRIKE_ENABLED" "1"
+            set_globals_var   "COIN_STRIKE_ENABLED" "1"
+            ok_json '{"ok":true,"coin_strike_enabled":true}'
+            ;;
+        0)
+            save_coin_env_var "COIN_STRIKE_ENABLED" "0"
+            set_lmehspt_var   "COIN_STRIKE_ENABLED" "0"
+            set_globals_var   "COIN_STRIKE_ENABLED" "0"
+            ok_json '{"ok":true,"coin_strike_enabled":false}'
             ;;
         *) err_json "bad_value" ;;
     esac

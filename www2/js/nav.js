@@ -57,6 +57,7 @@ setInterval(function () {
             { label: 'Overview',        href: '/hotspot.html',           hotspot: 'always'  },
             { label: 'Interfaces',      href: '/hotspot-ifaces.html',    hotspot: 'always'  },
             { label: 'DHCP Settings',   href: '/hotspot-dhcp.html',      hotspot: 'always'  },
+            { label: 'DHCP Leases',     href: '/hotspot-leases.html',    hotspot: 'enabled' },
             { label: 'Income & Alerts', href: '/hotspot-income.html',    hotspot: 'always'  },
             { label: 'Portal',          href: '/hotspot-portal.html',    hotspot: 'always'  },
             { label: 'WiFi Rates',      href: '/hotspot-rates.html',     hotspot: 'enabled' },

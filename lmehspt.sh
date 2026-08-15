@@ -71,12 +71,43 @@ NODEMCU_1_TITLE="Coin Slot"
 NODEMCU_1_ENABLED="1"
 COIN_TIMEOUT="30"
 COIN_RATES="1:15 5:90 10:210 15:360 20:720 25:1080 30:2160 35:2880 40:3600 45:4320 50:5040 55:5760"
+# Anti-griefing strike system: repeated empty coin sessions (coin slot
+# entered but no coins dropped) temporarily suspend that device from
+# inserting more. On by default (matches the system's original always-on
+# behavior); COIN_STRIKE_ENABLED="0" turns it off while keeping the coin
+# acceptor itself on, for locations where a flaky coin mech legitimately
+# produces empty sessions that shouldn't count against a paying customer.
+COIN_STRIKE_ENABLED="1"
 COIN_STRIKE_THRESHOLD="3"
 COIN_COOLDOWN="60"
 # Seconds the portal keeps a mid-insert coin session alive while the NodeMCU is
 # unreachable (reporting "reconnecting", coins preserved, countdown frozen)
 # before giving up. Keep equal to the firmware's MAX_PAUSE_MS (300s).
 COIN_RECONNECT_GRACE="300"
+# When "1": coin.sh's "start" action refuses to open a new coin session while
+# INTERNET_UP_FILE (checked ~every 15s by the watchdog loop below) says the
+# router has no internet. Sessions already active are never interrupted by
+# this - only new coin insertions.
+COIN_REQUIRE_INTERNET="0"
+# Same idea for voucher redemption: when "1", login.sh rejects a voucher code
+# (error "no_internet") submitted while there is no internet, instead of
+# burning it.
+VOUCHER_REQUIRE_INTERNET="0"
+# Wrong-voucher anti-troll strike system (mirrors COIN_STRIKE_THRESHOLD /
+# COIN_COOLDOWN above, but for repeated incorrect voucher code submissions
+# instead of empty coin sessions). When VOUCHER_STRIKE_ENABLED is "1",
+# login.sh temporarily blocks further voucher attempts from a device once it
+# has submitted VOUCHER_STRIKE_THRESHOLD wrong codes in a row, for
+# VOUCHER_COOLDOWN seconds. Opt-in and off by default so existing installs
+# keep today's unlimited-attempts behavior until the admin turns it on.
+VOUCHER_STRIKE_ENABLED="0"
+VOUCHER_STRIKE_THRESHOLD="3"
+VOUCHER_COOLDOWN="60"
+# Flag file: present = internet reachable as of the last check, absent = not
+# reachable. Written by the watchdog loop's internet-check tick; read by
+# coin.sh and login.sh. A plain existence check keeps those per-request reads
+# essentially free instead of pinging on every login/coin-start.
+INTERNET_UP_FILE="/tmp/internet_up"
 
 # NTP servers used by busybox ntpd to discipline the system clock over the WAN.
 NTP_SERVERS="pool.ntp.org time.google.com time.cloudflare.com"
@@ -1381,6 +1412,9 @@ write_coin_config() {
         printf 'COIN_COOLDOWN="%s"\n'       "$COIN_COOLDOWN"
         printf 'COIN_RECONNECT_GRACE="%s"\n' "$COIN_RECONNECT_GRACE"
         printf 'COIN_ENABLED="%s"\n'        "$COIN_ENABLED"
+        printf 'COIN_REQUIRE_INTERNET="%s"\n' "${COIN_REQUIRE_INTERNET:-0}"
+        printf 'VOUCHER_REQUIRE_INTERNET="%s"\n' "${VOUCHER_REQUIRE_INTERNET:-0}"
+        printf 'INTERNET_UP_FILE="%s"\n'    "${INTERNET_UP_FILE:-/tmp/internet_up}"
         printf 'HOTSPOT_BR="%s"\n'          "$HOTSPOT_BR"
         printf 'SESSION_FILE="%s"\n'        "$SESSION_FILE"
         printf 'PAUSED_FILE="%s"\n'         "$PAUSED_FILE"
@@ -1745,6 +1779,7 @@ fi
     LAST_QOS_SYNC=0
     LAST_INCOME=0
     LAST_PORT80_SCAN=0
+    LAST_INETCHECK=0
     while true; do
         # Re-source the runtime config every tick so config_set / qos_apply
         # changes take effect without a hotspot restart.
@@ -1963,6 +1998,23 @@ fi
             # Drain queued notifications now that we have a periodic internet check
             ( /lmepisowifi/hotspot/notify.sh --drain >/dev/null 2>&1 </dev/null & )
             LAST_INCOME=$NOW
+        fi
+
+        # Internet connectivity check — cheap flag file for coin.sh/login.sh to
+        # gate coin insertion / voucher redemption on (COIN_REQUIRE_INTERNET /
+        # VOUCHER_REQUIRE_INTERNET) without either of those synchronous,
+        # customer-facing CGI requests having to block on a live ping itself.
+        # ~15s cadence: fast enough that the "no internet" state clears soon
+        # after the WAN comes back, but not so frequent it floods pings.
+        # Same two-target fallback as notify.sh's _internet_up().
+        if [ $((NOW - LAST_INETCHECK)) -ge 15 ]; then
+            if $BB ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 || \
+               $BB ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+                touch "${INTERNET_UP_FILE:-/tmp/internet_up}" 2>/dev/null
+            else
+                rm -f "${INTERNET_UP_FILE:-/tmp/internet_up}" 2>/dev/null
+            fi
+            LAST_INETCHECK=$NOW
         fi
 
         # Port 80 watchdog — only relevant while PORTAL_PORT="80". Throttled
