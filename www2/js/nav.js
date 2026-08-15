@@ -51,10 +51,10 @@ setInterval(function () {
         { label: 'Interfaces', children: [
             { label: 'DHCP Client', href: '/wan-repurpose.html' },
         ]},
-        { label: 'IP ACL',  href: '/ipacl.html' },
+        { label: 'Services',  href: '/services.html' },
         { label: 'Domain Blocking', href: '/domainblk.html' },
         { label: 'Hotspot', module: 'hotspot', children: [
-            { label: 'Overview',        href: '/hotspot.html',           hotspot: 'always'  },
+            { label: 'Controls',        href: '/hotspot.html',           hotspot: 'always'  },
             { label: 'Interfaces',      href: '/hotspot-ifaces.html',    hotspot: 'always'  },
             { label: 'DHCP Settings',   href: '/hotspot-dhcp.html',      hotspot: 'always'  },
             { label: 'DHCP Leases',     href: '/hotspot-leases.html',    hotspot: 'enabled' },
@@ -116,7 +116,7 @@ setInterval(function () {
                 // Filter hotspot sub-items based on running state
                 var visibleChildren = item.children.filter(function (c) {
                     if (!c.hotspot) return true;             // non-hotspot items always show
-                    if (c.hotspot === 'always') return true; // always visible (overview, interfaces)
+                    if (c.hotspot === 'always') return true; // always visible (controls, interfaces)
                     return hotspotRunning;                   // 'enabled' items only when running
                 });
                 if (visibleChildren.length === 0) return '';

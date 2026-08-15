@@ -228,6 +228,17 @@ if [ -n "$RESUME" ] && [ "$RESUME" = "1" ]; then
     NEW_EXPIRY=$(( NOW + DURATION ))
     NEW_TOTAL=$TOTAL
 else
+    # Master switch: voucher input entirely disabled by the admin. Checked
+    # before anything else in this branch (strikes, internet gate, code
+    # lookup) so a disabled device doesn't accumulate strikes or burn a
+    # code lookup for a feature it can't use. Resuming an already-paused
+    # session (the branch above) is untouched by this toggle, same as
+    # COIN_ENABLED never blocks resuming an already-paid coin session.
+    if [ "${VOUCHER_ENABLED:-1}" = "0" ]; then
+        echo '{"ok":false,"error":"voucher_disabled"}'
+        exit 0
+    fi
+
     # Verify regular voucher inputs
     if [ -z "$VOUCHER" ]; then
         echo '{"ok":false,"error":"no_voucher"}'

@@ -567,6 +567,7 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
     AP="${AUTO_PAUSE_ENABLED:-$(read_lmehspt_var AUTO_PAUSE_ENABLED)}"
     AP_BOOL="false"; [ "${AP:-1}" = "1" ] && AP_BOOL="true"
     CE="${COIN_ENABLED:-$(read_lmehspt_var COIN_ENABLED)}"
+    VE="${VOUCHER_ENABLED:-$(read_lmehspt_var VOUCHER_ENABLED)}"
     NIP="${NODEMCU_IP:-$(read_lmehspt_var NODEMCU_IP)}"
     NMC="${NODEMCU_MAC:-$(read_lmehspt_var NODEMCU_MAC)}"
     NPT="${NODEMCU_PORT:-$(read_lmehspt_var NODEMCU_PORT)}"
@@ -601,6 +602,7 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
 
     HSP_RUNNING="false"; hotspot_running && HSP_RUNNING="true"
     COIN_ON="false"; [ -f /tmp/coin_enabled ] && COIN_ON="true"
+    VOUCHER_ON="true"; [ "${VE:-1}" = "0" ] && VOUCHER_ON="false"
     INET_UP="false"; [ -f "${INTERNET_UP_FILE:-/tmp/internet_up}" ] && INET_UP="true"
 
     ok_json "{\"ok\":true,
@@ -612,6 +614,7 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
 \"auto_pause_enabled\":$AP_BOOL,
 \"coin_enabled\":\"$(esc_json "$CE")\",
 \"coin_on\":$COIN_ON,
+\"voucher_on\":$VOUCHER_ON,
 \"nodemcu_ip\":\"$(esc_json "$NIP")\",
 \"nodemcu_mac\":\"$(esc_json "$NMC")\",
 \"nodemcu_port\":\"$(esc_json "$NPT")\",
@@ -1923,6 +1926,33 @@ if echo "$QS" | $BB grep -q "action=nodemcu_del"; then
     _order_remove_id "$NID"
     ok_json "{\"ok\":true,\"id\":$NID}"
 fi
+# ================================================================
+# POST ?action=voucher_toggle  body: enabled=1|0
+# Master switch for voucher code redemption (see login.sh). When off,
+# login.sh refuses all new voucher submissions with "voucher_disabled" and
+# the portal hides the voucher-code input entirely — same shape as
+# coin_toggle below, but persisted the three-way way (coin_config.env +
+# lmehspt.sh + globals.env) like voucher_strike_set, so the setting
+# actually survives a hotspot restart/reboot.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=voucher_toggle"; then
+    read -n "$CONTENT_LENGTH" POST_DATA
+    VAL=$($BB echo "$POST_DATA" | $BB sed -n 's/.*enabled=\([^&]*\).*/\1/p')
+    if [ "$VAL" = "1" ]; then
+        save_coin_env_var "VOUCHER_ENABLED" "1"
+        set_lmehspt_var   "VOUCHER_ENABLED" "1"
+        set_globals_var   "VOUCHER_ENABLED" "1"
+        ok_json "{\"ok\":true,\"voucher_on\":true}"
+    elif [ "$VAL" = "0" ]; then
+        save_coin_env_var "VOUCHER_ENABLED" "0"
+        set_lmehspt_var   "VOUCHER_ENABLED" "0"
+        set_globals_var   "VOUCHER_ENABLED" "0"
+        ok_json "{\"ok\":true,\"voucher_on\":false}"
+    else
+        err_json "bad_value"
+    fi
+fi
+
 # ================================================================
 # POST ?action=coin_toggle  body: enabled=1|0
 # ================================================================

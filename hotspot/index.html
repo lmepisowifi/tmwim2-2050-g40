@@ -1717,6 +1717,7 @@ function doLogin() {
         invalid:   'Invalid or already-used voucher code.',
         expired:   'This voucher has expired and can no longer be redeemed.',
         no_internet:'No internet connection right now — voucher redemption is temporarily unavailable.',
+        voucher_disabled:'Voucher redemption is currently unavailable.',
         cooldown:'Too many attempts. Please wait a moment.'
       };
       toastr.error(msgs[d.error] || 'Something went wrong — please try again.');
@@ -1756,6 +1757,7 @@ function doAddTime() {
         invalid: 'Invalid or already-used voucher code.',
         expired: 'This voucher has expired.',
         no_internet:'No internet connection right now — voucher redemption is temporarily unavailable.',
+        voucher_disabled:'Voucher redemption is currently unavailable.',
         cooldown:'Too many attempts. Please wait a moment.'
       };
       toastr.error(msgs[d.error] || 'Error — please try again.');
@@ -1837,6 +1839,16 @@ function checkCoinEnabled(pendingRetries) {
       if (hasRates) {
         _cachedRates = d.rates;
       }
+
+      // Voucher Input: master switch, independent of the coin toggle above.
+      // Hides both the fresh-login voucher form and the "add time while
+      // connected" voucher form when the admin has turned voucher
+      // redemption off.
+      var voucherOn = d.voucher_enabled !== false;
+      ['login-panel', 'add-panel'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.style.display = voucherOn ? 'block' : 'none';
+      });
       // Which coin slots exist right now — used by startCoinFlow() to decide
       // whether a picker is even needed (0 or 1 entries: same one-tap flow
       // as before this feature existed).

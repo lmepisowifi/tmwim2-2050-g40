@@ -72,7 +72,7 @@
 
     <div class="container mt-4">
         <div class="card">
-            <div class="card-header">IP Access Control</div>
+            <div class="card-header">Services</div>
             <div class="card-body p-0">
                 <table class="acl-table" id="acl-table">
                     <tbody id="acl-tbody">
@@ -167,7 +167,7 @@
             row.classList.add('acl-row-saving');
             showOverlay('Applying…');
 
-            fetch('/cgi-bin/ipacl.cgi?action=set', {
+            fetch('/cgi-bin/services.cgi?action=set', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                 body: 'service=' + encodeURIComponent(service) + '&level=' + level
@@ -202,7 +202,7 @@
             row.classList.add('acl-row-saving');
             showOverlay('Applying new port…');
 
-            fetch('/cgi-bin/ipacl.cgi?action=set_port', {
+            fetch('/cgi-bin/services.cgi?action=set_port', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                 body: 'service=' + encodeURIComponent(service) + '&port=' + port
@@ -226,7 +226,7 @@
 
         function loadList() {
             showOverlay('Loading…');
-            fetch('/cgi-bin/ipacl.cgi?action=list', { cache: 'no-store' })
+            fetch('/cgi-bin/services.cgi?action=list', { cache: 'no-store' })
                 .then(r => r.json())
                 .then(data => {
                     renderRows(data.services || []);

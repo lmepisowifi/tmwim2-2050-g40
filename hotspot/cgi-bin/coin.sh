@@ -216,6 +216,11 @@ if [ "$ACTION" = "config" ]; then
         NO_INET_BLOCK="true"
     fi
 
+    # Voucher input master switch — surfaced here (rather than a separate
+    # endpoint) since this is the config poll the portal already hits on
+    # load and after every session-state change.
+    VOUCHER_ON="true"; [ "${VOUCHER_ENABLED:-1}" = "0" ] && VOUCHER_ON="false"
+
     if [ -f /tmp/coin_enabled ] && [ "$NO_INET_BLOCK" != "true" ]; then
         SUSPENDED_FLAG="false"
         COOLDOWN_REMAINING=0
@@ -236,12 +241,12 @@ if [ "$ACTION" = "config" ]; then
                 fi
             fi
         fi
-        _ok "{\"enabled\":true,\"timeout\":${COIN_TIMEOUT},\"rates\":\"${COIN_RATES}\",\"resume\":${RESUME_FLAG},\"resume_nodemcu\":${RESUME_NODE},\"pending\":${PENDING_FLAG},\"suspended\":${SUSPENDED_FLAG},\"cooldown_remaining\":${COOLDOWN_REMAINING},\"nodemcus\":$(_node_list_json)}"
+        _ok "{\"enabled\":true,\"timeout\":${COIN_TIMEOUT},\"rates\":\"${COIN_RATES}\",\"resume\":${RESUME_FLAG},\"resume_nodemcu\":${RESUME_NODE},\"pending\":${PENDING_FLAG},\"suspended\":${SUSPENDED_FLAG},\"cooldown_remaining\":${COOLDOWN_REMAINING},\"nodemcus\":$(_node_list_json),\"voucher_enabled\":${VOUCHER_ON}}"
     else
         # Coin acceptor toggled off. Still expose the configured rates so the
         # portal can keep showing the WiFi Rates button independently of the
         # coin toggle (nodemcus/resume/etc. are coin-only and stay omitted).
-        _ok "{\"enabled\":false,\"rates\":\"${COIN_RATES}\"}"
+        _ok "{\"enabled\":false,\"rates\":\"${COIN_RATES}\",\"voucher_enabled\":${VOUCHER_ON}}"
     fi
 fi
 

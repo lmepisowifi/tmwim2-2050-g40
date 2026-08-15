@@ -103,6 +103,12 @@ VOUCHER_REQUIRE_INTERNET="0"
 VOUCHER_STRIKE_ENABLED="0"
 VOUCHER_STRIKE_THRESHOLD="3"
 VOUCHER_COOLDOWN="60"
+# Master switch for voucher code redemption, same shape as COIN_ENABLED above.
+# When "0", login.sh refuses all new voucher-code submissions (error
+# "voucher_disabled") while leaving coin insertion and resuming an
+# already-paused session untouched. On by default (matches the system's
+# original always-available behavior).
+VOUCHER_ENABLED="1"
 # Flag file: present = internet reachable as of the last check, absent = not
 # reachable. Written by the watchdog loop's internet-check tick; read by
 # coin.sh and login.sh. A plain existence check keeps those per-request reads
@@ -1414,6 +1420,17 @@ write_coin_config() {
         printf 'COIN_ENABLED="%s"\n'        "$COIN_ENABLED"
         printf 'COIN_REQUIRE_INTERNET="%s"\n' "${COIN_REQUIRE_INTERNET:-0}"
         printf 'VOUCHER_REQUIRE_INTERNET="%s"\n' "${VOUCHER_REQUIRE_INTERNET:-0}"
+        # Wrong-voucher anti-troll strike system (see login.sh). Without
+        # these, every write_coin_config() call (hotspot start/restart,
+        # NodeMCU IP change, boot) regenerates /tmp/coin_config.env from
+        # this exact list and silently drops whatever the admin toggled via
+        # hotspot.cgi's voucher_strike_set action — login.sh only sources
+        # this cache file (never globals.env directly), so it would then
+        # see VOUCHER_STRIKE_ENABLED as unset and fall back to disabled.
+        printf 'VOUCHER_STRIKE_ENABLED="%s"\n' "${VOUCHER_STRIKE_ENABLED:-0}"
+        printf 'VOUCHER_STRIKE_THRESHOLD="%s"\n' "${VOUCHER_STRIKE_THRESHOLD:-3}"
+        printf 'VOUCHER_COOLDOWN="%s"\n'    "${VOUCHER_COOLDOWN:-60}"
+        printf 'VOUCHER_ENABLED="%s"\n'     "${VOUCHER_ENABLED:-1}"
         printf 'INTERNET_UP_FILE="%s"\n'    "${INTERNET_UP_FILE:-/tmp/internet_up}"
         printf 'HOTSPOT_BR="%s"\n'          "$HOTSPOT_BR"
         printf 'SESSION_FILE="%s"\n'        "$SESSION_FILE"

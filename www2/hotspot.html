@@ -45,6 +45,7 @@
             <div style="font-size:12px;color:var(--text-secondary);" id="power-sub">Loading…</div>
         </div>
         <div class="d-flex align-items-center gap-3">
+            <span id="inet-status-badge" class="status-badge stopped" title="WAN connectivity"><span class="dot"></span><span id="inet-status-text">…</span></span>
             <span id="hsp-status-badge" class="status-badge stopped"><span class="dot"></span><span id="hsp-status-text">…</span></span>
             <div id="hotspot-power-toggle" class="wlan-toggle" onclick="toggleHotspot()" title="Enable / Disable hotspot">
                 <div class="wlan-toggle-knob"></div>
@@ -52,10 +53,55 @@
         </div>
     </div>
 
-    <!-- ═══ Bandwidth & Inactivity ═══ -->
+    <!-- ═══ Protections ═══ -->
+    <div class="card mb-3">
+        <div class="card-header">Protections</div>
+        <div class="card-body p-0">
+            <div class="d-flex align-items-start justify-content-between gap-3 p-3">
+                <div>
+                    <div style="font-weight:500;">Anti-Tethering</div>
+                    <div class="field-hint">Marks hotspot traffic by TTL so clients cannot re-share the connection as a personal hotspot.</div>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                    <span id="at-badge" class="at-badge off">Off</span>
+                    <div id="at-toggle" class="wlan-toggle" onclick="toggleAntiTether()" title="Toggle anti-tethering">
+                        <div class="wlan-toggle-knob"></div>
+                    </div>
+                </div>
+            </div>
+            <hr class="my-0" style="border-color:var(--border-color);">
+            <div class="d-flex align-items-start justify-content-between gap-3 p-3">
+                <div>
+                    <div style="font-weight:500;">LAN Isolation</div>
+                    <div class="field-hint">Prevents hotspot clients from reaching the router gateway and RFC 1918 LAN addresses.</div>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                    <span id="li-badge" class="at-badge off">Off</span>
+                    <div id="li-toggle" class="wlan-toggle" onclick="toggleLanIsolate()" title="Toggle LAN isolation">
+                        <div class="wlan-toggle-knob"></div>
+                    </div>
+                </div>
+            </div>
+            <hr class="my-0" style="border-color:var(--border-color);">
+            <div class="d-flex align-items-start justify-content-between gap-3 p-3">
+                <div>
+                    <div style="font-weight:500;">MAC Randomization Fix</div>
+                    <div class="field-hint">Recovers active sessions when a client device rotates its MAC address mid-session.</div>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                    <span id="mf-badge" class="at-badge off">Off</span>
+                    <div id="mf-toggle" class="wlan-toggle" onclick="toggleMacFix()" title="Toggle MAC-randomization fix">
+                        <div class="wlan-toggle-knob"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══ Bandwidth & QoS ═══ -->
     <div class="card mb-3">
         <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-            <span>Bandwidth &amp; Inactivity</span>
+            <span>Bandwidth &amp; QoS</span>
         </div>
         <div class="card-body">
             <div class="row g-3">
@@ -135,54 +181,8 @@
         </div>
     </div>
 
-    <!-- ═══ Anti-Tethering ═══ -->
-    <div class="card mb-3">
-        <div class="card-header d-flex align-items-center justify-content-between gap-3">
-            <div style="min-width:0;">
-                <div style="font-weight:500;">Anti-Tethering</div>
-            </div>
-            <div class="d-flex align-items-center gap-2 flex-shrink-0">
-                <span id="at-badge" class="at-badge off">Off</span>
-                <div id="at-toggle" class="wlan-toggle" onclick="toggleAntiTether()" title="Toggle anti-tethering">
-                    <div class="wlan-toggle-knob"></div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- ═══ LAN Isolation ═══ -->
-    <div class="card mb-3">
-        <div class="card-header d-flex align-items-center justify-content-between gap-3">
-                    <div style="min-width:0;">
-                <div style="font-weight:500;">Anti-Gateway/LAN Access</div>
-            </div>
-
-            <div class="d-flex align-items-center gap-2 flex-shrink-0">
-                <span id="li-badge" class="at-badge off">Off</span>
-                <div id="li-toggle" class="wlan-toggle" onclick="toggleLanIsolate()" title="Toggle LAN isolation">
-                    <div class="wlan-toggle-knob"></div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- ═══ MAC Randomization Fix ═══ -->
-    <div class="card mb-3">
-        <div class="card-header d-flex align-items-center justify-content-between gap-3">
-            <div style="min-width:0;">
-                <div style="font-weight:500;">MAC Randomization Fix</div>
-            </div>
-            <div class="d-flex align-items-center gap-2 flex-shrink-0">
-                <span id="mf-badge" class="at-badge off">Off</span>
-                <div id="mf-toggle" class="wlan-toggle" onclick="toggleMacFix()" title="Toggle MAC-randomization fix">
-                    <div class="wlan-toggle-knob"></div>
-                </div>
-            </div>
-        </div>
-    </div>
-
     <!-- ═══ Coin Acceptor ═══ -->
-    <div class="card">
+    <div class="card mb-3">
         <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
             <span>Coin Acceptor</span>
             <div class="d-flex align-items-center gap-2">
@@ -193,10 +193,11 @@
             </div>
         </div>
         <div class="card-body">
-            <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+            <!-- Anti-Troll -->
+            <div class="d-flex align-items-start justify-content-between gap-3 mb-3">
                 <div style="min-width:0;">
                     <div style="font-weight:500;">Anti-Troll Suspension</div>
-                    <div class="field-hint">Temporarily suspend a device that inserts the coin slot but drops no coins, repeatedly.</div>
+                    <div class="field-hint">Temporarily suspend a device that triggers the coin slot repeatedly without inserting coins.</div>
                 </div>
                 <div class="d-flex align-items-center gap-2 flex-shrink-0">
                     <span id="cs-badge" class="at-badge on">On</span>
@@ -222,6 +223,20 @@
                 </div>
             </div>
             <hr class="my-3" style="border-color:var(--border-color);">
+            <!-- Require internet -->
+            <div class="d-flex align-items-start justify-content-between gap-3">
+                <div style="min-width:0;">
+                    <div style="font-weight:500;">Require Internet</div>
+                    <div class="field-hint">Refuse new coin sessions while the router has no WAN access. Active sessions are never interrupted.</div>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                    <span id="ci-badge" class="at-badge off">Off</span>
+                    <div id="ci-toggle" class="wlan-toggle" onclick="toggleCoinInternet()" title="Require internet to insert coins">
+                        <div class="wlan-toggle-knob"></div>
+                    </div>
+                </div>
+            </div>
+            <hr class="my-3" style="border-color:var(--border-color);">
             <div class="d-flex gap-2 flex-wrap">
                 <button class="btn btn-primary" onclick="saveCoin()">Save Coin Settings</button>
                 <button class="btn btn-outline-secondary" onclick="loadConfig()">Discard</button>
@@ -229,19 +244,31 @@
         </div>
     </div>
 
-    <!-- ═══ Voucher Suspension ═══ -->
+    <!-- ═══ Voucher Input ═══ -->
     <div class="card mb-3">
         <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-            <span>Voucher Suspension</span>
+            <span>Voucher Input</span>
             <div class="d-flex align-items-center gap-2">
-                <span id="vs-badge" class="at-badge off">Off</span>
-                <div id="vs-toggle" class="wlan-toggle" onclick="toggleVoucherStrike()" title="Toggle wrong-voucher suspension">
+                <span style="font-size:12px;color:var(--text-secondary);" id="voucher-toggle-label">Voucher: On</span>
+                <div class="wlan-toggle" id="voucher-toggle" onclick="toggleVoucher()" title="Toggle voucher code redemption">
                     <div class="wlan-toggle-knob"></div>
                 </div>
             </div>
         </div>
         <div class="card-body">
-            <div class="field-hint mb-2">Temporarily blocks a device from redeeming vouchers after too many wrong codes in a row.</div>
+            <!-- Wrong-code suspension -->
+            <div class="d-flex align-items-start justify-content-between gap-3 mb-3">
+                <div style="min-width:0;">
+                    <div style="font-weight:500;">Wrong-Code Suspension</div>
+                    <div class="field-hint">Temporarily block a device from redeeming vouchers after too many wrong codes in a row.</div>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                    <span id="vs-badge" class="at-badge off">Off</span>
+                    <div id="vs-toggle" class="wlan-toggle" onclick="toggleVoucherStrike()" title="Toggle wrong-voucher suspension">
+                        <div class="wlan-toggle-knob"></div>
+                    </div>
+                </div>
+            </div>
             <div class="row g-3">
                 <div class="col-sm-6">
                     <label class="form-label">Wrong Attempts Threshold</label>
@@ -255,36 +282,11 @@
                 </div>
             </div>
             <hr class="my-3" style="border-color:var(--border-color);">
-            <div class="d-flex gap-2 flex-wrap">
-                <button class="btn btn-primary" onclick="saveVoucherStrike()">Save Voucher Settings</button>
-                <button class="btn btn-outline-secondary" onclick="loadConfig()">Discard</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- ═══ Internet Requirement ═══ -->
-    <div class="card">
-        <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-            <span>Internet Requirement</span>
-            <span id="inet-status-badge" class="status-badge stopped"><span class="dot"></span><span id="inet-status-text">…</span></span>
-        </div>
-        <div class="card-body">
-            <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+            <!-- Require internet -->
+            <div class="d-flex align-items-start justify-content-between gap-3">
                 <div style="min-width:0;">
-                    <div style="font-weight:500;">Disable Insert Coin (no internet)</div>
-                    <div class="field-hint">Refuse to start a new coin session while the router has no internet. Coins already in a session are never interrupted.</div>
-                </div>
-                <div class="d-flex align-items-center gap-2 flex-shrink-0">
-                    <span id="ci-badge" class="at-badge off">Off</span>
-                    <div id="ci-toggle" class="wlan-toggle" onclick="toggleCoinInternet()" title="Require internet to insert coins">
-                        <div class="wlan-toggle-knob"></div>
-                    </div>
-                </div>
-            </div>
-            <div class="d-flex align-items-center justify-content-between gap-3">
-                <div style="min-width:0;">
-                    <div style="font-weight:500;">Disable Voucher Conversion (no internet)</div>
-                    <div class="field-hint">Refuse to redeem a voucher code while the router has no internet.</div>
+                    <div style="font-weight:500;">Require Internet</div>
+                    <div class="field-hint">Refuse voucher redemption while the router has no WAN access.</div>
                 </div>
                 <div class="d-flex align-items-center gap-2 flex-shrink-0">
                     <span id="vi-badge" class="at-badge off">Off</span>
@@ -292,6 +294,11 @@
                         <div class="wlan-toggle-knob"></div>
                     </div>
                 </div>
+            </div>
+            <hr class="my-3" style="border-color:var(--border-color);">
+            <div class="d-flex gap-2 flex-wrap">
+                <button class="btn btn-primary" onclick="saveVoucherStrike()">Save Voucher Settings</button>
+                <button class="btn btn-outline-secondary" onclick="loadConfig()">Discard</button>
             </div>
         </div>
     </div>
@@ -385,6 +392,7 @@ function loadConfig(){
             document.getElementById('c-cooldown').value       = d.coin_cooldown||'';
             setCoinStrikeUI(d.coin_strike_enabled===true||d.coin_strike_enabled==='1'||d.coin_strike_enabled===1);
             setCoinToggleUI(d.coin_on);
+            setVoucherToggleUI(d.voucher_on);
             setAntiTetherUI(d.anti_tether===true||d.anti_tether==='1'||d.anti_tether===1);
             setLanIsolateUI(d.lan_isolate===true||d.lan_isolate==='1'||d.lan_isolate===1);
             setMacFixUI(d.mac_randomization_fix===true||d.mac_randomization_fix==='1'||d.mac_randomization_fix===1);
@@ -489,6 +497,18 @@ function toggleMacFix(){
         tog.classList.remove('busy');
         if(d.ok){ setMacFixUI(d.mac_randomization_fix); toastr.success('MAC randomization fix '+(d.mac_randomization_fix?'enabled':'disabled')); }
         else toastr.error('Failed: '+(d.error||'unknown'));
+    });
+}
+
+/* ── Voucher toggle ── */
+function setVoucherToggleUI(on){ var tog=document.getElementById('voucher-toggle'); var lbl=document.getElementById('voucher-toggle-label'); if(on){tog.classList.add('on');lbl.textContent='Voucher: On';}else{tog.classList.remove('on');lbl.textContent='Voucher: Off';} }
+function toggleVoucher(){
+    var tog=document.getElementById('voucher-toggle'); tog.classList.add('busy');
+    var newState=tog.classList.contains('on')?0:1;
+    postForm('voucher_toggle','enabled='+newState,function(d){
+        tog.classList.remove('busy');
+        if(d.ok){setVoucherToggleUI(d.voucher_on);toastr.success('Voucher input '+(d.voucher_on?'enabled':'disabled'));}
+        else toastr.error('Toggle failed: '+(d.error||'unknown'));
     });
 }
 
