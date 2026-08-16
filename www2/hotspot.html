@@ -172,6 +172,16 @@
                         <div class="field-hint">Idle time before session auto-pauses</div>
                     </div>
                 </div>
+                <!-- Auto-resume on reconnect -->
+                <div class="col-sm-6">
+                    <div class="d-flex align-items-center justify-content-between">
+                        <label class="form-label mb-0">Auto-Resume on Reconnect</label>
+                        <div id="ar-toggle" class="wlan-toggle" onclick="toggleAutoResumeUI()" title="Automatically resume a paused session the moment the device reconnects">
+                            <div class="wlan-toggle-knob"></div>
+                        </div>
+                    </div>
+                    <div class="field-hint">Skip the Resume Time button — restore remaining time as soon as a paused device is back online</div>
+                </div>
             </div>
             <hr class="my-3" style="border-color:var(--border-color);">
             <div class="d-flex gap-2">
@@ -387,6 +397,7 @@ function loadConfig(){
             setRateField('r-unauth-val','r-unauth-unit',  d.unauth_rate||'256kbit');
             document.getElementById('r-inactivity').value = d.inactivity_timeout||'300';
             setAutoPauseUI(d.auto_pause_enabled===true||d.auto_pause_enabled==='1'||d.auto_pause_enabled===1);
+            setAutoResumeUI(d.auto_resume_enabled===true||d.auto_resume_enabled==='1'||d.auto_resume_enabled===1);
             document.getElementById('c-coin-timeout').value  = d.coin_timeout||'';
             document.getElementById('c-strike-threshold').value = d.coin_strike_threshold||'';
             document.getElementById('c-cooldown').value       = d.coin_cooldown||'';
@@ -414,6 +425,7 @@ function saveRates(){
     var uar = getRateStr('r-unauth-val','r-unauth-unit');
     var ina = document.getElementById('r-inactivity').value.trim();
     var apOn = document.getElementById('ap-toggle').classList.contains('on');
+    var arOn = document.getElementById('ar-toggle').classList.contains('on');
     if(!gr){toastr.warning('Global Cap is required');return;}
     showOverlay('Saving…');
     var body='global_rate='+encodeURIComponent(gr)
@@ -421,7 +433,8 @@ function saveRates(){
             +'&per_user_burst='+encodeURIComponent(pub)
             +'&unauth_rate='+encodeURIComponent(uar)
             +'&inactivity_timeout='+encodeURIComponent(ina)
-            +'&auto_pause_enabled='+(apOn?'1':'0');
+            +'&auto_pause_enabled='+(apOn?'1':'0')
+            +'&auto_resume_enabled='+(arOn?'1':'0');
     postForm('config_set', body, function(d){
         hideOverlay();
         if(!d.ok){toastr.error('Save failed');return;}
@@ -441,6 +454,16 @@ function setAutoPauseUI(on){
 function toggleAutoPauseUI(){
     var tog=document.getElementById('ap-toggle');
     setAutoPauseUI(!tog.classList.contains('on'));
+}
+
+/* ── Auto-resume switch (local UI state; persisted via Save & Apply) ── */
+function setAutoResumeUI(on){
+    var tog=document.getElementById('ar-toggle');
+    if(on) tog.classList.add('on'); else tog.classList.remove('on');
+}
+function toggleAutoResumeUI(){
+    var tog=document.getElementById('ar-toggle');
+    setAutoResumeUI(!tog.classList.contains('on'));
 }
 
 /* ── Anti-tethering toggle ── */

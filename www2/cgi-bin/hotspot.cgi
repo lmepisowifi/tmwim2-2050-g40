@@ -566,6 +566,8 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
     IT="${INACTIVITY_TIMEOUT:-$(read_lmehspt_var INACTIVITY_TIMEOUT)}"
     AP="${AUTO_PAUSE_ENABLED:-$(read_lmehspt_var AUTO_PAUSE_ENABLED)}"
     AP_BOOL="false"; [ "${AP:-1}" = "1" ] && AP_BOOL="true"
+    AR="${AUTO_RESUME_ENABLED:-$(read_lmehspt_var AUTO_RESUME_ENABLED)}"
+    AR_BOOL="false"; [ "${AR:-0}" = "1" ] && AR_BOOL="true"
     CE="${COIN_ENABLED:-$(read_lmehspt_var COIN_ENABLED)}"
     VE="${VOUCHER_ENABLED:-$(read_lmehspt_var VOUCHER_ENABLED)}"
     NIP="${NODEMCU_IP:-$(read_lmehspt_var NODEMCU_IP)}"
@@ -612,6 +614,7 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
 \"unauth_rate\":\"$(esc_json "$UAR")\",
 \"inactivity_timeout\":\"$(esc_json "$IT")\",
 \"auto_pause_enabled\":$AP_BOOL,
+\"auto_resume_enabled\":$AR_BOOL,
 \"coin_enabled\":\"$(esc_json "$CE")\",
 \"coin_on\":$COIN_ON,
 \"voucher_on\":$VOUCHER_ON,
@@ -680,6 +683,7 @@ if echo "$QS" | $BB grep -q "action=config_set"; then
     apply_if "UNAUTH_RATE"         "$(fget unauth_rate)"
     apply_if "INACTIVITY_TIMEOUT"  "$(fget inactivity_timeout)"
     apply_if "AUTO_PAUSE_ENABLED"  "$(fget auto_pause_enabled)"
+    apply_if "AUTO_RESUME_ENABLED" "$(fget auto_resume_enabled)"
     apply_if "NODEMCU_IP"          "$(fget nodemcu_ip)"
     apply_if "NODEMCU_MAC"         "$(fget nodemcu_mac)"
     apply_if "NODEMCU_PORT"        "$(fget nodemcu_port)"

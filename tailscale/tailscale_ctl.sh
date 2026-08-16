@@ -10,8 +10,8 @@ export GOMAXPROCS=2
 
 ROOT="/lmepisowifi"
 TS_DIR="$ROOT/tailscale"
-DAEMON="$TS_DIR/tailscaled-small"
-CLI="$TS_DIR/tailscale-small"
+DAEMON="$TS_DIR/tailscaled"
+CLI="$TS_DIR/tailscale"
 
 CFG_DIR="/config/tailscale"
 CFG="$CFG_DIR/config.env"

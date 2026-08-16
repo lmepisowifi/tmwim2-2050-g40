@@ -21,18 +21,18 @@
 BB="busybox"
 
 # ── Built-in defaults ─────────────────────────────────────────────────────
-DEFAULT_TPL_NEW_SALE='New Sale%0ATotal: *totaltime*%0AAdded: *addedtime*%0ARemaining: *remainingtime*%0ACoin: ₱*insertcoinamt*%0AMAC: *mac*%0AActive Users: *activeusrcount*%0ADaily: ₱*dailyamt* | Monthly: ₱*monthlyamt* | Yearly: ₱*yearlyamt*%0A*date*'
+DEFAULT_TPL_NEW_SALE='%0A-------New Sale-------%0AMAC: *mac*%0ATime Added: *addedtime*%0ATotal Time: *totaltime*%0ARemaining Time: *remainingtime*%0ACoin: ₱*insertcoinamt*%0A%0AOther Information: %0AActive Users: *activeusrcount*%0ADaily: ₱*dailyamt* | Monthly: ₱*monthlyamt* | Yearly: ₱*yearlyamt*%0ADate: *date*%0A%0ASystem Information:%0ACPU Usage: *cpuusage* %0ARAM Usage: *ramusage* %0A'
 DEFAULT_TPL_COINS_INSERTED='Coins Inserted%0AAmount: ₱*insertcoinamt*%0ADevice: *mac*'
-DEFAULT_TPL_ANTI_TROLL='Anti-Troll Suspension%0ADevice suspended: *mac*%0AStrikes: *strikes*/*strikemax* — no coins inserted *strikemax* times in a row%0ASuspended for: *cooldownmins* minutes'
-DEFAULT_TPL_VOUCHER_ANTI_TROLL='Voucher Suspension%0ADevice suspended: *mac*%0AStrikes: *strikes*/*strikemax* — wrong voucher code entered *strikemax* times in a row%0ASuspended for: *cooldownmins* minutes'
-DEFAULT_TPL_SESSION_EXPIRED='Session Expired%0ADevice: *mac*%0AActive Users: *activeusrcount*'
-DEFAULT_TPL_SESSION_PAUSED='Session *reason* Paused%0ARemaining: *remainingtime*%0ATotal: *totaltime*%0ADevice: *mac*%0AActive Users: *activeusrcount*'
-DEFAULT_TPL_SESSION_RESUMED='Session Resumed%0ARemaining: *remainingtime*%0ATotal: *totaltime*%0ADevice: *mac*%0AActive Users: *activeusrcount*'
-DEFAULT_TPL_VOUCHER_REDEEMED='Voucher Redeemed%0AVoucher: *voucher*%0ATime added: *addedtime*%0ATotal: *totaltime*%0ARemaining: *remainingtime*%0ADevice: *mac*'
-DEFAULT_TPL_DAILY_REPORT='Daily Income Report%0ADate: *label*%0ATotal: ₱*amount*'
-DEFAULT_TPL_MONTHLY_REPORT='Monthly Income Report%0AMonth: *label*%0ATotal: ₱*amount*'
-DEFAULT_TPL_YEARLY_REPORT='Yearly Income Report%0AYear: *label*%0ATotal: ₱*amount*'
-DEFAULT_TPL_TEST_ALERT='Hotspot test alert%0AIf you can read this, notifications are working.'
+DEFAULT_TPL_ANTI_TROLL='-------Insert Coin Suspended-------%0ADevice: *mac*%0AReached *strikemax* Strikes%0ASuspended For: *cooldownmins* minute(s)'
+DEFAULT_TPL_VOUCHER_ANTI_TROLL='-------Voucher Conversion Suspended-------%0ADevice: *mac*%0AReached *strikemax* Strikes%0ASuspended For: *cooldownmins* minute(s)'
+DEFAULT_TPL_SESSION_EXPIRED='-------Ran Out of Time-------%0ADevice: *mac*'
+DEFAULT_TPL_SESSION_PAUSED='-------Time Paused *reason*-------%0ADevice: *mac*'
+DEFAULT_TPL_SESSION_RESUMED='-------Resumed Time-------%0ADevice: *mac*%0ATime Remaining: *remainingtime*%0AActive Users: *activeusrcount*'
+DEFAULT_TPL_VOUCHER_REDEEMED='-------Redeemed Voucher-------%0ADevice: *mac*%0AVoucher: *voucher*%0ATime Added: *addedtime*%0ATotal Time: *totaltime*%0ARemaining Time: *remainingtime*%0A'
+DEFAULT_TPL_DAILY_REPORT='-------Daily Income-------%0ADate: *label*%0ATotal: ₱*amount*'
+DEFAULT_TPL_MONTHLY_REPORT='-------Monthly Income------- Report%0AMonth: *label*%0ATotal: ₱*amount*'
+DEFAULT_TPL_YEARLY_REPORT='-------Yearly Income-------%0AYear: *label*%0ATotal: ₱*amount*'
+DEFAULT_TPL_TEST_ALERT='this is a test message.'
 
 # ── Load user overrides ──────────────────────────────────────────────────
 _TPL_ENV="/lmepisowifi/hotspot_data/notify_templates.env"

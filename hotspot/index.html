@@ -1384,6 +1384,7 @@ var _queuePollID      = null;
 var _coinPendingWait  = false;   
 var _cachedRates      = '';      
 var _coinSuspended    = false;
+var _autoResuming     = false;   // guards against firing doResume(true) twice while one is in flight
 var _coinCooldownRemaining = 0;
 var _coinNodemcus     = [];      // [{id,title}, ...] from coin.sh's config action — only >1 entry shows the picker
 var _coinNodeID       = null;    // which unit the in-flight/active session targets
@@ -1629,7 +1630,17 @@ function checkStatus() {
         startTimer(d.remaining, d.total, d.used);
       } else {
         renderDeviceInfo(d, 'l');
-        
+
+        // Auto-Resume switch (admin-configured): skip the paused screen
+        // entirely and fire the same resume=1 request the button below
+        // sends. Guarded by _autoResuming so an overlapping poll (e.g. a
+        // visibilitychange firing mid-request) can't double-submit.
+        if (d.has_paused && d.remaining > 0 && d.auto_resume && !_autoResuming) {
+          _autoResuming = true;
+          doResume(true);
+          return;
+        }
+
         var loginTitle = document.getElementById('login-title');
         var loginSub   = document.getElementById('login-sub');
 
@@ -1670,7 +1681,7 @@ function checkStatus() {
     });
 }
 
-function doResume() {
+function doResume(auto) {
   fetch('/cgi-bin/login.sh', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1678,8 +1689,15 @@ function doResume() {
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
+    _autoResuming = false;
     if (d.ok) {
       show('v-status');
+      checkStatus();
+    } else if (auto) {
+      // Silent by design — the admin turned this on so the customer never
+      // sees a resume prompt. A miss here (e.g. a benign race with the
+      // paused record) just falls back to the normal paused/disconnected
+      // screen, where the manual button still works.
       checkStatus();
     } else {
       var msgs = {
@@ -1689,7 +1707,10 @@ function doResume() {
       toastr.error(msgs[d.error] || 'Failed to resume session.');
     }
   })
-  .catch(function() { toastr.error('Connection error.'); });
+  .catch(function() {
+    _autoResuming = false;
+    if (!auto) toastr.error('Connection error.');
+  });
 }
 
 function doLogin() {

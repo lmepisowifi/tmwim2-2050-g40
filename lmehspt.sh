@@ -42,6 +42,12 @@ BR0_GATEWAY="192.168.18.1"   # FALLBACK only. The live gateway is auto-detected 
 GLOBAL_RATE="20mbit"
 INACTIVITY_TIMEOUT="300"
 AUTO_PAUSE_ENABLED="1"
+# Off by default: existing deployments keep today's manual "Resume Time"
+# tap unless the admin opts in via www2. When on, status.sh flags paused
+# sessions as auto-resumable and the portal page (index.html) fires the
+# same resume=1 request the button would, the moment the device's next
+# status poll lands after it reconnects — no tap needed.
+AUTO_RESUME_ENABLED="0"
 BOOT_MARKER="/tmp/hotspot_boot.mark"
 ACTIVITY_FILE="/tmp/hotspot_activity.txt"
 PER_USER_RATE="5mbit"
@@ -1443,6 +1449,13 @@ write_coin_config() {
         printf 'UNAUTH_RATE="%s"\n'         "$UNAUTH_RATE"
         printf 'INACTIVITY_TIMEOUT="%s"\n'  "$INACTIVITY_TIMEOUT"
         printf 'AUTO_PAUSE_ENABLED="%s"\n'  "${AUTO_PAUSE_ENABLED:-1}"
+        # Without this line, every write_coin_config() call (hotspot
+        # start/restart, NodeMCU IP change, boot) regenerates
+        # coin_config.env from this exact list and silently drops whatever
+        # the admin toggled via hotspot.cgi's config_set action — status.sh
+        # only sources this cache file (never globals.env directly), so it
+        # would then see AUTO_RESUME_ENABLED as unset and fall back to off.
+        printf 'AUTO_RESUME_ENABLED="%s"\n' "${AUTO_RESUME_ENABLED:-0}"
         printf 'PORTAL_IP="%s"\n'           "$PORTAL_IP"
         printf 'PORTAL_PORT="%s"\n'         "$PORTAL_PORT"
         printf 'DHCP_START="%s"\n'          "$DHCP_START"

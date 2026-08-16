@@ -127,7 +127,13 @@ if [ -n "$PAUSED" ]; then
     REMAINING=$($BB echo "$PAUSED" | $BB awk '{print $3}')
     TOTAL=$($BB echo "$PAUSED" | $BB awk '{print $4}')
     [ -z "$TOTAL" ] && TOTAL=$REMAINING
-    $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"has_paused\":true,\"remaining\":$REMAINING,\"total\":$TOTAL,${CONN_JSON}}"
+    # AUTO_RESUME_ENABLED comes from coin_config.env (sourced above). When
+    # on, index.html fires the same resume=1 request the "Resume Time"
+    # button sends, on this same status poll — no tap needed. login.sh
+    # still does the actual resume, so this flag never bypasses its
+    # locking/atomic-write path, just who clicks the button.
+    AR_BOOL="false"; [ "${AUTO_RESUME_ENABLED:-0}" = "1" ] && AR_BOOL="true"
+    $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"has_paused\":true,\"remaining\":$REMAINING,\"total\":$TOTAL,\"auto_resume\":$AR_BOOL,${CONN_JSON}}"
 else
     $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",${CONN_JSON}}"
 fi
