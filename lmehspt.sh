@@ -1,4 +1,16 @@
 #!/bin/sh
+# ---------------------------------------------------------------------------
+# lmepisowifi — https://github.com/lmepisowifi/tmwim2-2050-g40
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The lmepisowifi Project — see AUTHORS
+#
+# Licensed under the GNU AGPLv3 (see LICENSE). Modifying or rewriting this
+# file — including by running it through an LLM — does not remove these
+# obligations: keep this notice, mark your changes, and offer Corresponding
+# Source to network users (AGPLv3 §5, §13). See PROVENANCE.md before
+# presenting this as your own original work.
+# ---------------------------------------------------------------------------
+
 
 # ============================================================
 # lmehspt.sh — Piso Wifi Hotspot Controller
@@ -53,6 +65,15 @@ ACTIVITY_FILE="/tmp/hotspot_activity.txt"
 PER_USER_RATE="5mbit"
 PER_USER_BURST="100k"
 UNAUTH_RATE="1000kbit"
+# Off by default: existing deployments keep today's fixed PER_USER_RATE
+# guarantee unless the admin opts in via www2. When on, each online
+# session's guaranteed HTB "rate" is recomputed as GLOBAL_RATE divided by
+# however many sessions are currently online (PER_USER_RATE is ignored),
+# while "ceil" always stays pinned to GLOBAL_RATE — so HTB's normal
+# borrowing still lets a single active client burst up to the full global
+# rate whenever everyone else is idle. See _qos_equal_share_kbit() /
+# qos_rebalance_equal_share().
+EQUAL_SHARING_ENABLED="0"
 IP_MAP_FILE="/tmp/hotspot_ip_map.txt"
 
 HOTSPOT_ENABLED="1"
@@ -994,8 +1015,70 @@ get_ip_for_mac() {
     $BB grep -i "^$mac " "$IP_MAP_FILE" 2>/dev/null | $BB awk '{print $2}' | head -1
 }
 
+# Convert a tc-normalised rate string (mbit/kbit/gbit/bit — see _norm_rate)
+# into an integer kbit value, for arithmetic like the equal-share divide
+# below. Unrecognised input yields 0.
+_rate_to_kbit() {
+    local r="$1" num
+    case "$r" in
+        *gbit) num=${r%gbit}; echo $(( num * 1000000 )) ;;
+        *mbit) num=${r%mbit}; echo $(( num * 1000 )) ;;
+        *kbit) num=${r%kbit}; echo $(( num )) ;;
+        *bit)  num=${r%bit};  echo $(( num / 1000 )) ;;
+        *) echo 0 ;;
+    esac
+}
+
+# Each online (non-expired) session's fair-share guaranteed rate, in kbit,
+# when Equal Bandwidth Sharing is on: GLOBAL_RATE split evenly across
+# however many sessions are currently online. Callers always keep "ceil"
+# pinned to GLOBAL_RATE, so this only changes the GUARANTEED floor — HTB's
+# normal borrowing still lets a lone active client reach the full global
+# rate whenever the other shares are idle.
+_qos_equal_share_kbit() {
+    local n=0 global_kbit share NOW mac expiry _rest
+    if [ -f "$SESSION_FILE" ]; then
+        NOW=$($BB awk '{print int($1)}' /proc/uptime)
+        while read -r mac expiry _rest; do
+            [ -n "$mac" ] && [ -n "$expiry" ] || continue
+            [ "$expiry" -gt "$NOW" ] || continue
+            n=$(( n + 1 ))
+        done < "$SESSION_FILE"
+    fi
+    [ "$n" -lt 1 ] && n=1
+    global_kbit=$(_rate_to_kbit "$(_norm_rate "$GLOBAL_RATE")")
+    share=$(( global_kbit / n ))
+    # Floor so tc never gets handed an invalid 0kbit rate when a lot of
+    # clients are online at once.
+    [ "$share" -lt 8 ] && share=8
+    echo "$share"
+}
+
+# Re-spread GLOBAL_RATE across every currently-online session's already-
+# created HTB class. Called whenever the number of online sessions changes
+# (a session joins, expires, or is paused) so every client's guaranteed
+# floor stays equal, not just whatever it was when its class was created.
+# No-op unless Equal Bandwidth Sharing is enabled.
+qos_rebalance_equal_share() {
+    case "${EQUAL_SHARING_ENABLED:-0}" in 1|yes|true) ;; *) return ;; esac
+    [ -f "$SESSION_FILE" ] || return
+    local NOW mac expiry _rest ip cid share
+    share="$(_qos_equal_share_kbit)kbit"
+    NOW=$($BB awk '{print int($1)}' /proc/uptime)
+    while read -r mac expiry _rest; do
+        [ -n "$mac" ] && [ -n "$expiry" ] || continue
+        [ "$expiry" -gt "$NOW" ] || continue
+        ip=$(get_ip_for_mac "$mac")
+        [ -z "$ip" ] && continue
+        cid=$(ip_to_cid "$ip")
+        [ -z "$cid" ] && continue
+        tc class change dev $WAN_INT    classid 1:$cid htb rate $share ceil $GLOBAL_RATE burst $PER_USER_BURST quantum 1500 2>/dev/null
+        tc class change dev $HOTSPOT_BR classid 2:$cid htb rate $share ceil $GLOBAL_RATE burst $PER_USER_BURST quantum 1500 2>/dev/null
+    done < "$SESSION_FILE"
+}
+
 add_user_qos() {
-    local mac=$1 ip cid
+    local mac=$1 ip cid _rate
     ip=$(get_ip_for_mac "$mac")
     [ -z "$ip" ] && return
     cid=$(ip_to_cid "$ip")
@@ -1005,12 +1088,21 @@ add_user_qos() {
     GLOBAL_RATE=$(_norm_rate "$GLOBAL_RATE")
     PER_USER_RATE=$(_norm_rate "$PER_USER_RATE")
 
+    # Equal Bandwidth Sharing: use GLOBAL_RATE divided by the number of
+    # online sessions as the guaranteed floor instead of the fixed
+    # PER_USER_RATE. ceil stays GLOBAL_RATE either way (below), so a lone
+    # active client can still borrow up to the full pipe when idle.
+    case "${EQUAL_SHARING_ENABLED:-0}" in
+        1|yes|true) _rate="$(_qos_equal_share_kbit)kbit" ;;
+        *)          _rate="$PER_USER_RATE" ;;
+    esac
+
     iptables -t mangle -I FORWARD 1 -i $HOTSPOT_BR -m mac --mac-source "$mac" -j MARK --set-mark $cid 2>/dev/null
     
     # ============================================================
     # UPLOAD (WAN) Leaf QoS - Gaming Prioritization
     # ============================================================
-    tc class add dev $WAN_INT parent 1:1 classid 1:$cid htb rate $PER_USER_RATE ceil $GLOBAL_RATE burst $PER_USER_BURST quantum 1500 2>/dev/null
+    tc class add dev $WAN_INT parent 1:1 classid 1:$cid htb rate $_rate ceil $GLOBAL_RATE burst $PER_USER_BURST quantum 1500 2>/dev/null
     
     # Create 2 priority bands (Band 1 = Gaming/VIP, Band 2 = Bulk). Priomap defaults everything to Band 2.
     tc qdisc add dev $WAN_INT parent 1:$cid handle ${cid}: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 2>/dev/null
@@ -1033,7 +1125,7 @@ add_user_qos() {
     # ============================================================
     # DOWNLOAD (LAN Bridge) Leaf QoS - Gaming Prioritization
     # ============================================================
-    tc class add dev $HOTSPOT_BR parent 2:1 classid 2:$cid htb rate $PER_USER_RATE ceil $GLOBAL_RATE burst $PER_USER_BURST quantum 1500 2>/dev/null
+    tc class add dev $HOTSPOT_BR parent 2:1 classid 2:$cid htb rate $_rate ceil $GLOBAL_RATE burst $PER_USER_BURST quantum 1500 2>/dev/null
     
     tc qdisc add dev $HOTSPOT_BR parent 2:$cid handle $((cid+500)): prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 2>/dev/null
     
@@ -1086,6 +1178,10 @@ restore_qos_sessions() {
         tc class show dev $WAN_INT classid 1:$cid 2>/dev/null | $BB grep -q ":" && continue
         add_user_qos "$mac"
     done < "$SESSION_FILE"
+    # A newly (re)created class above changes how many sessions are online,
+    # so re-spread the equal share across everyone once, in a single pass,
+    # rather than after each individual add_user_qos call.
+    qos_rebalance_equal_share
 }
 
 start_dhcp() {
@@ -1275,6 +1371,11 @@ pause_session() {
     fi
     _unlock
 
+    # This mac just dropped out of SESSION_FILE (no longer "online"), so
+    # re-spread the equal share across whoever's left. No-op unless Equal
+    # Bandwidth Sharing is enabled.
+    qos_rebalance_equal_share
+
     $BB grep -v "^$mac " "$ACTIVITY_FILE" > /tmp/activity_pause.tmp 2>/dev/null
     $BB mv /tmp/activity_pause.tmp "$ACTIVITY_FILE"
 
@@ -1447,6 +1548,13 @@ write_coin_config() {
         printf 'PER_USER_RATE="%s"\n'       "$PER_USER_RATE"
         printf 'PER_USER_BURST="%s"\n'      "$PER_USER_BURST"
         printf 'UNAUTH_RATE="%s"\n'         "$UNAUTH_RATE"
+        # Same "without this line" reasoning as AUTO_RESUME_ENABLED just
+        # below: add_user_qos()/qos_rebalance_equal_share() only ever see
+        # this var via a re-source of coin_config.env each watchdog tick
+        # (never globals.env directly), so without dumping it here every
+        # write_coin_config() call would silently drop the admin's Equal
+        # Sharing toggle back to unset/off.
+        printf 'EQUAL_SHARING_ENABLED="%s"\n' "${EQUAL_SHARING_ENABLED:-0}"
         printf 'INACTIVITY_TIMEOUT="%s"\n'  "$INACTIVITY_TIMEOUT"
         printf 'AUTO_PAUSE_ENABLED="%s"\n'  "${AUTO_PAUSE_ENABLED:-1}"
         # Without this line, every write_coin_config() call (hotspot
@@ -1963,6 +2071,7 @@ fi
             NOW=$($BB awk '{print int($1)}' /proc/uptime)
             _SES_TMP="${SESSION_FILE}.tmp"
             > "$_SES_TMP"
+            _expired_this_tick=0
             
             _lock
             while read -r mac expiry total; do
@@ -1973,6 +2082,7 @@ fi
                         $BB grep -v "^$mac " "$ACTIVITY_FILE" > /tmp/activity_exp.tmp 2>/dev/null
                         $BB mv /tmp/activity_exp.tmp "$ACTIVITY_FILE" 2>/dev/null
                         del_user_qos "$mac"
+                        _expired_this_tick=1
                         
                         _users_file_replace_excl "$mac"
                         
@@ -1994,6 +2104,11 @@ fi
             done < "$SESSION_FILE"
             $BB mv "$_SES_TMP" "$SESSION_FILE"
             _unlock
+
+            # One or more sessions just expired (fewer users online now) —
+            # re-spread the equal share across whoever's left. No-op unless
+            # Equal Bandwidth Sharing is enabled.
+            [ "$_expired_this_tick" = "1" ] && qos_rebalance_equal_share
         fi
 
         check_inactivity

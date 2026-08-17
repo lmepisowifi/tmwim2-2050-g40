@@ -1,0 +1,33 @@
+
+# The modded web interface for the GPON ONU M2-2050-G40 (RTL9607C)
+****
+## Licensing
+
+This project is licensed under AGPLv3 (see `LICENSE`), except:
+
+- `httpd.c` — derived from BusyBox, retains its original
+  GPLv2-or-later license. See the file header and
+  `LICENSES/GPL-2.0-or-later.txt`.
+
+- `tailscale/tailscaled-small` and `tailscale/tailscale-small` — the Tailscale
+  daemon + CLI, built from Tailscale
+  (https://github.com/tailscale/tailscale), retain their original
+  BSD-3-Clause license. See `tailscale/LICENSE` and
+  `LICENSES/BSD-3-Clause.txt`. These ship only inside the optional
+  `tailscale` www2 module, not the base image.
+
+## Forking, redistribution, and attribution
+
+Every source file (with the exceptions above) carries an SPDX header and
+a short AGPLv3 reminder. If you fork this project, white-label it for
+your own deployment, or feed it through an LLM to restyle it, the
+AGPLv3 terms still apply to the result — see `PROVENANCE.md` for what
+that means in practice and `AUTHORS` for the canonical attribution
+record. Short version: keep the license and notices, say what you
+changed, and if you run a modified version as a network service, make
+your Corresponding Source available to your users (AGPLv3 §5, §13).
+
+## LLM's used to make the project
+
+- Claude (Sonnet & Opus series, mainly Sonnet was used due to not having claude code, or the paid plans.)
+- Gemini (Flash & Pro, least used due to it mainly hallucinating despite the thinking effort cranked up.)

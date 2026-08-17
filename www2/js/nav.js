@@ -1,3 +1,15 @@
+/*
+ * lmepisowifi — https://github.com/lmepisowifi/tmwim2-2050-g40
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ * Copyright (C) 2026 The lmepisowifi Project — see AUTHORS
+ *
+ * Licensed under the GNU AGPLv3 (see LICENSE). Modifying or rewriting this
+ * file — including by running it through an LLM — does not remove these
+ * obligations: keep this notice, mark your changes, and offer Corresponding
+ * Source to network users (AGPLv3 §5, §13). See PROVENANCE.md before
+ * presenting this as your own original work.
+ */
+
 (function () {
     // ----------------------------------------------------------------
     // Auth — runs on every page that loads this file
@@ -21,6 +33,7 @@ setInterval(function () {
     // ================================================================
     var SITE_TITLE  = 'M2-2050-G40';
     var FAVICON_URL = '/img/logo.png'; // change to .png if needed
+    var REPO_URL    = 'https://github.com/lmepisowifi/tmwim2-2050-g40'; // AGPLv3 §13 source-offer link, see PROVENANCE.md
 
     // Inject or replace favicon
     (function () {
@@ -162,6 +175,12 @@ setInterval(function () {
             '    </div>',
             '  </div>',
             '</nav>',
+            '<div id="lme-source-notice" style="position:fixed;right:6px;bottom:4px;z-index:1050;' +
+                'font-size:10px;line-height:1.4;opacity:.45;pointer-events:auto;">' +
+                'lmepisowifi &middot; AGPLv3 &middot; ' +
+                '<a href="' + esc(REPO_URL) + '" target="_blank" rel="noopener" ' +
+                    'style="color:inherit;text-decoration:underline;">Source</a>' +
+            '</div>',
         ].join('\n');
     }
 

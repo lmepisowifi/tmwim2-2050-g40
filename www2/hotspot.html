@@ -1,4 +1,15 @@
 <!DOCTYPE html>
+<!--
+  lmepisowifi — https://github.com/lmepisowifi/tmwim2-2050-g40
+  SPDX-License-Identifier: AGPL-3.0-or-later
+  Copyright (C) 2026 The lmepisowifi Project — see AUTHORS
+
+  Licensed under the GNU AGPLv3 (see LICENSE). Modifying or rewriting this
+  file — including by running it through an LLM — does not remove these
+  obligations: keep this notice, mark your changes, and offer Corresponding
+  Source to network users (AGPLv3 §5, §13). See PROVENANCE.md before
+  presenting this as your own original work.
+-->
 <html lang="en" data-bs-theme="dark">
 <head>
     <meta charset="UTF-8">
@@ -128,7 +139,7 @@
                             <option value="kbit">Kbit/s</option>
                         </select>
                     </div>
-                    <div class="field-hint">Minimum bandwidth each active client can claim</div>
+                    <div class="field-hint" id="pur-hint">Minimum bandwidth each active client can claim</div>
                 </div>
                 <!-- Per-user burst -->
                 <div class="col-sm-6">
@@ -154,6 +165,32 @@
                     </div>
                     <div class="field-hint">Captive-portal redirect speed for new clients</div>
                 </div>
+                <!-- Equal bandwidth sharing -->
+                <div class="col-sm-6">
+                    <div class="d-flex align-items-center justify-content-between">
+                        <label class="form-label mb-0">Equal Sharing</label>
+                        <div id="es-toggle" class="wlan-toggle" onclick="toggleEqualShareUI()" title="Split the Global Cap evenly across everyone currently online">
+                            <div class="wlan-toggle-knob"></div>
+                        </div>
+                    </div>
+                    <div class="field-hint">Splits the Global Cap evenly among online clients (e.g. 20 Mbit/s ÷ 4 users ≈ 5 Mbit/s each). A single active client can still burst up to the full Global Cap whenever the others are idle. Overrides Per-User Rate while enabled.</div>
+                </div>
+            </div>
+            <hr class="my-3" style="border-color:var(--border-color);">
+            <div class="d-flex gap-2">
+                <button class="btn btn-primary" onclick="saveRates()">Save &amp; Apply</button>
+                <button class="btn btn-outline-secondary" onclick="loadConfig()">Discard</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══ Session Settings ═══ -->
+    <div class="card mb-3">
+        <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <span>Session Settings</span>
+        </div>
+        <div class="card-body">
+            <div class="row g-3">
                 <!-- Auto-pause + inactivity timeout -->
                 <div class="col-sm-6">
                     <div class="d-flex align-items-center justify-content-between">
@@ -185,7 +222,7 @@
             </div>
             <hr class="my-3" style="border-color:var(--border-color);">
             <div class="d-flex gap-2">
-                <button class="btn btn-primary" onclick="saveRates()">Save &amp; Apply</button>
+                <button class="btn btn-primary" onclick="saveSessionSettings()">Save &amp; Apply</button>
                 <button class="btn btn-outline-secondary" onclick="loadConfig()">Discard</button>
             </div>
         </div>
@@ -398,6 +435,7 @@ function loadConfig(){
             document.getElementById('r-inactivity').value = d.inactivity_timeout||'300';
             setAutoPauseUI(d.auto_pause_enabled===true||d.auto_pause_enabled==='1'||d.auto_pause_enabled===1);
             setAutoResumeUI(d.auto_resume_enabled===true||d.auto_resume_enabled==='1'||d.auto_resume_enabled===1);
+            setEqualShareUI(d.equal_sharing_enabled===true||d.equal_sharing_enabled==='1'||d.equal_sharing_enabled===1);
             document.getElementById('c-coin-timeout').value  = d.coin_timeout||'';
             document.getElementById('c-strike-threshold').value = d.coin_strike_threshold||'';
             document.getElementById('c-cooldown').value       = d.coin_cooldown||'';
@@ -423,24 +461,48 @@ function saveRates(){
     var pur = getRateStr('r-user-val','r-user-unit');
     var pub = getRateStr('r-burst-val','r-burst-unit');
     var uar = getRateStr('r-unauth-val','r-unauth-unit');
-    var ina = document.getElementById('r-inactivity').value.trim();
-    var apOn = document.getElementById('ap-toggle').classList.contains('on');
-    var arOn = document.getElementById('ar-toggle').classList.contains('on');
+    var esOn = document.getElementById('es-toggle').classList.contains('on');
     if(!gr){toastr.warning('Global Cap is required');return;}
     showOverlay('Saving…');
     var body='global_rate='+encodeURIComponent(gr)
             +'&per_user_rate='+encodeURIComponent(pur)
             +'&per_user_burst='+encodeURIComponent(pub)
             +'&unauth_rate='+encodeURIComponent(uar)
-            +'&inactivity_timeout='+encodeURIComponent(ina)
-            +'&auto_pause_enabled='+(apOn?'1':'0')
-            +'&auto_resume_enabled='+(arOn?'1':'0');
+            +'&equal_sharing_enabled='+(esOn?'1':'0');
     postForm('config_set', body, function(d){
         hideOverlay();
         if(!d.ok){toastr.error('Save failed');return;}
         postForm('qos_apply','',function(r2){
             toastr.success(r2.ok?'Rates saved — QoS updating…':'Saved (QoS trigger failed)');
         });
+    });
+}
+
+/* ── Equal bandwidth sharing switch (local UI state; persisted via Save & Apply) ── */
+function setEqualShareUI(on){
+    var tog=document.getElementById('es-toggle');
+    var hint=document.getElementById('pur-hint');
+    if(on){ tog.classList.add('on'); hint.textContent='Ignored while Equal Sharing is enabled'; }
+    else  { tog.classList.remove('on'); hint.textContent='Minimum bandwidth each active client can claim'; }
+}
+function toggleEqualShareUI(){
+    var tog=document.getElementById('es-toggle');
+    setEqualShareUI(!tog.classList.contains('on'));
+}
+
+/* ── Save session settings ── */
+function saveSessionSettings(){
+    var ina = document.getElementById('r-inactivity').value.trim();
+    var apOn = document.getElementById('ap-toggle').classList.contains('on');
+    var arOn = document.getElementById('ar-toggle').classList.contains('on');
+    showOverlay('Saving…');
+    var body='inactivity_timeout='+encodeURIComponent(ina)
+            +'&auto_pause_enabled='+(apOn?'1':'0')
+            +'&auto_resume_enabled='+(arOn?'1':'0');
+    postForm('config_set', body, function(d){
+        hideOverlay();
+        if(d.ok) toastr.success('Session settings saved');
+        else toastr.error('Save failed: '+(d.error||''));
     });
 }
 

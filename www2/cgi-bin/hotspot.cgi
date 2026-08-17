@@ -1,4 +1,16 @@
 #!/bin/sh
+# ---------------------------------------------------------------------------
+# lmepisowifi — https://github.com/lmepisowifi/tmwim2-2050-g40
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The lmepisowifi Project — see AUTHORS
+#
+# Licensed under the GNU AGPLv3 (see LICENSE). Modifying or rewriting this
+# file — including by running it through an LLM — does not remove these
+# obligations: keep this notice, mark your changes, and offer Corresponding
+# Source to network users (AGPLv3 §5, §13). See PROVENANCE.md before
+# presenting this as your own original work.
+# ---------------------------------------------------------------------------
+
 
 SESSION_TIMEOUT=600
 
@@ -568,6 +580,8 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
     AP_BOOL="false"; [ "${AP:-1}" = "1" ] && AP_BOOL="true"
     AR="${AUTO_RESUME_ENABLED:-$(read_lmehspt_var AUTO_RESUME_ENABLED)}"
     AR_BOOL="false"; [ "${AR:-0}" = "1" ] && AR_BOOL="true"
+    ES="${EQUAL_SHARING_ENABLED:-$(read_lmehspt_var EQUAL_SHARING_ENABLED)}"
+    ES_BOOL="false"; [ "${ES:-0}" = "1" ] && ES_BOOL="true"
     CE="${COIN_ENABLED:-$(read_lmehspt_var COIN_ENABLED)}"
     VE="${VOUCHER_ENABLED:-$(read_lmehspt_var VOUCHER_ENABLED)}"
     NIP="${NODEMCU_IP:-$(read_lmehspt_var NODEMCU_IP)}"
@@ -615,6 +629,7 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
 \"inactivity_timeout\":\"$(esc_json "$IT")\",
 \"auto_pause_enabled\":$AP_BOOL,
 \"auto_resume_enabled\":$AR_BOOL,
+\"equal_sharing_enabled\":$ES_BOOL,
 \"coin_enabled\":\"$(esc_json "$CE")\",
 \"coin_on\":$COIN_ON,
 \"voucher_on\":$VOUCHER_ON,
@@ -684,6 +699,7 @@ if echo "$QS" | $BB grep -q "action=config_set"; then
     apply_if "INACTIVITY_TIMEOUT"  "$(fget inactivity_timeout)"
     apply_if "AUTO_PAUSE_ENABLED"  "$(fget auto_pause_enabled)"
     apply_if "AUTO_RESUME_ENABLED" "$(fget auto_resume_enabled)"
+    apply_if "EQUAL_SHARING_ENABLED" "$(fget equal_sharing_enabled)"
     apply_if "NODEMCU_IP"          "$(fget nodemcu_ip)"
     apply_if "NODEMCU_MAC"         "$(fget nodemcu_mac)"
     apply_if "NODEMCU_PORT"        "$(fget nodemcu_port)"
