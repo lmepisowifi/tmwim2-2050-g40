@@ -12,10 +12,16 @@
 # ---------------------------------------------------------------------------
 
 # ============================================================
-# notify.sh — send hotspot event messages to Telegram/Discord, AND
+# notify.sh — send hotspot event messages to Telegram AND/OR Discord, AND
 #             (in --bot mode) run the interactive Telegram command
 #             router bot. Merged into one file so both share the same
 #             config, wget transport, and Telegram JSON parsing.
+#
+#   Telegram and Discord are independent, not either/or: each fires
+#   whenever it's configured (bot token + chat id, or a webhook) or
+#   explicitly switched on in notify.env — see _tg_should_send /
+#   _dc_should_send below. Configure both and every alert goes to both
+#   at once.
 #
 #   notify.sh "message text"                 send if alerts are enabled
 #   notify.sh "message text" force            send even if disabled (test)
@@ -131,6 +137,30 @@ send_discord() {
         "$DISCORD_WEBHOOK" 2>/dev/null
 }
 
+# ── Which provider(s) fire for this send? ─────────────────────────────────
+# Telegram and Discord are independent and BOTH send when both apply —
+# this isn't an either/or provider pick. Each one fires when:
+#   - its NOTIFY_*_ENABLED flag is explicitly "1" or "0" (admin's switch
+#     in the Income & Notifications page wins outright), OR
+#   - that flag was never set (older config, or never touched) AND the
+#     fields it needs to actually send are filled in — so a config that
+#     just has a bot token + chat id (or just a webhook) keeps working
+#     without anyone having to flip a switch first.
+_tg_should_send() {
+    case "${NOTIFY_TG_ENABLED:-}" in
+        0) return 1 ;;
+        1) return 0 ;;
+        *) [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] ;;
+    esac
+}
+_dc_should_send() {
+    case "${NOTIFY_DISCORD_ENABLED:-}" in
+        0) return 1 ;;
+        1) return 0 ;;
+        *) [ -n "$DISCORD_WEBHOOK" ] ;;
+    esac
+}
+
 # ── Connectivity check (fast ping — avoids full TLS handshake overhead) ───────
 _internet_up() {
     bb ping -c 1 -W 4 8.8.8.8 >/dev/null 2>&1 || \
@@ -138,11 +168,18 @@ _internet_up() {
 }
 
 # ── Queue a message for later delivery ───────────────────────────────────────
+# $1 (optional): "tg" or "dc" — which provider still owes this message.
+# Tagged in the filename so --drain retries only the provider(s) that
+# actually failed, instead of re-sending to one that already succeeded.
+# Omitted/unknown suffix = legacy behavior, retry against whatever is
+# configured at drain time (see --drain below).
 _enqueue() {
+    local provider="$1"
     mkdir -p "$QUEUE_DIR" 2>/dev/null
-    local ts
+    local ts suffix
     ts=$(bb awk '{print int($1)}' /proc/uptime 2>/dev/null || bb date +%s)
-    printf '%s' "$MSG" > "${QUEUE_DIR}/${ts}_$$"
+    suffix=""; [ -n "$provider" ] && suffix=".$provider"
+    printf '%s' "$MSG" > "${QUEUE_DIR}/${ts}_$$${suffix}"
 }
 
 # ============================================================
@@ -260,6 +297,112 @@ json_get() {
 # ---------------------------------------------------------------
 
 # ---------------------------------------------------------------
+# Hotspot session management (bot mode only) — backs the activeusers/
+# kick/addtime/removetime commands below. Reads and writes the SAME
+# session files the web admin UI and portal CGI scripts use
+# ($SESSION_DATA / $USERS_FILE), participating in the identical
+# /tmp/hotspot_session.lock mutex protocol as hotspot.cgi, login.sh,
+# logout.sh, coin_result.sh, and lmehspt.sh (see hotspot.cgi's _lock for
+# the full rationale on the steal-after-dead logic). Duplicated here
+# rather than sourced from one of those files, matching this codebase's
+# existing convention of every script carrying its own copy of this
+# protocol and of _fmt_secs.
+# ---------------------------------------------------------------
+HDATA="/lmepisowifi/hotspot_data"
+SESSION_DATA="/tmp/active_sessions.txt"
+USERS_FILE="$HDATA/users.txt"
+
+_hs_unlock() { rm -f /tmp/hotspot_session.lock/pid 2>/dev/null; rmdir /tmp/hotspot_session.lock 2>/dev/null; }
+_hs_lock() {
+    local i=0
+    while ! mkdir /tmp/hotspot_session.lock 2>/dev/null; do
+        if [ "$((i % 10))" -eq 0 ] && [ "$i" -gt 0 ]; then
+            if [ "$i" -ge 300 ]; then
+                bb rm -f /tmp/hotspot_session.lock/pid 2>/dev/null
+                rmdir /tmp/hotspot_session.lock 2>/dev/null
+            else
+                _HPID=$(bb cat /tmp/hotspot_session.lock/pid 2>/dev/null)
+                if [ -z "$_HPID" ] || ! kill -0 "$_HPID" 2>/dev/null; then
+                    bb rm -f /tmp/hotspot_session.lock/pid 2>/dev/null
+                    rmdir /tmp/hotspot_session.lock 2>/dev/null
+                fi
+            fi
+        fi
+        bb sleep 0.1 2>/dev/null || sleep 0.1
+        i=$((i + 1))
+    done
+    bb echo $$ > /tmp/hotspot_session.lock/pid 2>/dev/null
+    # Deliberately NO `trap _hs_unlock EXIT INT TERM` here, unlike the CGI
+    # copies of this lock. Those are one-shot processes where the trap is
+    # a harmless safety net; this lock is taken from inside the long-running
+    # --bot loop, where installing an INT/TERM trap would change how the
+    # whole bot process responds to those signals for the rest of its life
+    # (the admin panel's bot stop switch kills it with -9, which no trap
+    # can intercept anyway). Every caller below unlocks explicitly instead.
+}
+
+_hs_fmt_secs() {
+    local s="${1:-0}"
+    s="${s#-}"
+    case "$s" in ''|*[!0-9]*) s=0 ;; esac
+    local d=$(( s / 86400 )) h=$(( (s % 86400) / 3600 )) m=$(( (s % 3600) / 60 ))
+    if [ "$d" -gt 0 ]; then printf '%dd %dh %dm' "$d" "$h" "$m"
+    elif [ "$h" -gt 0 ]; then printf '%dh %dm' "$h" "$m"
+    else printf '%dm' "$m"; fi
+}
+
+# Stage USERS_FILE.tmp with every line except MAC $1's, WITHOUT committing
+# (caller appends a replacement line, then calls _hs_commit). Call inside
+# _hs_lock. Refuses (returns 1, tmp file removed) if grep couldn't actually
+# read USERS_FILE — see hotspot.cgi's _users_file_stage_excl for the full
+# rationale on the existed/rc check.
+_hs_stage_excl() {
+    local mac="$1" existed=0 rc=0
+    [ -e "$USERS_FILE" ] && existed=1
+    bb grep -v "^${mac} " "$USERS_FILE" > "${USERS_FILE}.tmp" 2>/dev/null || rc=$?
+    if [ "$existed" -eq 1 ] && [ "$rc" -gt 1 ]; then
+        rm -f "${USERS_FILE}.tmp" 2>/dev/null
+        return 1
+    fi
+    return 0
+}
+# Same idea, but drops only the "$mac paused ..." line via awk (keeps any
+# active line for the same mac untouched — grep -v "^$mac " would wrongly
+# drop both).
+_hs_stage_excl_paused() {
+    local mac="$1" existed=0 rc=0
+    [ -e "$USERS_FILE" ] && existed=1
+    bb awk -v m="$mac" '$1==m && $2=="paused"{next}{print}' "$USERS_FILE" > "${USERS_FILE}.tmp" 2>/dev/null || rc=$?
+    if [ "$existed" -eq 1 ] && [ "$rc" -ne 0 ]; then
+        rm -f "${USERS_FILE}.tmp" 2>/dev/null
+        return 1
+    fi
+    return 0
+}
+_hs_commit() {
+    bb mv "${USERS_FILE}.tmp" "$USERS_FILE"
+    sync
+}
+
+# Normalize a user-typed MAC (any case, with or without colons) into
+# canonical aa:bb:cc:dd:ee:ff form. Prints nothing and returns 1 if it
+# isn't exactly 12 hex digits once separators are stripped — so admins can
+# type a MAC into Telegram with or without colons and it still resolves.
+_hs_norm_mac() {
+    local hexonly
+    hexonly=$(printf '%s' "$1" | bb tr 'A-Z' 'a-z' | bb tr -cd '0-9a-f')
+    case "$hexonly" in
+        ????????????) ;;
+        *) return 1 ;;
+    esac
+    printf '%s:%s:%s:%s:%s:%s' \
+        "$(printf '%s' "$hexonly" | bb cut -c1-2)"  "$(printf '%s' "$hexonly" | bb cut -c3-4)" \
+        "$(printf '%s' "$hexonly" | bb cut -c5-6)"  "$(printf '%s' "$hexonly" | bb cut -c7-8)" \
+        "$(printf '%s' "$hexonly" | bb cut -c9-10)" "$(printf '%s' "$hexonly" | bb cut -c11-12)"
+}
+# ---------------------------------------------------------------
+
+# ---------------------------------------------------------------
 # Command registry — "name|description|handler" one per line.
 # To add a command: add a line here and a cmd_<name>() function below.
 # To remove one: delete its line (or set CMD_ENABLED_<NAME>="0" in
@@ -272,7 +415,11 @@ json_get() {
 # ---------------------------------------------------------------
 CMD_REGISTRY="status|Check router uptime|cmd_status
 reboot|Reboot the router|cmd_reboot
-hotspotstats|View hotspot status, sessions, and income|cmd_hotspot_stats"
+hotspotstats|View hotspot status, sessions, and income|cmd_hotspot_stats
+activeusers|List active/paused users: MAC + time left|cmd_active_users
+kick|Kick a user offline: /kick <mac>|cmd_kick
+addtime|Add time: /addtime <mac> <minutes>|cmd_add_time
+removetime|Remove time: /removetime <mac> <minutes>|cmd_remove_time"
 
 esc_json() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
@@ -362,6 +509,287 @@ Month: ₱${monthly}
 Year: ₱${yearly}
 All-time: ₱${total}"
 }
+
+# List every user with a live balance — active (in RAM) or paused (flash-
+# persisted) — as a MAC/status/remaining table. Sent as a Markdown code
+# block (see RESPONSE_MODE) so the columns actually line up in Telegram.
+cmd_active_users() {
+    local UPTIME out="" header count=0 mac expiry total rem status fmt
+
+    UPTIME=$(bb awk '{print int($1)}' /proc/uptime 2>/dev/null); [ -n "$UPTIME" ] || UPTIME=0
+
+    if [ -f "$SESSION_DATA" ]; then
+        while read -r mac expiry total; do
+            [ -n "$mac" ] || continue
+            rem=$(( expiry - UPTIME ))
+            [ "$rem" -le 0 ] && continue
+            count=$(( count + 1 ))
+            out="${out}$(printf '%-17s %-7s %s' "$mac" "active" "$(_hs_fmt_secs "$rem")")
+"
+        done < "$SESSION_DATA"
+    fi
+    if [ -f "$USERS_FILE" ]; then
+        while read -r mac status rem total fmt; do
+            [ -n "$mac" ] && [ "$status" = "paused" ] || continue
+            count=$(( count + 1 ))
+            out="${out}$(printf '%-17s %-7s %s' "$mac" "paused" "$(_hs_fmt_secs "$rem")")
+"
+        done < "$USERS_FILE"
+    fi
+
+    if [ "$count" -eq 0 ]; then
+        RESPONSE="No active or paused users right now."
+        return
+    fi
+
+    local FENCE
+    FENCE='```'
+    header=$(printf '%-17s %-7s %s' "MAC" "STATUS" "REMAINING")
+    RESPONSE="${FENCE}
+${header}
+${out}${FENCE}"
+    RESPONSE_MODE="Markdown"
+}
+
+# /kick <mac> — same as the web admin's Kick button: moves an active
+# session to paused with its remaining time preserved (or no-ops with a
+# "nothing to kick" reply if the MAC has no session at all), then cuts
+# its firewall access immediately. Mirrors hotspot.cgi's action=kick.
+cmd_kick() {
+    local ARG1 MAC
+    ARG1=${CMD_ARGS%% *}
+    if [ -z "$ARG1" ]; then
+        RESPONSE="Usage: /kick <mac>
+Example: /kick aa:bb:cc:dd:ee:ff
+See /activeusers for a list of connected MACs."
+        return
+    fi
+    MAC=$(_hs_norm_mac "$ARG1")
+    if [ -z "$MAC" ]; then
+        RESPONSE="That doesn't look like a valid MAC address: $ARG1"
+        return
+    fi
+
+    local ACTIVITY_FILE="/tmp/hotspot_activity.txt"
+    local UPTIME PAUSED="false" REM=0 TOT=0
+    UPTIME=$(bb awk '{print int($1)}' /proc/uptime 2>/dev/null); [ -n "$UPTIME" ] || UPTIME=0
+
+    _hs_lock
+    if [ -f "$SESSION_DATA" ] && bb grep -q "^$MAC " "$SESSION_DATA"; then
+        local LINE K_EXP K_TOT
+        LINE=$(bb grep "^$MAC " "$SESSION_DATA" | head -1)
+        K_EXP=$(printf '%s' "$LINE" | bb awk '{print $2}')
+        K_TOT=$(printf '%s' "$LINE" | bb awk '{print $3}')
+        REM=$(( K_EXP - UPTIME )); [ "$REM" -lt 0 ] && REM=0
+        [ -z "$K_TOT" ] && K_TOT=$REM
+        TOT=$K_TOT
+
+        bb grep -v "^$MAC " "$SESSION_DATA" > /tmp/tgkick_s.tmp; bb mv /tmp/tgkick_s.tmp "$SESSION_DATA"
+
+        mkdir -p "$HDATA"; touch "$USERS_FILE"
+        if _hs_stage_excl "$MAC"; then
+            [ "$REM" -gt 0 ] && echo "$MAC paused $REM $TOT $(_hs_fmt_secs "$REM")" >> "${USERS_FILE}.tmp"
+            _hs_commit
+        fi
+        PAUSED="true"
+    fi
+    _hs_unlock
+
+    iptables -t nat    -D HOTSPOT     -m mac --mac-source "$MAC" -j RETURN 2>/dev/null
+    iptables -t filter -D HOTSPOT_FWD -m mac --mac-source "$MAC" -j ACCEPT 2>/dev/null
+    [ -f "$ACTIVITY_FILE" ] && { bb grep -v "^$MAC " "$ACTIVITY_FILE" > /tmp/tgkick_a.tmp 2>/dev/null; bb mv /tmp/tgkick_a.tmp "$ACTIVITY_FILE"; }
+    [ -f /tmp/hotspot_ip_map.txt ] && { bb grep -v "^$MAC " /tmp/hotspot_ip_map.txt > /tmp/tgkick_i.tmp; bb mv /tmp/tgkick_i.tmp /tmp/hotspot_ip_map.txt; }
+
+    if [ "$PAUSED" = "true" ]; then
+        RESPONSE="Kicked $MAC — had $(_hs_fmt_secs "$REM") remaining, now paused (can resume with the same balance)."
+        # Same "session paused" alert the web admin's Kick button fires —
+        # a manual pause is a manual pause regardless of which UI did it.
+        (
+            . /lmepisowifi/hotspot/notify_templates.sh
+            _P_ACTIVE=$(bb grep -c '.' "$SESSION_DATA" 2>/dev/null); [ -n "$_P_ACTIVE" ] || _P_ACTIVE=0
+            _P_MSG=$(tpl_render "$TPL_SESSION_PAUSED" \
+                reason "Manually (Telegram)" \
+                remainingtime "$(_hs_fmt_secs "$REM")" \
+                totaltime "$(_hs_fmt_secs "$TOT")" \
+                mac "$MAC" \
+                activeusrcount "${_P_ACTIVE:-0}")
+            /lmepisowifi/hotspot/notify.sh "$_P_MSG" "" session_paused "$MAC" >/dev/null 2>&1 </dev/null
+        ) &
+    else
+        RESPONSE="No active session found for $MAC — nothing to kick."
+    fi
+}
+
+# /addtime <mac> <minutes> — extends an active or paused session; if the
+# MAC has no session at all, creates a fresh active one and opens its
+# firewall access (mirrors hotspot.cgi's action=add_time, which always
+# succeeds instead of erroring on an unknown MAC).
+cmd_add_time() {
+    local ARG1 ARG2 MAC MINS ADD UPTIME FOUND=0 REM=0 CREATED=0
+
+    ARG1=${CMD_ARGS%% *}
+    case "$CMD_ARGS" in
+        *" "*) ARG2=${CMD_ARGS#* } ;;
+        *) ARG2="" ;;
+    esac
+    ARG2=${ARG2%% *}
+
+    if [ -z "$ARG1" ] || [ -z "$ARG2" ]; then
+        RESPONSE="Usage: /addtime <mac> <minutes>
+Example: /addtime aa:bb:cc:dd:ee:ff 30"
+        return
+    fi
+    MAC=$(_hs_norm_mac "$ARG1")
+    if [ -z "$MAC" ]; then
+        RESPONSE="That doesn't look like a valid MAC address: $ARG1"
+        return
+    fi
+    MINS=$(printf '%s' "$ARG2" | bb tr -cd '0-9')
+    if [ -z "$MINS" ] || [ "$MINS" -le 0 ] 2>/dev/null; then
+        RESPONSE="Minutes must be a positive whole number."
+        return
+    fi
+
+    ADD=$(( MINS * 60 ))
+    UPTIME=$(bb awk '{print int($1)}' /proc/uptime 2>/dev/null); [ -n "$UPTIME" ] || UPTIME=0
+
+    _hs_lock
+    if [ -f "$SESSION_DATA" ] && bb grep -q "^$MAC " "$SESSION_DATA"; then
+        bb awk -v m="$MAC" -v add="$ADD" -v up="$UPTIME" '
+            $1==m {
+                xe=$2; tot=$3
+                if (xe=="") xe=up
+                if (tot=="") tot=xe-up
+                base=(xe>up?xe:up)
+                print m, base+add, tot+add
+                next
+            }
+            { print }
+        ' "$SESSION_DATA" > /tmp/tgat_s.tmp && bb mv /tmp/tgat_s.tmp "$SESSION_DATA"
+
+        local NEW_EXP NEW_TOT
+        NEW_EXP=$(bb grep "^$MAC " "$SESSION_DATA" | bb awk '{print $2}')
+        NEW_TOT=$(bb grep "^$MAC " "$SESSION_DATA" | bb awk '{print $3}')
+        REM=$(( NEW_EXP - UPTIME ))
+        if _hs_stage_excl "$MAC"; then
+            echo "$MAC active $REM $NEW_TOT $(_hs_fmt_secs "$REM")" >> "${USERS_FILE}.tmp"
+            _hs_commit
+        fi
+        FOUND=1
+    elif [ -f "$USERS_FILE" ] && bb grep -q "^$MAC paused " "$USERS_FILE"; then
+        local OLD_P P_REM P_TOT N_TOT
+        OLD_P=$(bb grep "^$MAC paused " "$USERS_FILE" | head -1)
+        P_REM=$(printf '%s' "$OLD_P" | bb awk '{print $3}')
+        P_TOT=$(printf '%s' "$OLD_P" | bb awk '{print $4}')
+        [ -z "$P_TOT" ] && P_TOT=$P_REM
+        REM=$(( P_REM + ADD ))
+        N_TOT=$(( P_TOT + ADD ))
+        if _hs_stage_excl_paused "$MAC"; then
+            echo "$MAC paused $REM $N_TOT $(_hs_fmt_secs "$REM")" >> "${USERS_FILE}.tmp"
+            _hs_commit
+        fi
+        FOUND=1
+    fi
+
+    if [ "$FOUND" -eq 0 ]; then
+        mkdir -p "$HDATA"; touch "$SESSION_DATA"; touch "$USERS_FILE"
+        echo "$MAC $(( UPTIME + ADD )) $ADD" >> "$SESSION_DATA"
+        if _hs_stage_excl "$MAC"; then
+            echo "$MAC active $ADD $ADD $(_hs_fmt_secs "$ADD")" >> "${USERS_FILE}.tmp"
+            _hs_commit
+        fi
+        iptables -t nat    -I HOTSPOT     1 -m mac --mac-source "$MAC" -j RETURN 2>/dev/null
+        iptables -t filter -I HOTSPOT_FWD 1 -m mac --mac-source "$MAC" -j ACCEPT 2>/dev/null
+        REM=$ADD
+        CREATED=1
+    fi
+    _hs_unlock
+
+    if [ "$CREATED" -eq 1 ]; then
+        RESPONSE="No existing session for $MAC — created a new one with ${MINS}m."
+    else
+        RESPONSE="Added ${MINS}m to $MAC. Remaining: $(_hs_fmt_secs "$REM")."
+    fi
+}
+
+# /removetime <mac> <minutes> — subtracts from an active or paused
+# session, clamped to a 60s floor so it can never zero one out (use /kick
+# for that). Refuses (unlike /addtime) if the MAC has no session at all —
+# mirrors hotspot.cgi's action=remove_time.
+cmd_remove_time() {
+    local ARG1 ARG2 MAC MINS SUB UPTIME FOUND=0 REM=0 MIN_REM=60
+
+    ARG1=${CMD_ARGS%% *}
+    case "$CMD_ARGS" in
+        *" "*) ARG2=${CMD_ARGS#* } ;;
+        *) ARG2="" ;;
+    esac
+    ARG2=${ARG2%% *}
+
+    if [ -z "$ARG1" ] || [ -z "$ARG2" ]; then
+        RESPONSE="Usage: /removetime <mac> <minutes>
+Example: /removetime aa:bb:cc:dd:ee:ff 15"
+        return
+    fi
+    MAC=$(_hs_norm_mac "$ARG1")
+    if [ -z "$MAC" ]; then
+        RESPONSE="That doesn't look like a valid MAC address: $ARG1"
+        return
+    fi
+    MINS=$(printf '%s' "$ARG2" | bb tr -cd '0-9')
+    if [ -z "$MINS" ] || [ "$MINS" -le 0 ] 2>/dev/null; then
+        RESPONSE="Minutes must be a positive whole number."
+        return
+    fi
+
+    SUB=$(( MINS * 60 ))
+    UPTIME=$(bb awk '{print int($1)}' /proc/uptime 2>/dev/null); [ -n "$UPTIME" ] || UPTIME=0
+
+    _hs_lock
+    if [ -f "$SESSION_DATA" ] && bb grep -q "^$MAC " "$SESSION_DATA"; then
+        bb awk -v m="$MAC" -v deduct="$SUB" -v up="$UPTIME" -v minr="$MIN_REM" '
+            $1==m {
+                xe=$2; tot=$3
+                if (xe=="") xe=up; if (tot=="") tot=xe-up
+                newxe = xe - deduct; newtot = tot - deduct
+                if (newxe < up + minr) newxe = up + minr
+                if (newtot < minr)     newtot = minr
+                print m, newxe, newtot; next
+            }
+            { print }
+        ' "$SESSION_DATA" > /tmp/tgrt_s.tmp && bb mv /tmp/tgrt_s.tmp "$SESSION_DATA"
+
+        local NEW_EXP NEW_TOT
+        NEW_EXP=$(bb grep "^$MAC " "$SESSION_DATA" | bb awk '{print $2}')
+        NEW_TOT=$(bb grep "^$MAC " "$SESSION_DATA" | bb awk '{print $3}')
+        REM=$(( NEW_EXP - UPTIME ))
+        if _hs_stage_excl "$MAC"; then
+            echo "$MAC active $REM $NEW_TOT $(_hs_fmt_secs "$REM")" >> "${USERS_FILE}.tmp"
+            _hs_commit
+        fi
+        FOUND=1
+    elif [ -f "$USERS_FILE" ] && bb grep -q "^$MAC paused " "$USERS_FILE"; then
+        local OLD_P P_REM P_TOT N_TOT
+        OLD_P=$(bb grep "^$MAC paused " "$USERS_FILE" | head -1)
+        P_REM=$(printf '%s' "$OLD_P" | bb awk '{print $3}')
+        P_TOT=$(printf '%s' "$OLD_P" | bb awk '{print $4}')
+        [ -z "$P_TOT" ] && P_TOT=$P_REM
+        REM=$(( P_REM - SUB )); [ "$REM" -lt "$MIN_REM" ] && REM=$MIN_REM
+        N_TOT=$(( P_TOT - SUB )); [ "$N_TOT" -lt "$MIN_REM" ] && N_TOT=$MIN_REM
+        if _hs_stage_excl_paused "$MAC"; then
+            echo "$MAC paused $REM $N_TOT $(_hs_fmt_secs "$REM")" >> "${USERS_FILE}.tmp"
+            _hs_commit
+        fi
+        FOUND=1
+    fi
+    _hs_unlock
+
+    if [ "$FOUND" -eq 0 ]; then
+        RESPONSE="No session found for $MAC — nothing to remove time from."
+        return
+    fi
+    RESPONSE="Removed ${MINS}m from $MAC. Remaining: $(_hs_fmt_secs "$REM")."
+}
 # ------------------------------------------------------------------------
 
 # wget POST of a JSON body (setMyCommands) — replaces `curl -s -X POST ... -d`.
@@ -373,11 +801,16 @@ _bot_post_json() {
 }
 
 # wget POST of a chat_id/text reply — replaces `curl -s -d ... -d ...`.
+# $3 (optional) is a Telegram parse_mode ("Markdown") — used by
+# cmd_active_users so its table renders as an aligned code block instead
+# of plain text with the spacing collapsed.
 _bot_send_reply() {
-    local chat_id="$1" text="$2" enc
+    local chat_id="$1" text="$2" mode="$3" enc body
     enc=$(urlenc "$text")
+    body="chat_id=${chat_id}&text=${enc}"
+    [ -n "$mode" ] && body="${body}&parse_mode=${mode}"
     "$WGET" -q -T "$TIMEOUT" --no-check-certificate -O /dev/null \
-        --post-data="chat_id=${chat_id}&text=${enc}" \
+        --post-data="$body" \
         "$BOT_API_URL/sendMessage" 2>/dev/null
 }
 
@@ -423,6 +856,10 @@ BOT_AUTOSTART="0"
 # CMD_ENABLED_STATUS="1"
 # CMD_ENABLED_REBOOT="1"
 # CMD_ENABLED_HOTSPOTSTATS="1"
+# CMD_ENABLED_ACTIVEUSERS="1"
+# CMD_ENABLED_KICK="1"
+# CMD_ENABLED_ADDTIME="1"
+# CMD_ENABLED_REMOVETIME="1"
 EOF
     fi
 
@@ -465,7 +902,7 @@ EOF
 
     echo "Router Bot Started..."
 
-    local UPDATE OK UPDATE_ID USER_ID CHAT_ID COMMAND RESPONSE POST_ACTION CMD_NAME HANDLER
+    local UPDATE OK UPDATE_ID USER_ID CHAT_ID COMMAND RESPONSE RESPONSE_MODE POST_ACTION CMD_NAME CMD_ARGS CBODY HANDLER
     while true; do
         # Fetch updates (max 1 at a time, 30s long-poll timeout; local wget
         # timeout is set higher than that so wget doesn't cut the connection
@@ -488,12 +925,27 @@ EOF
                 case ",$ALLOWED_USER_IDS," in
                     *",${USER_ID},"*)
                         RESPONSE=""
+                        RESPONSE_MODE=""
                         POST_ACTION=""
 
                         # --- COMMAND ROUTING (data-driven — see CMD_REGISTRY) ---
+                        # Split "/cmd arg1 arg2..." into CMD_NAME (bare
+                        # command, no slash, no "@botname" suffix Telegram
+                        # appends in group chats) and CMD_ARGS (everything
+                        # after the first space, or "" for a no-arg command
+                        # like /status).
                         CMD_NAME=""
+                        CMD_ARGS=""
                         case "$COMMAND" in
-                            /*) CMD_NAME=${COMMAND#/} ;;
+                            /*)
+                                CBODY=${COMMAND#/}
+                                CMD_NAME=${CBODY%% *}
+                                CMD_NAME=${CMD_NAME%%@*}
+                                case "$CBODY" in
+                                    *" "*) CMD_ARGS=${CBODY#* } ;;
+                                    *) CMD_ARGS="" ;;
+                                esac
+                                ;;
                         esac
 
                         HANDLER=""
@@ -506,7 +958,7 @@ EOF
                         fi
 
                         # Send the response back
-                        _bot_send_reply "$CHAT_ID" "$RESPONSE"
+                        _bot_send_reply "$CHAT_ID" "$RESPONSE" "$RESPONSE_MODE"
 
                         # Execute delayed commands (set by the handler) after sending
                         [ "$POST_ACTION" = "reboot" ] && reboot
@@ -558,8 +1010,8 @@ fi
 
 # ── Source notify config ──────────────────────────────────────────────────────
 NOTIFY_ENABLED=0
-NOTIFY_PROVIDER="telegram"
 TG_BOT_TOKEN=""; TG_CHAT_ID=""; DISCORD_WEBHOOK=""
+NOTIFY_TG_ENABLED=""; NOTIFY_DISCORD_ENABLED=""
 . "$NOTIFY_ENV" 2>/dev/null
 
 # ── DRAIN MODE — flush queued messages when internet is back ──────────────────
@@ -571,9 +1023,23 @@ if [ "$MSG" = "--drain" ]; then
         [ -f "$qf" ] || continue
         MSG=$(cat "$qf" 2>/dev/null)
         [ -n "$MSG" ] || { rm -f "$qf"; continue; }
-        case "${NOTIFY_PROVIDER:-telegram}" in
-            discord) send_discord && rm -f "$qf" ;;
-            *)       send_telegram && rm -f "$qf" ;;
+        case "$qf" in
+            *.tg)
+                # Drop it if Telegram got switched off since this was queued
+                # rather than leave it stuck forever.
+                if _tg_should_send; then send_telegram && rm -f "$qf"; else rm -f "$qf"; fi
+                ;;
+            *.dc)
+                if _dc_should_send; then send_discord && rm -f "$qf"; else rm -f "$qf"; fi
+                ;;
+            *)
+                # Legacy queued file from before dual-provider support (no
+                # provider suffix) — retry against whatever's configured now.
+                _tried=0; _ok=1
+                if _tg_should_send; then _tried=1; send_telegram || _ok=0; fi
+                if _dc_should_send; then _tried=1; send_discord || _ok=0; fi
+                [ "$_tried" = "1" ] && [ "$_ok" = "1" ] && rm -f "$qf"
+                ;;
         esac
     done
     exit 0
@@ -624,14 +1090,20 @@ fi
 
 # Skip connectivity check for forced sends (test button — always try)
 if [ "$FORCE" != "force" ] && ! _internet_up; then
-    _enqueue
+    _tg_should_send && _enqueue tg
+    _dc_should_send && _enqueue dc
     exit 0
 fi
 
-# Try to send; queue on failure (transient or auth error)
-case "${NOTIFY_PROVIDER:-telegram}" in
-    discord) send_discord || { [ "$FORCE" != "force" ] && _enqueue; } ;;
-    *)       send_telegram || { [ "$FORCE" != "force" ] && _enqueue; } ;;
-esac
+# Send to every provider that's configured/enabled — Telegram AND Discord
+# both fire for the same event when both apply, instead of picking one.
+# Each queues independently on failure so a drain only retries the one(s)
+# that actually didn't go through.
+if _tg_should_send; then
+    send_telegram || { [ "$FORCE" != "force" ] && _enqueue tg; }
+fi
+if _dc_should_send; then
+    send_discord || { [ "$FORCE" != "force" ] && _enqueue dc; }
+fi
 
 exit 0

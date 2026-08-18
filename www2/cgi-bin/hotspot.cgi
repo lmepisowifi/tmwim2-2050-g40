@@ -2404,8 +2404,9 @@ fi
 # ================================================================
 if echo "$QS" | $BB grep -q "action=notify_get"; then
     NF="$HDATA/notify.env"
-    NOTIFY_ENABLED=0; NOTIFY_PROVIDER="telegram"
+    NOTIFY_ENABLED=0
     TG_BOT_TOKEN=""; TG_CHAT_ID=""; DISCORD_WEBHOOK=""
+    NOTIFY_TG_ENABLED=""; NOTIFY_DISCORD_ENABLED=""
     # Per-event flags default to enabled (unset -> "1") so existing configs
     # keep every alert firing until the admin explicitly mutes one.
     NOTIFY_EVT_NEW_SALE=1; NOTIFY_EVT_COINS_INSERTED=1; NOTIFY_EVT_ANTI_TROLL=1
@@ -2415,11 +2416,24 @@ if echo "$QS" | $BB grep -q "action=notify_get"; then
     NOTIFY_DEDUP_WINDOW=30
     [ -f "$NF" ] && . "$NF" 2>/dev/null
     EN_STR="false"; [ "${NOTIFY_ENABLED:-0}" = "1" ] && EN_STR="true"
-    case "${NOTIFY_PROVIDER:-telegram}" in discord) PROV="discord" ;; *) PROV="telegram" ;; esac
+    # A provider is "enabled" (and, per notify.sh, actually fires) when its
+    # own flag is explicitly set, OR — if it was never explicitly set —
+    # when its required fields are already filled in. Telegram and Discord
+    # are independent: both can report true and both will send together.
+    case "${NOTIFY_TG_ENABLED:-}" in
+        0) TG_EN="false" ;;
+        1) TG_EN="true" ;;
+        *) if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then TG_EN="true"; else TG_EN="false"; fi ;;
+    esac
+    case "${NOTIFY_DISCORD_ENABLED:-}" in
+        0) DC_EN="false" ;;
+        1) DC_EN="true" ;;
+        *) if [ -n "$DISCORD_WEBHOOK" ]; then DC_EN="true"; else DC_EN="false"; fi ;;
+    esac
     case "${NOTIFY_DEDUP_WINDOW:-30}" in ''|*[!0-9]*) DDW=30 ;; *) DDW="$NOTIFY_DEDUP_WINDOW" ;; esac
     # Emit each event flag as a JSON boolean ("1" -> true, anything else -> false)
     _evb() { [ "${1:-1}" = "1" ] && printf 'true' || printf 'false'; }
-    ok_json "{\"enabled\":$EN_STR,\"provider\":\"$PROV\",\"tg_bot_token\":\"$(esc_json "$TG_BOT_TOKEN")\",\"tg_chat_id\":\"$(esc_json "$TG_CHAT_ID")\",\"discord_webhook\":\"$(esc_json "$DISCORD_WEBHOOK")\",\"dedup_window\":$DDW,\"events\":{\
+    ok_json "{\"enabled\":$EN_STR,\"tg_enabled\":$TG_EN,\"discord_enabled\":$DC_EN,\"tg_bot_token\":\"$(esc_json "$TG_BOT_TOKEN")\",\"tg_chat_id\":\"$(esc_json "$TG_CHAT_ID")\",\"discord_webhook\":\"$(esc_json "$DISCORD_WEBHOOK")\",\"dedup_window\":$DDW,\"events\":{\
 \"new_sale\":$(_evb "$NOTIFY_EVT_NEW_SALE"),\
 \"coins_inserted\":$(_evb "$NOTIFY_EVT_COINS_INSERTED"),\
 \"anti_troll\":$(_evb "$NOTIFY_EVT_ANTI_TROLL"),\
@@ -2449,13 +2463,20 @@ if echo "$QS" | $BB grep -q "action=notify_set"; then
     # Strip chars that could break the sourced env file / inject commands.
     san() { printf '%s' "$1" | $BB tr -d '\r\n"\\$\140'; }
 
-    EN=$(fget enabled);       PROV=$(fget provider)
+    EN=$(fget enabled)
+    TGEN=$(fget tg_enabled); DCEN=$(fget discord_enabled)
     TGT=$(san "$(fget tg_bot_token)")
     TGC=$(san "$(fget tg_chat_id)")
     DWH=$(san "$(fget discord_webhook)")
 
     case "$EN"   in 1|true|on|yes) EN=1 ;; *) EN=0 ;; esac
-    case "$PROV" in discord) PROV="discord" ;; *) PROV="telegram" ;; esac
+    # Explicit per-provider switches - always written as a definite 1/0 from
+    # here on (never left blank/"auto"), since the admin panel always sends
+    # both fields. A pre-dual-provider notify.env with neither key set yet
+    # stays in "auto" mode (see notify.sh/notify_get) only until the first
+    # Save through this action.
+    case "$TGEN" in 1|true|on|yes) TGEN=1 ;; *) TGEN=0 ;; esac
+    case "$DCEN" in 1|true|on|yes) DCEN=1 ;; *) DCEN=0 ;; esac
 
     # Anti-spam cooldown window (seconds). Non-numeric -> default 30;
     # clamp to a sane 0..3600 so a typo can't wedge notifications for hours.
@@ -2480,7 +2501,8 @@ if echo "$QS" | $BB grep -q "action=notify_set"; then
     mkdir -p "$HDATA"
     {
         echo "NOTIFY_ENABLED=\"$EN\""
-        echo "NOTIFY_PROVIDER=\"$PROV\""
+        echo "NOTIFY_TG_ENABLED=\"$TGEN\""
+        echo "NOTIFY_DISCORD_ENABLED=\"$DCEN\""
         echo "TG_BOT_TOKEN=\"$TGT\""
         echo "TG_CHAT_ID=\"$TGC\""
         echo "DISCORD_WEBHOOK=\"$DWH\""

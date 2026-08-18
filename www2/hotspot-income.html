@@ -122,16 +122,19 @@
                 </div>
                 <span id="nf-enabled-label" style="font-size:12px;color:var(--text-secondary);">Off</span>
             </div>
-
-            <div class="field-row">
-                <label>Provider</label>
-                <select id="nf-provider" class="form-select" style="max-width:240px;" onchange="onProviderChange()">
-                    <option value="telegram">Telegram</option>
-                    <option value="discord">Discord</option>
-                </select>
+            <div class="form-hint" style="margin-bottom:14px;">
+                Telegram and Discord both fire at the same time whenever both are filled
+                in below (or explicitly switched on) — no need to pick just one.
             </div>
 
-            <!-- Telegram fields -->
+            <!-- Telegram -->
+            <div class="controls-row mb-2">
+                <span style="font-size:13px;flex:1;">Telegram</span>
+                <div class="wlan-toggle" id="nf-tg-enabled" onclick="toggleTgEnabled()"
+                     role="switch" aria-checked="false" title="Enable Telegram alerts">
+                    <div class="wlan-toggle-knob"></div>
+                </div>
+            </div>
             <div id="tg-fields">
                 <div class="field-row">
                     <label>Bot Token</label>
@@ -145,8 +148,15 @@
                 </div>
             </div>
 
-            <!-- Discord fields -->
-            <div id="dc-fields" style="display:none;">
+            <!-- Discord -->
+            <div class="controls-row mb-2 mt-3">
+                <span style="font-size:13px;flex:1;">Discord</span>
+                <div class="wlan-toggle" id="nf-dc-enabled" onclick="toggleDcEnabled()"
+                     role="switch" aria-checked="false" title="Enable Discord alerts">
+                    <div class="wlan-toggle-knob"></div>
+                </div>
+            </div>
+            <div id="dc-fields">
                 <div class="field-row">
                     <label>Webhook URL</label>
                     <input type="text" id="nf-dc-webhook" class="form-control" placeholder="https://discord.com/api/webhooks/...">
@@ -193,7 +203,9 @@
                 <span style="font-size:13px;flex:1;">
                     Enable Commands <span class="form-hint" id="tgbot-status-txt">(bot stopped)</span>
                 </span>
-                <div class="wlan-toggle" id="tgbot-toggle" role="switch" aria-checked="false" onclick="toggleTelegramBot()"></div>
+                <div class="wlan-toggle" id="tgbot-toggle" role="switch" aria-checked="false" onclick="toggleTelegramBot()">
+                    <div class="wlan-toggle-knob"></div>
+                </div>
             </div>
             <div class="form-hint" style="margin-bottom:14px;">
                 Turn individual router-bot commands on or off. A command switched
@@ -316,6 +328,25 @@ function setEnabledUI(on){
 }
 function toggleEnabled(){ setEnabledUI(!_enabled); }
 
+// ── Per-provider enable toggles (Telegram / Discord fire together when
+// both are configured/enabled — see buildNotifyBody) ──
+var _tgEnabled = false;
+var _dcEnabled = false;
+function setTgEnabledUI(on){
+    _tgEnabled = !!on;
+    var t = document.getElementById('nf-tg-enabled');
+    t.classList.toggle('on', _tgEnabled);
+    t.setAttribute('aria-checked', _tgEnabled ? 'true' : 'false');
+}
+function toggleTgEnabled(){ setTgEnabledUI(!_tgEnabled); }
+function setDcEnabledUI(on){
+    _dcEnabled = !!on;
+    var t = document.getElementById('nf-dc-enabled');
+    t.classList.toggle('on', _dcEnabled);
+    t.setAttribute('aria-checked', _dcEnabled ? 'true' : 'false');
+}
+function toggleDcEnabled(){ setDcEnabledUI(!_dcEnabled); }
+
 // ── Per-event alert toggles ──
 // Every muteable event and its friendly label. test_alert is intentionally
 // excluded — the Send Test button always bypasses per-event muting.
@@ -370,32 +401,26 @@ function setEvtStateFrom(events){
     buildEvtToggles();
 }
 
-function onProviderChange(){
-    var p = document.getElementById('nf-provider').value;
-    document.getElementById('tg-fields').style.display = (p==='telegram') ? '' : 'none';
-    document.getElementById('dc-fields').style.display = (p==='discord')  ? '' : 'none';
-}
-
 function loadNotify(){
     fetch('/cgi-bin/hotspot.cgi?action=notify_get', { cache:'no-store' })
         .then(function(r){ return r.json(); })
         .then(function(d){
             setEnabledUI(d.enabled);
-            document.getElementById('nf-provider').value = d.provider || 'telegram';
+            setTgEnabledUI(d.tg_enabled);
+            setDcEnabledUI(d.discord_enabled);
             document.getElementById('nf-tg-token').value  = d.tg_bot_token || '';
             document.getElementById('nf-tg-chat').value   = d.tg_chat_id || '';
             document.getElementById('nf-dc-webhook').value = d.discord_webhook || '';
             document.getElementById('nf-dedup').value = (d.dedup_window != null) ? d.dedup_window : 30;
             setEvtStateFrom(d.events);
-            onProviderChange();
         })
         .catch(function(){ toastr.error('Could not load notification settings'); });
 }
 
 function buildNotifyBody(){
-    var p = document.getElementById('nf-provider').value;
     var body = 'enabled='   + (_enabled ? '1' : '0') +
-           '&provider=' + encodeURIComponent(p) +
+           '&tg_enabled=' + (_tgEnabled ? '1' : '0') +
+           '&discord_enabled=' + (_dcEnabled ? '1' : '0') +
            '&tg_bot_token=' + encodeURIComponent(document.getElementById('nf-tg-token').value.trim()) +
            '&tg_chat_id='   + encodeURIComponent(document.getElementById('nf-tg-chat').value.trim()) +
            '&discord_webhook=' + encodeURIComponent(document.getElementById('nf-dc-webhook').value.trim());
@@ -439,7 +464,7 @@ function testNotify(){
         })
         .then(function(r){ return r.json(); })
         .then(function(d){
-            if (d.ok){ toastr.info('Test sent — check your '+document.getElementById('nf-provider').value+' chat.'); }
+            if (d.ok){ toastr.info('Test sent — check Telegram/Discord (whichever is enabled).'); }
             else { toastr.error('Test failed: '+(d.error||'')); }
         })
         .catch(function(){ toastr.error('Test request failed'); })
