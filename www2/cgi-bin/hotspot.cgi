@@ -482,6 +482,14 @@ hotspot_running() {
     $BB kill -0 "$pid" 2>/dev/null
 }
 
+# Is the interactive Telegram router bot (notify.sh --bot) currently
+# running? Same pidfile-based check as hotspot_running() above.
+bot_running() {
+    [ -f /tmp/telegram_bot.pid ] || return 1
+    local pid; pid=$(cat /tmp/telegram_bot.pid)
+    $BB kill -0 "$pid" 2>/dev/null
+}
+
 esc_json() { printf '%s' "$1" | $BB sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 # Resolve a wlan* netdev name to its WLAN(1)_MBSSIB_TBL row and report
@@ -2571,6 +2579,191 @@ if echo "$QS" | $BB grep -q "action=notify_templates_reset"; then
     ok_json "{\"ok\":true}"
 fi
 
+# Where the router-bot code lives on this device. Merged into notify.sh
+# (run as `notify.sh --bot`) rather than a standalone script — kept as
+# one constant used by both actions below, update here if that changes.
+TGBOT_SCRIPT="/lmepisowifi/hotspot/notify.sh"
+TGBOT_ENV="$HDATA/telegram_bot.env"
+TGBOT_STARTUP="/lmepisowifi/www2/sh/startup.sh"
+
+# Write / update a key in telegram_bot.env. Adds the key if absent,
+# replaces it if present; creates the file if it doesn't exist yet (e.g.
+# the bot has never been started, so notify.sh's own first-run heredoc
+# hasn't fired). Same add-or-replace pattern as set_globals_var above,
+# just pointed at $TGBOT_ENV.
+set_tgbot_var() {
+    local var="$1" val="$2"
+    local esc
+    mkdir -p "$HDATA" 2>/dev/null
+    touch "$TGBOT_ENV" 2>/dev/null
+    esc=$(printf '%s' "$val" | $BB sed 's/[\\/&]/\\&/g')
+    if $BB grep -q "^${var}=" "$TGBOT_ENV" 2>/dev/null; then
+        $BB sed -i "s|^${var}=.*|${var}=\"${esc}\"|" "$TGBOT_ENV"
+    else
+        printf '%s="%s"\n' "$var" "$val" >> "$TGBOT_ENV"
+    fi
+}
+
+# Boot-marker plumbing for the router-bot switch, so it survives a
+# reboot -- same BEGIN_X/END_X convention www2/sh/startup.sh already uses
+# for Tailscale/WAN-repurpose/IP-ACL (see tailscale_ctl.sh's
+# add_boot_marker/remove_boot_marker). ota.sh's merge_startup_markers()
+# discovers any BEGIN_/END_ pair automatically, so this survives an OTA
+# update too without needing to be registered anywhere else.
+_tgbot_has_marker() {
+    [ -f "$TGBOT_STARTUP" ] && $BB grep -q 'BEGIN_TELEGRAM_BOT' "$TGBOT_STARTUP"
+}
+
+_tgbot_set_marker() {
+    [ -f "$TGBOT_STARTUP" ] || return 0
+    $BB awk -v line="$1" '
+        /BEGIN_TELEGRAM_BOT/ { print; if (line != "") print line; inblk = 1; next }
+        /END_TELEGRAM_BOT/   { inblk = 0; print; next }
+        inblk { next }
+        { print }
+    ' "$TGBOT_STARTUP" > "$TGBOT_STARTUP.tmp" 2>/dev/null && $BB mv "$TGBOT_STARTUP.tmp" "$TGBOT_STARTUP"
+}
+
+add_tgbot_boot_marker() {
+    [ -f "$TGBOT_STARTUP" ] || return 0
+    if _tgbot_has_marker; then
+        _tgbot_set_marker '( /lmepisowifi/hotspot/notify.sh --bot-autostart ) &'
+    else
+        printf '\n# --- BEGIN_TELEGRAM_BOT ---\n( /lmepisowifi/hotspot/notify.sh --bot-autostart ) &\n# --- END_TELEGRAM_BOT ---\n' >> "$TGBOT_STARTUP"
+    fi
+}
+
+remove_tgbot_boot_marker() {
+    _tgbot_has_marker || return 0
+    _tgbot_set_marker ''
+}
+
+# Pull the raw "name|description|handler" lines out of CMD_REGISTRY in
+# the bot script itself (not hand-duplicated here), so this list can
+# never drift from what the bot actually runs.
+_tgbot_registry() {
+    $BB sed -n '/^CMD_REGISTRY="/,/"[[:space:]]*$/p' "$TGBOT_SCRIPT" \
+        | $BB sed '1s/^CMD_REGISTRY="//; $s/"[[:space:]]*$//'
+}
+
+# ================================================================
+# GET ?action=telegram_cmds_get  -> router-bot command list + enabled
+# state. A command's enabled state comes from telegram_bot.env's
+# CMD_ENABLED_* flags -- unset/missing defaults to enabled, same
+# convention as NOTIFY_EVT_* above, so a config predating a newly
+# added command still runs it.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=telegram_cmds_get"; then
+    if [ ! -f "$TGBOT_SCRIPT" ]; then
+        ok_json "{\"installed\":false,\"running\":false,\"commands\":[]}"
+    fi
+
+    [ -f "$TGBOT_ENV" ] && . "$TGBOT_ENV" 2>/dev/null
+
+    _cmd_en() {
+        local key flag
+        key=$(echo "$1" | $BB tr 'a-z' 'A-Z' | $BB tr -cd 'A-Z0-9_')
+        eval "flag=\"\${CMD_ENABLED_${key}:-1}\""
+        [ "$flag" = "0" ] && printf 'false' || printf 'true'
+    }
+
+    OUT="" FIRST=1
+    while IFS='|' read -r NAME DESC HANDLER; do
+        [ -z "$NAME" ] && continue
+        if [ "$FIRST" = "1" ]; then FIRST=0; else OUT="${OUT},"; fi
+        OUT="${OUT}{\"name\":\"$(esc_json "$NAME")\",\"description\":\"$(esc_json "$DESC")\",\"enabled\":$(_cmd_en "$NAME")}"
+    done <<EOF
+$(_tgbot_registry)
+EOF
+    RUNNING="false"; bot_running && RUNNING="true"
+    ok_json "{\"installed\":true,\"running\":$RUNNING,\"commands\":[$OUT]}"
+fi
+
+# ================================================================
+# POST ?action=telegram_bot_toggle   body: enabled=1|0
+# Starts/stops the interactive Telegram command-router bot in the
+# background (`notify.sh --bot`), tracked via /tmp/telegram_bot.pid —
+# same pidfile pattern as hotspot_start/hotspot_stop above. Also persists
+# the switch (BOT_AUTOSTART in telegram_bot.env) and adds/removes a boot
+# marker in www2/sh/startup.sh that calls `notify.sh --bot-autostart` —
+# same mechanism the Tailscale switch uses — so a device that reboots
+# with the bot on comes back up with it running instead of needing a
+# manual re-toggle.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=telegram_bot_toggle"; then
+    read -n "$CONTENT_LENGTH" POST_DATA
+    VAL=$($BB echo "$POST_DATA" | $BB sed -n 's/.*enabled=\([^&]*\).*/\1/p')
+
+    if [ "$VAL" = "1" ]; then
+        [ -f "$TGBOT_SCRIPT" ] || err_json "bot_not_installed"
+        set_tgbot_var "BOT_AUTOSTART" "1"
+        add_tgbot_boot_marker
+        if bot_running; then
+            ok_json "{\"ok\":true,\"running\":true,\"msg\":\"already running\"}"
+        fi
+        "$TGBOT_SCRIPT" --bot >/tmp/telegram_bot_start.log 2>&1 &
+        echo $! > /tmp/telegram_bot.pid
+        $BB sleep 1
+        RUNNING="false"; bot_running && RUNNING="true"
+        ok_json "{\"ok\":true,\"running\":$RUNNING}"
+    elif [ "$VAL" = "0" ]; then
+        set_tgbot_var "BOT_AUTOSTART" "0"
+        remove_tgbot_boot_marker
+        if [ -f /tmp/telegram_bot.pid ]; then
+            kill -9 "$(cat /tmp/telegram_bot.pid)" 2>/dev/null
+            rm -f /tmp/telegram_bot.pid
+        fi
+        ok_json "{\"ok\":true,\"running\":false}"
+    else
+        err_json "bad_value"
+    fi
+fi
+
+# ================================================================
+# POST ?action=telegram_cmds_set  (form-encoded) -> save which router-
+# bot commands are enabled. Expects cmd_enabled_<name>=1|0 per command.
+# Only ever writes CMD_ENABLED_* -- the BOT_TOKEN / ALLOWED_USER_IDS
+# lines already in telegram_bot.env are read back and re-written
+# unchanged, since this page doesn't manage bot credentials.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=telegram_cmds_set"; then
+    [ -f "$TGBOT_SCRIPT" ] || err_json "bot_not_installed"
+    read -n "$CONTENT_LENGTH" POST_DATA
+
+    fget() {
+        printf '%s' "$POST_DATA" \
+            | $BB tr '&' '\n' \
+            | $BB grep "^$1=" \
+            | $BB sed 's/^[^=]*=//' \
+            | urldecode \
+            | head -1
+    }
+
+    BOT_TOKEN=""; ALLOWED_USER_IDS=""; BOT_AUTOSTART="0"
+    [ -f "$TGBOT_ENV" ] && . "$TGBOT_ENV" 2>/dev/null
+
+    mkdir -p "$HDATA"
+    {
+        echo "BOT_TOKEN=\"$BOT_TOKEN\""
+        echo "ALLOWED_USER_IDS=\"$ALLOWED_USER_IDS\""
+        echo "BOT_AUTOSTART=\"$BOT_AUTOSTART\""
+        while IFS='|' read -r NAME DESC HANDLER; do
+            [ -z "$NAME" ] && continue
+            KEY=$(echo "$NAME" | $BB tr 'a-z' 'A-Z' | $BB tr -cd 'A-Z0-9_')
+            [ -n "$KEY" ] || continue
+            case "$(fget "cmd_enabled_${NAME}")" in
+                0|false|off|no) VAL=0 ;;
+                *) VAL=1 ;;
+            esac
+            echo "CMD_ENABLED_${KEY}=\"$VAL\""
+        done <<EOF
+$(_tgbot_registry)
+EOF
+    } > "$TGBOT_ENV.tmp"
+    $BB mv "$TGBOT_ENV.tmp" "$TGBOT_ENV"
+    ok_json "{\"ok\":true}"
+fi
+
 # ================================================================
 # GET ?action=hotspot_stats  -> running state + session count + income
 # ================================================================
@@ -2589,7 +2782,7 @@ fi
 
 # ================================================================
 # GET ?action=portal_disk_space  -> UBIFS size/used/avail/usable bytes
-# usable_bytes = avail_bytes − 10 MB reserve (0 when at or below floor)
+# usable_bytes = avail_bytes − 3 MB reserve (0 when at or below floor)
 # ================================================================
 if echo "$QS" | $BB grep -q "action=portal_disk_space"; then
     _dfline=$($BB df -k /lmepisowifi 2>/dev/null | $BB awk 'NR==2')
@@ -2599,7 +2792,7 @@ if echo "$QS" | $BB grep -q "action=portal_disk_space"; then
     _sz_b=$(( ${_dfl:-0} * 1024 ))
     _used_b=$(( ${_dfu:-0} * 1024 ))
     _avail_b=$(( ${_dfa:-0} * 1024 ))
-    _reserve_b=10485760
+    _reserve_b=3145728
     _usable_b=$(( _avail_b - _reserve_b ))
     [ "$_usable_b" -lt 0 ] && _usable_b=0
     ok_json "{\"ok\":true,\"size_bytes\":${_sz_b},\"used_bytes\":${_used_b},\"avail_bytes\":${_avail_b},\"usable_bytes\":${_usable_b},\"reserve_bytes\":${_reserve_b}}"
@@ -2729,13 +2922,13 @@ if echo "$QS" | $BB grep -q "action=portal_upload"; then
             ;;
     esac
 
-    # Disk-space guard: reject before writing if the file would breach the 10 MB floor
+    # Disk-space guard: reject before writing if the file would breach the 3 MB floor
     # B64 chars × 3/4 ≈ decoded bytes (slight overestimate — safe to use for comparison)
     _img_avkb=$($BB df -k /lmepisowifi 2>/dev/null | $BB awk 'NR==2 {print $4+0}')
     _img_avail=$(( ${_img_avkb:-0} * 1024 ))
     _img_b64len=$(printf '%s' "$B64" | $BB wc -c | $BB tr -cd '0-9')
     _img_fsize=$(( (${_img_b64len:-0} * 3 + 3) / 4 ))
-    [ $(( _img_avail - _img_fsize )) -lt 10485760 ] && err_json "insufficient_space"
+    [ $(( _img_avail - _img_fsize )) -lt 3145728 ] && err_json "insufficient_space"
 
     if ! printf '%s' "$B64" | $BB base64 -d > "${DEST}.tmp" 2>/dev/null; then
         printf '%s' "$B64" | openssl enc -d -base64 -A > "${DEST}.tmp" 2>/dev/null \
@@ -2818,12 +3011,12 @@ if echo "$QS" | $BB grep -q "action=portal_audio_upload"; then
     rm -f "/lmepisowifi/hotspot/audio/${SLOT}".* 2>/dev/null
     DEST="/lmepisowifi/hotspot/audio/${SLOT}.${EXT}"
 
-    # Disk-space guard: reject before writing if the file would breach the 10 MB floor
+    # Disk-space guard: reject before writing if the file would breach the 3 MB floor
     _aud_avkb=$($BB df -k /lmepisowifi 2>/dev/null | $BB awk 'NR==2 {print $4+0}')
     _aud_avail=$(( ${_aud_avkb:-0} * 1024 ))
     _aud_b64len=$(printf '%s' "$B64" | $BB wc -c | $BB tr -cd '0-9')
     _aud_fsize=$(( (${_aud_b64len:-0} * 3 + 3) / 4 ))
-    [ $(( _aud_avail - _aud_fsize )) -lt 10485760 ] && err_json "insufficient_space"
+    [ $(( _aud_avail - _aud_fsize )) -lt 3145728 ] && err_json "insufficient_space"
 
     if ! printf '%s' "$B64" | $BB base64 -d > "${DEST}.tmp" 2>/dev/null; then
         printf '%s' "$B64" | openssl enc -d -base64 -A > "${DEST}.tmp" 2>/dev/null \
