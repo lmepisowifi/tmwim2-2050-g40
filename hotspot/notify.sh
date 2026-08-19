@@ -465,17 +465,17 @@ EOF
 # (an action to run AFTER the reply is sent, e.g. "reboot").
 
 cmd_status() {
-    RESPONSE=$(uptime)
+    RESPONSE=$(tpl_render "$TPL_CMD_STATUS" uptime "$(uptime)")
 }
 
 cmd_reboot() {
-    RESPONSE="Rebooting router now..."
+    RESPONSE=$(tpl_render "$TPL_CMD_REBOOT")
     POST_ACTION="reboot"
 }
 
 cmd_hotspot_stats() {
     if [ ! -d /lmepisowifi/hotspot ]; then
-        RESPONSE="Hotspot module is not installed on this device."
+        RESPONSE=$(tpl_render "$TPL_CMD_HOTSPOTSTATS_NOTINSTALLED")
         return
     fi
 
@@ -500,14 +500,13 @@ cmd_hotspot_stats() {
     yearly=$(json_get "$income_json" "yearly");   [ -n "$yearly" ]  || yearly=0
     total=$(json_get "$income_json" "total");     [ -n "$total" ]   || total=0
 
-    RESPONSE="Hotspot: ${running}
-Active sessions: ${sessions}
-
-Income
-Today: ₱${daily}
-Month: ₱${monthly}
-Year: ₱${yearly}
-All-time: ₱${total}"
+    RESPONSE=$(tpl_render "$TPL_CMD_HOTSPOTSTATS" \
+        running "$running" \
+        sessions "$sessions" \
+        daily "$daily" \
+        monthly "$monthly" \
+        yearly "$yearly" \
+        total "$total")
 }
 
 # List every user with a live balance — active (in RAM) or paused (flash-
@@ -538,7 +537,7 @@ cmd_active_users() {
     fi
 
     if [ "$count" -eq 0 ]; then
-        RESPONSE="No active or paused users right now."
+        RESPONSE=$(tpl_render "$TPL_CMD_ACTIVEUSERS_EMPTY")
         return
     fi
 
@@ -559,14 +558,12 @@ cmd_kick() {
     local ARG1 MAC
     ARG1=${CMD_ARGS%% *}
     if [ -z "$ARG1" ]; then
-        RESPONSE="Usage: /kick <mac>
-Example: /kick aa:bb:cc:dd:ee:ff
-See /activeusers for a list of connected MACs."
+        RESPONSE=$(tpl_render "$TPL_CMD_KICK_USAGE")
         return
     fi
     MAC=$(_hs_norm_mac "$ARG1")
     if [ -z "$MAC" ]; then
-        RESPONSE="That doesn't look like a valid MAC address: $ARG1"
+        RESPONSE=$(tpl_render "$TPL_CMD_BADMAC" input "$ARG1")
         return
     fi
 
@@ -601,7 +598,7 @@ See /activeusers for a list of connected MACs."
     [ -f /tmp/hotspot_ip_map.txt ] && { bb grep -v "^$MAC " /tmp/hotspot_ip_map.txt > /tmp/tgkick_i.tmp; bb mv /tmp/tgkick_i.tmp /tmp/hotspot_ip_map.txt; }
 
     if [ "$PAUSED" = "true" ]; then
-        RESPONSE="Kicked $MAC — had $(_hs_fmt_secs "$REM") remaining, now paused (can resume with the same balance)."
+        RESPONSE=$(tpl_render "$TPL_CMD_KICK_OK" mac "$MAC" remainingtime "$(_hs_fmt_secs "$REM")")
         # Same "session paused" alert the web admin's Kick button fires —
         # a manual pause is a manual pause regardless of which UI did it.
         (
@@ -616,7 +613,7 @@ See /activeusers for a list of connected MACs."
             /lmepisowifi/hotspot/notify.sh "$_P_MSG" "" session_paused "$MAC" >/dev/null 2>&1 </dev/null
         ) &
     else
-        RESPONSE="No active session found for $MAC — nothing to kick."
+        RESPONSE=$(tpl_render "$TPL_CMD_KICK_NONE" mac "$MAC")
     fi
 }
 
@@ -635,18 +632,17 @@ cmd_add_time() {
     ARG2=${ARG2%% *}
 
     if [ -z "$ARG1" ] || [ -z "$ARG2" ]; then
-        RESPONSE="Usage: /addtime <mac> <minutes>
-Example: /addtime aa:bb:cc:dd:ee:ff 30"
+        RESPONSE=$(tpl_render "$TPL_CMD_ADDTIME_USAGE")
         return
     fi
     MAC=$(_hs_norm_mac "$ARG1")
     if [ -z "$MAC" ]; then
-        RESPONSE="That doesn't look like a valid MAC address: $ARG1"
+        RESPONSE=$(tpl_render "$TPL_CMD_BADMAC" input "$ARG1")
         return
     fi
     MINS=$(printf '%s' "$ARG2" | bb tr -cd '0-9')
     if [ -z "$MINS" ] || [ "$MINS" -le 0 ] 2>/dev/null; then
-        RESPONSE="Minutes must be a positive whole number."
+        RESPONSE=$(tpl_render "$TPL_CMD_BADMINUTES")
         return
     fi
 
@@ -706,9 +702,9 @@ Example: /addtime aa:bb:cc:dd:ee:ff 30"
     _hs_unlock
 
     if [ "$CREATED" -eq 1 ]; then
-        RESPONSE="No existing session for $MAC — created a new one with ${MINS}m."
+        RESPONSE=$(tpl_render "$TPL_CMD_ADDTIME_CREATED" mac "$MAC" minutes "$MINS")
     else
-        RESPONSE="Added ${MINS}m to $MAC. Remaining: $(_hs_fmt_secs "$REM")."
+        RESPONSE=$(tpl_render "$TPL_CMD_ADDTIME_OK" mac "$MAC" minutes "$MINS" remainingtime "$(_hs_fmt_secs "$REM")")
     fi
 }
 
@@ -727,18 +723,17 @@ cmd_remove_time() {
     ARG2=${ARG2%% *}
 
     if [ -z "$ARG1" ] || [ -z "$ARG2" ]; then
-        RESPONSE="Usage: /removetime <mac> <minutes>
-Example: /removetime aa:bb:cc:dd:ee:ff 15"
+        RESPONSE=$(tpl_render "$TPL_CMD_REMOVETIME_USAGE")
         return
     fi
     MAC=$(_hs_norm_mac "$ARG1")
     if [ -z "$MAC" ]; then
-        RESPONSE="That doesn't look like a valid MAC address: $ARG1"
+        RESPONSE=$(tpl_render "$TPL_CMD_BADMAC" input "$ARG1")
         return
     fi
     MINS=$(printf '%s' "$ARG2" | bb tr -cd '0-9')
     if [ -z "$MINS" ] || [ "$MINS" -le 0 ] 2>/dev/null; then
-        RESPONSE="Minutes must be a positive whole number."
+        RESPONSE=$(tpl_render "$TPL_CMD_BADMINUTES")
         return
     fi
 
@@ -785,10 +780,10 @@ Example: /removetime aa:bb:cc:dd:ee:ff 15"
     _hs_unlock
 
     if [ "$FOUND" -eq 0 ]; then
-        RESPONSE="No session found for $MAC — nothing to remove time from."
+        RESPONSE=$(tpl_render "$TPL_CMD_REMOVETIME_NONE" mac "$MAC")
         return
     fi
-    RESPONSE="Removed ${MINS}m from $MAC. Remaining: $(_hs_fmt_secs "$REM")."
+    RESPONSE=$(tpl_render "$TPL_CMD_REMOVETIME_OK" mac "$MAC" minutes "$MINS" remainingtime "$(_hs_fmt_secs "$REM")")
 }
 # ------------------------------------------------------------------------
 
@@ -817,6 +812,14 @@ _bot_send_reply() {
 run_bot() {
     local BOT_OFFSET=0
     BOTTAB="$(printf '\t')"
+
+    # Command-response templates ($TPL_CMD_*) — same customizable-message
+    # engine the event notifications use (see notify_templates.sh), just a
+    # separate override file/admin UI card. Loaded once here rather than
+    # per-message, same as the bot config below: editing a response in the
+    # admin panel takes effect on the bot's next start/restart, matching
+    # how a CMD_ENABLED_*/BOT_TOKEN edit already behaves.
+    . /lmepisowifi/hotspot/notify_templates.sh
 
     # === Bot configuration ===
     local BOT_ENV="/lmepisowifi/hotspot_data/telegram_bot.env"
@@ -954,7 +957,7 @@ EOF
                         if [ -n "$HANDLER" ] && cmd_is_enabled "$CMD_NAME"; then
                             "$HANDLER"
                         else
-                            RESPONSE="Unknown command."
+                            RESPONSE=$(tpl_render "$TPL_CMD_UNKNOWN")
                         fi
 
                         # Send the response back
@@ -965,7 +968,7 @@ EOF
                         ;;
                     *)
                         # Reject unauthorized users
-                        _bot_send_reply "$CHAT_ID" "Unauthorized user. Access denied."
+                        _bot_send_reply "$CHAT_ID" "$(tpl_render "$TPL_CMD_UNAUTHORIZED")"
                         ;;
                 esac
 

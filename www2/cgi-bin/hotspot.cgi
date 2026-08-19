@@ -605,6 +605,8 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
     CCD="${COIN_COOLDOWN:-$(read_lmehspt_var COIN_COOLDOWN)}"
     CSE="${COIN_STRIKE_ENABLED:-$(read_lmehspt_var COIN_STRIKE_ENABLED)}"
     CSE_BOOL="true"; [ "${CSE:-1}" = "0" ] && CSE_BOOL="false"
+    CQE="${COIN_QUEUE_ENABLED:-$(read_lmehspt_var COIN_QUEUE_ENABLED)}"
+    CQE_BOOL="true"; [ "${CQE:-1}" = "0" ] && CQE_BOOL="false"
     PIP="${PORTAL_IP:-$(read_lmehspt_var PORTAL_IP)}"
     PPT="${PORTAL_PORT:-$(read_lmehspt_var PORTAL_PORT)}"
     HBR="${HOTSPOT_BR:-$(read_lmehspt_var HOTSPOT_BR)}"
@@ -652,6 +654,7 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
 \"coin_strike_threshold\":\"$(esc_json "$CST")\",
 \"coin_cooldown\":\"$(esc_json "$CCD")\",
 \"coin_strike_enabled\":$CSE_BOOL,
+\"coin_queue_enabled\":$CQE_BOOL,
 \"portal_ip\":\"$(esc_json "$PIP")\",
 \"portal_port\":\"$(esc_json "$PPT")\",
 \"hotspot_br\":\"$(esc_json "$HBR")\",
@@ -2207,6 +2210,34 @@ if echo "$QS" | $BB grep -q "action=coin_strike_set"; then
 fi
 
 # ================================================================
+# POST ?action=coin_queue_set   body: enabled=1|0
+# Master switch for the Insert Coin waiting line (see coin.sh's "start"
+# action). On by default: a client who finds the slot busy is placed in
+# line and notified when it's their turn. When off, a busy slot is reported
+# immediately as "Coin slot is in use, try again later." and no one is
+# queued. Same simple three-tier persistence as every other on/off toggle.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=coin_queue_set"; then
+    read -n "${CONTENT_LENGTH:-0}" POST_DATA
+    VAL=$(printf '%s' "$POST_DATA" | $BB sed -n 's/.*enabled=\([^&]*\).*/\1/p')
+    case "$VAL" in
+        1)
+            save_coin_env_var "COIN_QUEUE_ENABLED" "1"
+            set_lmehspt_var   "COIN_QUEUE_ENABLED" "1"
+            set_globals_var   "COIN_QUEUE_ENABLED" "1"
+            ok_json '{"ok":true,"coin_queue_enabled":true}'
+            ;;
+        0)
+            save_coin_env_var "COIN_QUEUE_ENABLED" "0"
+            set_lmehspt_var   "COIN_QUEUE_ENABLED" "0"
+            set_globals_var   "COIN_QUEUE_ENABLED" "0"
+            ok_json '{"ok":true,"coin_queue_enabled":false}'
+            ;;
+        *) err_json "bad_value" ;;
+    esac
+fi
+
+# ================================================================
 # POST ?action=coin_reset
 # Wipes the NodeMCU's WiFi config and drops it back into the open
 # PisoWifi-Setup AP for re-provisioning. This replaces the old
@@ -2598,6 +2629,95 @@ fi
 # ================================================================
 if echo "$QS" | $BB grep -q "action=notify_templates_reset"; then
     rm -f "$HDATA/notify_templates.env"
+    ok_json "{\"ok\":true}"
+fi
+
+# ================================================================
+# GET ?action=bot_templates_get  -> current router-bot command-response
+# templates (falls back to built-in defaults for anything not customized).
+# Separate file/action from notify_templates_* above -- saving the "Bot
+# Command Responses" card can never clobber the "Message Templates" card
+# or vice versa.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=bot_templates_get"; then
+    . /lmepisowifi/hotspot/notify_templates.sh
+    ok_json "{\"templates\":{\
+\"cmd_status\":\"$(esc_json "$TPL_CMD_STATUS")\",\
+\"cmd_reboot\":\"$(esc_json "$TPL_CMD_REBOOT")\",\
+\"cmd_hotspotstats_notinstalled\":\"$(esc_json "$TPL_CMD_HOTSPOTSTATS_NOTINSTALLED")\",\
+\"cmd_hotspotstats\":\"$(esc_json "$TPL_CMD_HOTSPOTSTATS")\",\
+\"cmd_activeusers_empty\":\"$(esc_json "$TPL_CMD_ACTIVEUSERS_EMPTY")\",\
+\"cmd_kick_usage\":\"$(esc_json "$TPL_CMD_KICK_USAGE")\",\
+\"cmd_kick_ok\":\"$(esc_json "$TPL_CMD_KICK_OK")\",\
+\"cmd_kick_none\":\"$(esc_json "$TPL_CMD_KICK_NONE")\",\
+\"cmd_addtime_usage\":\"$(esc_json "$TPL_CMD_ADDTIME_USAGE")\",\
+\"cmd_addtime_created\":\"$(esc_json "$TPL_CMD_ADDTIME_CREATED")\",\
+\"cmd_addtime_ok\":\"$(esc_json "$TPL_CMD_ADDTIME_OK")\",\
+\"cmd_removetime_usage\":\"$(esc_json "$TPL_CMD_REMOVETIME_USAGE")\",\
+\"cmd_removetime_none\":\"$(esc_json "$TPL_CMD_REMOVETIME_NONE")\",\
+\"cmd_removetime_ok\":\"$(esc_json "$TPL_CMD_REMOVETIME_OK")\",\
+\"cmd_badmac\":\"$(esc_json "$TPL_CMD_BADMAC")\",\
+\"cmd_badminutes\":\"$(esc_json "$TPL_CMD_BADMINUTES")\",\
+\"cmd_unknown\":\"$(esc_json "$TPL_CMD_UNKNOWN")\",\
+\"cmd_unauthorized\":\"$(esc_json "$TPL_CMD_UNAUTHORIZED")\"\
+}}"
+fi
+
+# ================================================================
+# POST ?action=bot_templates_set  (form-encoded) -> save customized
+# router-bot command responses. Any field left blank reverts that
+# response to its built-in default (handled by notify_templates.sh at
+# render time). Takes effect the next time the bot is (re)started --
+# same as any other telegram_bot.env-adjacent change.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=bot_templates_set"; then
+    read -n "$CONTENT_LENGTH" POST_DATA
+
+    fget() {
+        printf '%s' "$POST_DATA" \
+            | $BB tr '&' '\n' \
+            | $BB grep "^$1=" \
+            | $BB sed 's/^[^=]*=//' \
+            | urldecode \
+            | head -1
+    }
+    # Same sanitizer as notify_templates_set -- strips CR/LF, quotes,
+    # backslashes, $ and backticks so a saved value can't break out of the
+    # sourced env file or inject shell commands. Still supports multi-line
+    # layout via the %0A token.
+    san() { printf '%s' "$1" | $BB tr -d '\r\n"\\$\140'; }
+
+    mkdir -p "$HDATA"
+    {
+        echo "TPL_CMD_STATUS=\"$(san "$(fget cmd_status)")\""
+        echo "TPL_CMD_REBOOT=\"$(san "$(fget cmd_reboot)")\""
+        echo "TPL_CMD_HOTSPOTSTATS_NOTINSTALLED=\"$(san "$(fget cmd_hotspotstats_notinstalled)")\""
+        echo "TPL_CMD_HOTSPOTSTATS=\"$(san "$(fget cmd_hotspotstats)")\""
+        echo "TPL_CMD_ACTIVEUSERS_EMPTY=\"$(san "$(fget cmd_activeusers_empty)")\""
+        echo "TPL_CMD_KICK_USAGE=\"$(san "$(fget cmd_kick_usage)")\""
+        echo "TPL_CMD_KICK_OK=\"$(san "$(fget cmd_kick_ok)")\""
+        echo "TPL_CMD_KICK_NONE=\"$(san "$(fget cmd_kick_none)")\""
+        echo "TPL_CMD_ADDTIME_USAGE=\"$(san "$(fget cmd_addtime_usage)")\""
+        echo "TPL_CMD_ADDTIME_CREATED=\"$(san "$(fget cmd_addtime_created)")\""
+        echo "TPL_CMD_ADDTIME_OK=\"$(san "$(fget cmd_addtime_ok)")\""
+        echo "TPL_CMD_REMOVETIME_USAGE=\"$(san "$(fget cmd_removetime_usage)")\""
+        echo "TPL_CMD_REMOVETIME_NONE=\"$(san "$(fget cmd_removetime_none)")\""
+        echo "TPL_CMD_REMOVETIME_OK=\"$(san "$(fget cmd_removetime_ok)")\""
+        echo "TPL_CMD_BADMAC=\"$(san "$(fget cmd_badmac)")\""
+        echo "TPL_CMD_BADMINUTES=\"$(san "$(fget cmd_badminutes)")\""
+        echo "TPL_CMD_UNKNOWN=\"$(san "$(fget cmd_unknown)")\""
+        echo "TPL_CMD_UNAUTHORIZED=\"$(san "$(fget cmd_unauthorized)")\""
+    } > "$HDATA/bot_templates.env.tmp"
+    $BB mv "$HDATA/bot_templates.env.tmp" "$HDATA/bot_templates.env"
+    ok_json "{\"ok\":true}"
+fi
+
+# ================================================================
+# POST ?action=bot_templates_reset  -> restore all router-bot command
+# responses to their built-in defaults (deletes the override file)
+# ================================================================
+if echo "$QS" | $BB grep -q "action=bot_templates_reset"; then
+    rm -f "$HDATA/bot_templates.env"
     ok_json "{\"ok\":true}"
 fi
 

@@ -429,6 +429,15 @@ start)
     fi
 
     if [ "$LOCKED" -eq 1 ]; then
+        # Waiting-line feature master switch. When off, don't put this
+        # client on hold at all — just turn them away so they can try the
+        # slot again later themselves instead of sitting in an unattended
+        # queue. Nothing is written to QFILE in this branch, so it simply
+        # never accumulates entries while the switch is off.
+        if [ "${COIN_QUEUE_ENABLED:-1}" = "0" ]; then
+            _err "Coin slot is in use, try again later."
+        fi
+
         # Enqueue user / Refresh their spot in line
         $BB grep -v "^$CLIENT_MAC " "$QFILE" > "${QFILE}.tmp" 2>/dev/null
         echo "$CLIENT_MAC $NOW" >> "${QFILE}.tmp"

@@ -284,6 +284,20 @@
                 </div>
             </div>
             <hr class="my-3" style="border-color:var(--border-color);">
+            <!-- Waiting line -->
+            <div class="d-flex align-items-start justify-content-between gap-3">
+                <div style="min-width:0;">
+                    <div style="font-weight:500;">Insert Coin Queue</div>
+                    <div class="field-hint">When someone hits Insert Coin while the slot is busy, put them in line and notify them when it's their turn. When off, they're told the slot is in use and to try again later — no one is queued.</div>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                    <span id="cq-badge" class="at-badge on">On</span>
+                    <div id="cq-toggle" class="wlan-toggle" onclick="toggleCoinQueue()" title="Toggle the insert coin waiting line">
+                        <div class="wlan-toggle-knob"></div>
+                    </div>
+                </div>
+            </div>
+            <hr class="my-3" style="border-color:var(--border-color);">
             <div class="d-flex gap-2 flex-wrap">
                 <button class="btn btn-primary" onclick="saveCoin()">Save Coin Settings</button>
                 <button class="btn btn-outline-secondary" onclick="loadConfig()">Discard</button>
@@ -440,6 +454,7 @@ function loadConfig(){
             document.getElementById('c-strike-threshold').value = d.coin_strike_threshold||'';
             document.getElementById('c-cooldown').value       = d.coin_cooldown||'';
             setCoinStrikeUI(d.coin_strike_enabled===true||d.coin_strike_enabled==='1'||d.coin_strike_enabled===1);
+            setCoinQueueUI(d.coin_queue_enabled===true||d.coin_queue_enabled==='1'||d.coin_queue_enabled===1);
             setCoinToggleUI(d.coin_on);
             setVoucherToggleUI(d.voucher_on);
             setAntiTetherUI(d.anti_tether===true||d.anti_tether==='1'||d.anti_tether===1);
@@ -624,6 +639,25 @@ function toggleCoinStrike(){
     postForm('coin_strike_set','enabled='+newVal,function(d){
         tog.classList.remove('busy');
         if(d.ok){ setCoinStrikeUI(d.coin_strike_enabled); toastr.success('Coin anti-troll suspension '+(d.coin_strike_enabled?'enabled':'disabled')); }
+        else toastr.error('Failed: '+(d.error||'unknown'));
+    });
+}
+
+/* ── Insert Coin queue toggle ── */
+function setCoinQueueUI(on){
+    var tog=document.getElementById('cq-toggle');
+    var badge=document.getElementById('cq-badge');
+    if(on){ tog.classList.add('on'); badge.textContent='On'; badge.className='at-badge on'; }
+    else  { tog.classList.remove('on'); badge.textContent='Off'; badge.className='at-badge off'; }
+}
+function toggleCoinQueue(){
+    var tog=document.getElementById('cq-toggle');
+    if(tog.classList.contains('busy')) return;
+    var newVal=tog.classList.contains('on')?0:1;
+    tog.classList.add('busy');
+    postForm('coin_queue_set','enabled='+newVal,function(d){
+        tog.classList.remove('busy');
+        if(d.ok){ setCoinQueueUI(d.coin_queue_enabled); toastr.success('Insert Coin queue '+(d.coin_queue_enabled?'enabled':'disabled')); }
         else toastr.error('Failed: '+(d.error||'unknown'));
     });
 }

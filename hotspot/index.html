@@ -2139,8 +2139,8 @@ function doCoinStart(fromStatus, isPolling) {
       if (d.error) {
         if (_queuePollID) { clearInterval(_queuePollID); _queuePollID = null; }
         var msg = d.error;
-        if (msg === 'Coin slot in use, try again shortly')
-          msg = 'The Coinslot is currently in use, you can wait for the person to finish.';
+        if (msg === 'Coin slot is in use, try again later.')
+          msg = 'The Coinslot is currently in use. Please try again in a moment.';
         else if (msg === 'Coinslot Unavailable')
           msg = 'The Coinslot is currently unavailable, try again later or notify the vendo owner.';
         else

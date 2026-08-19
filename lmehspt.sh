@@ -107,6 +107,12 @@ COIN_RATES="1:15 5:90 10:210 15:360 20:720 25:1080 30:2160 35:2880 40:3600 45:43
 COIN_STRIKE_ENABLED="1"
 COIN_STRIKE_THRESHOLD="3"
 COIN_COOLDOWN="60"
+# When "1" (default), a client who hits Insert Coin while the slot is
+# already in use by someone else is placed in a waiting line and notified
+# when it becomes their turn (see coin.sh's "start" action). Set to "0" to
+# turn the queue off entirely — a client finding the slot busy is refused
+# immediately with "Coin slot is in use, try again later." instead.
+COIN_QUEUE_ENABLED="1"
 # Seconds the portal keeps a mid-insert coin session alive while the NodeMCU is
 # unreachable (reporting "reconnecting", coins preserved, countdown frozen)
 # before giving up. Keep equal to the firmware's MAX_PAUSE_MS (300s).
@@ -1523,6 +1529,13 @@ write_coin_config() {
         printf 'COIN_RATES="%s"\n'          "$COIN_RATES"
         printf 'COIN_STRIKE_THRESHOLD="%s"\n' "$COIN_STRIKE_THRESHOLD"
         printf 'COIN_COOLDOWN="%s"\n'       "$COIN_COOLDOWN"
+        # Without this line, every write_coin_config() call (hotspot
+        # start/restart, NodeMCU IP change, boot) regenerates coin_config.env
+        # from this exact list and silently drops whatever the admin toggled
+        # via hotspot.cgi's coin_queue_set action — coin.sh only sources this
+        # cache file (never globals.env directly), so it would then see
+        # COIN_QUEUE_ENABLED as unset and fall back to the default (queue on).
+        printf 'COIN_QUEUE_ENABLED="%s"\n'  "${COIN_QUEUE_ENABLED:-1}"
         printf 'COIN_RECONNECT_GRACE="%s"\n' "$COIN_RECONNECT_GRACE"
         printf 'COIN_ENABLED="%s"\n'        "$COIN_ENABLED"
         printf 'COIN_REQUIRE_INTERNET="%s"\n' "${COIN_REQUIRE_INTERNET:-0}"
