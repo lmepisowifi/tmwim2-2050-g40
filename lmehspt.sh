@@ -80,6 +80,12 @@ HOTSPOT_ENABLED="1"
 ANTI_TETHER="1"
 LAN_ISOLATE="1"
 MAC_RANDOMIZATION_FIX="1"
+# See defaults.env for the full rationale. On (default): the one-time boot
+# sync (sync_to_persistent_db call inside the BOOT_MARKER block) converts
+# any users.txt row still "active" from before the reboot to "paused",
+# preserving its last-known remaining time. Off: skip that call, leaving
+# such rows "active" untouched.
+PAUSE_ON_BOOT="1"
 # Any address in these ranges is private (RFC1918) and, by definition, can
 # only ever be a LAN device — ours, or someone else's upstream gateway in a
 # chained/double-NAT setup (e.g. a repurposed-WAN uplink whose own gateway
@@ -1585,6 +1591,15 @@ write_coin_config() {
         printf 'ANTI_TETHER="%s"\n'         "${ANTI_TETHER:-0}"
         printf 'LAN_ISOLATE="%s"\n'         "${LAN_ISOLATE:-1}"
         printf 'MAC_RANDOMIZATION_FIX="%s"\n' "${MAC_RANDOMIZATION_FIX:-1}"
+        # Same "without this line..." reasoning as MAC_RANDOMIZATION_FIX just
+        # above — PAUSE_ON_BOOT is only actually consulted once, at the
+        # BOOT_MARKER gate near the bottom of this file, but that check reads
+        # whatever this function last wrote here (coin_config.env, sourced
+        # after globals.env), so leaving it out would silently reset the
+        # admin's toggle back to the "1" inline default on every
+        # write_coin_config() call (hotspot restart, NodeMCU IP change, etc.)
+        # before the box next actually reboots.
+        printf 'PAUSE_ON_BOOT="%s"\n'       "${PAUSE_ON_BOOT:-1}"
     } > /tmp/coin_config.env
     if [ "$COIN_ENABLED" = "1" ]; then
         touch /tmp/coin_enabled
@@ -1811,7 +1826,15 @@ if [ ! -f "$BOOT_MARKER" ]; then
     _lock
     restore_users_file_from_backup
     restore_income_file_from_backup
-    sync_to_persistent_db
+    # SESSION_FILE (tmpfs) is gone after a real reboot, so every users.txt
+    # row still marked "active" from before it has no live firewall rule
+    # backing it anymore. This one-time call folds those into "paused" (see
+    # PAUSE_ON_BOOT in defaults.env for the full rationale) — off leaves
+    # them "active" as-is, though the periodic 5-minute
+    # sync_to_persistent_db call further down still catches and pauses any
+    # that are still stale then, same as it would for any other
+    # USERS_FILE/SESSION_FILE desync, boot-related or not.
+    [ "${PAUSE_ON_BOOT:-1}" = "1" ] && sync_to_persistent_db
     sync
     backup_users_file
     backup_income_file

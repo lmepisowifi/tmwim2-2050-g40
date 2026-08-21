@@ -678,6 +678,27 @@
 
     .add-panel { display: none; padding-top: 14px; margin-top: 10px; border-top: 1px dashed var(--border-color); }
 
+    /* Persistent "you have leftover coins" banner — shown above whichever
+       view (v-login/v-status) is currently active, driven by status.sh's
+       available_coins field. Reuses the coin-button color family so it
+       reads as coin-related without introducing new variables. */
+    .avail-coins-banner {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      margin: 0 0 12px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--btn-coin-bg);
+      border: 1px solid var(--btn-coin-border);
+      color: var(--btn-coin-color);
+      font-size: 12.5px;
+      font-weight: 600;
+      text-align: center;
+    }
+    .avail-coins-banner .coin-sym { font-size: 1rem; font-weight: 700; color: var(--coin-sym-color); }
+
     /* ======================================= COIN VIEW ======================================= */
     .coin-display { 
       text-align: center; 
@@ -870,6 +891,11 @@
         <button id="promo-next" class="promo-arrow promo-arrow-right" aria-label="Next">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
         </button>
+      </div>
+
+      <div id="avail-coins-banner" class="avail-coins-banner">
+        <span class="coin-sym">&#8369;</span>
+        <span>Available coins: <span id="avail-coins-amount">0</span> — insert more to use it</span>
       </div>
 
       <div id="v-load">
@@ -1498,6 +1524,7 @@ function refreshWlanData(prefix) {
   fetch('/cgi-bin/status.sh?_=' + Math.random(), { cache: 'no-store' })
     .then(function(r) { return r.json(); })
     .then(function(d) {
+      updateAvailCoinsBanner(d);
       // Render into whichever view currently matches the connection state.
       var activePrefix = d.logged_in ? 's' : 'l';
       renderDeviceInfo(d, activePrefix);
@@ -1630,6 +1657,21 @@ function renderDeviceInfo(d, prefix) {
   }
 }
 
+/* Shows/updates the persistent "Available coins" banner from status.sh's
+   available_coins field (only present, and only shown, when > 0 — see
+   status.sh). Called regardless of logged_in/paused state since a leftover
+   below-tier balance can coexist with any of those. */
+function updateAvailCoinsBanner(d) {
+  var banner = document.getElementById('avail-coins-banner');
+  var amt = parseInt(d.available_coins, 10) || 0;
+  if (amt > 0) {
+    document.getElementById('avail-coins-amount').textContent = amt;
+    banner.style.display = 'flex';
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
 function checkStatus() {
   var isOnline = (document.getElementById('v-status').style.display === 'block');
   if (!_coinSID && !_queuePollID && !_coinPendingWait && !isOnline) show('v-load');
@@ -1639,6 +1681,7 @@ function checkStatus() {
   fetch(url, { cache: 'no-store' })
     .then(function(r) { return r.json(); })
     .then(function(d) {
+      updateAvailCoinsBanner(d);
       if (d.logged_in) {
         renderDeviceInfo(d, 's');
         if (!_coinSID && !_queuePollID && !_coinPendingWait) show('v-status');
@@ -2143,7 +2186,6 @@ function doCoinStart(fromStatus, isPolling) {
           msg = 'The Coinslot is currently in use. Please try again in a moment.';
         else if (msg === 'Coinslot Unavailable')
           msg = 'The Coinslot is currently unavailable, try again later or notify the vendo owner.';
-        else
         toastr.error(msg);
         return;
       }

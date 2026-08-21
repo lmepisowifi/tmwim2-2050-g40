@@ -56,6 +56,36 @@ _node_field() {
 COIN_PENDING_DIR="/lmepisowifi/hotspot_data/coin_pending"
 _clear_pending() { rm -f "${COIN_PENDING_DIR}/${1}" "${COIN_PENDING_DIR}/${1}.tmp" 2>/dev/null; }
 
+# ── Below-minimum-tier coin banking ──────────────────────────────────────────
+# When a coin session's total (see the greedy calculator below) doesn't reach
+# even the cheapest configured rate tier, none of it converts to time — that
+# money used to just be gone from the customer's perspective (still recorded
+# as income, just with nothing to show for it). This file carries that
+# leftover forward per-MAC so the next coin top-up picks up where the last
+# one left off instead of losing it. Reconciled across MAC-randomization
+# reconnects by macfix.sh's mf_reconcile() (MACFIX_BANK_FILE — same physical
+# file, path duplicated there the same way USERS_FILE's path already is).
+COIN_BANK_FILE="/lmepisowifi/hotspot_data/coin_bank.txt"
+
+# Currently banked pesos for $1 (a MAC) — empty if none. Call inside _lock.
+_bank_get() {
+    [ -f "$COIN_BANK_FILE" ] || return 0
+    $BB awk -v m="$1" '$1==m{print $2; exit}' "$COIN_BANK_FILE"
+}
+
+# Replaces $1 (MAC)'s banked amount with $2 pesos, dropping the row
+# entirely once it reaches 0 rather than leaving a stale "MAC 0" line
+# around forever. Same exclude-then-recommit idiom as
+# _users_file_stage_excl elsewhere in this file. Call inside _lock.
+_bank_set() {
+    local mac="$1" amt="${2:-0}"
+    case "$amt" in ''|*[!0-9]*) amt=0 ;; esac
+    mkdir -p /lmepisowifi/hotspot_data 2>/dev/null
+    $BB grep -v "^${mac} " "$COIN_BANK_FILE" > "${COIN_BANK_FILE}.tmp" 2>/dev/null
+    [ "$amt" -gt 0 ] && printf '%s %s\n' "$mac" "$amt" >> "${COIN_BANK_FILE}.tmp"
+    mv "${COIN_BANK_FILE}.tmp" "$COIN_BANK_FILE"
+}
+
 _unlock() { rm -f /tmp/hotspot_session.lock/pid 2>/dev/null; rmdir /tmp/hotspot_session.lock 2>/dev/null; }
 _lock() {
     local i=0
@@ -300,7 +330,18 @@ if [ "${AMOUNT:-0}" -eq 0 ]; then
     _ok '{"ok":true,"amount":0,"minutes":0}'
 fi
 
-MINUTES=$(printf '%s %s\n' "$COIN_RATES" "$AMOUNT" | awk '
+# Fold in whatever's already banked for this MAC (see COIN_BANK_FILE above)
+# before converting to time, so a customer topping up in small increments
+# gets credited once the RUNNING TOTAL crosses a tier — instead of every
+# top-up being evaluated, and lost, in isolation. Wrapped in the same lock
+# used below for the session/users grant so a below-tier top-up racing
+# against another request for the same MAC can't read a stale balance.
+_lock
+BANKED=$(_bank_get "$CLIENT_MAC")
+case "$BANKED" in ''|*[!0-9]*) BANKED=0 ;; esac
+TOTAL_FOR_TIME=$(( BANKED + AMOUNT ))
+
+_MB=$(printf '%s %s\n' "$COIN_RATES" "$TOTAL_FOR_TIME" | awk '
 {
     amt=$NF; n=NF-1
     for(i=1;i<=n;i++){split($i,a,":");pesos[i]=a[1]+0;mins[i]=a[2]+0}
@@ -313,12 +354,19 @@ MINUTES=$(printf '%s %s\n' "$COIN_RATES" "$AMOUNT" | awk '
     for(i=1;i<=n;i++) if(pesos[i]>0){
         c=int(rem/pesos[i]); total+=c*mins[i]; rem-=c*pesos[i]
     }
-    print total
+    print total, rem
 }')
+MINUTES=${_MB%% *}
+BANK_AFTER=${_MB##* }
+
+# Whatever's left over (0 once TOTAL_FOR_TIME exactly covers whole tiers)
+# REPLACES the pre-top-up balance rather than adding to it — BANKED was
+# already folded into TOTAL_FOR_TIME above, so re-adding it here would
+# double-count it.
+_bank_set "$CLIENT_MAC" "$BANK_AFTER"
 
 # --- Grant or extend session (3-COLUMN AWARE) ---
 if [ "${MINUTES:-0}" -gt 0 ]; then
-    _lock
     $BB grep -v "^$CLIENT_MAC " /tmp/coin_strikes.txt > /tmp/cs.tmp 2>/dev/null
     $BB mv /tmp/cs.tmp /tmp/coin_strikes.txt
 
@@ -366,8 +414,8 @@ if [ "${MINUTES:-0}" -gt 0 ]; then
         printf '%s active %s %s %s\n' "$CLIENT_MAC" "$N_REMAIN" "$NEW_TOTAL" "$(_fmt_secs "$N_REMAIN")" >> "${USERS_FILE}.tmp"
         _users_file_commit
     fi
-    _unlock
 fi
+_unlock
 
 # --- Income tracking + coin-sale notification ----------------------------
 if [ "${AMOUNT:-0}" -gt 0 ]; then
@@ -429,6 +477,6 @@ rm -f "$SESSION_PATH" "${SESSION_PATH}.miss" "${SESSION_PATH}.amt" "${SESSION_PA
 _clear_pending "$SID"   # coins credited → drop the non-volatile crash mirror
 
 if [ "$RECOVER" = "1" ]; then
-    _ok "{\"ok\":true,\"amount\":${AMOUNT},\"minutes\":${MINUTES},\"recovered\":true}"
+    _ok "{\"ok\":true,\"amount\":${AMOUNT},\"minutes\":${MINUTES},\"banked\":${BANK_AFTER:-0},\"recovered\":true}"
 fi
-_ok "{\"ok\":true,\"amount\":${AMOUNT},\"minutes\":${MINUTES}}"
+_ok "{\"ok\":true,\"amount\":${AMOUNT},\"minutes\":${MINUTES},\"banked\":${BANK_AFTER:-0}}"

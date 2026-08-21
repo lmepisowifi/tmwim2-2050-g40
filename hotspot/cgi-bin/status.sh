@@ -15,6 +15,7 @@
 BB="busybox"
 SESSION_FILE="/tmp/active_sessions.txt"
 USERS_FILE="/lmepisowifi/hotspot_data/users.txt"
+COIN_BANK_FILE="/lmepisowifi/hotspot_data/coin_bank.txt"
 HOTSPOT_BR="br1"
 
 # Live-updatable toggles (MAC_RANDOMIZATION_FIX among them) written by
@@ -72,6 +73,17 @@ if [ -z "$CLIENT_MAC" ] || [ "$CLIENT_MAC" = "00:00:00:00:00:00" ]; then
     exit 0
 fi
 
+# Pesos banked from a below-minimum-tier coin top-up (see coin_result.sh's
+# COIN_BANK_FILE) that haven't converted to time yet — already reconciled
+# onto this MAC by mf_reconcile() above if it changed since the balance was
+# banked. Surfaced only when nonzero so the portal's "Available coins"
+# banner stays hidden for everyone else.
+AVAIL_COINS=0
+[ -f "$COIN_BANK_FILE" ] && AVAIL_COINS=$($BB awk -v m="$CLIENT_MAC" '$1==m{print $2; exit}' "$COIN_BANK_FILE")
+case "$AVAIL_COINS" in ''|*[!0-9]*) AVAIL_COINS=0 ;; esac
+AVAIL_JSON=""
+[ "$AVAIL_COINS" -gt 0 ] && AVAIL_JSON=",\"available_coins\":$AVAIL_COINS"
+
 # -- CONNECTION DETECTION (Run for everyone regardless of session) --
 WLAN_IFACE=""
 WLAN_BAND=""
@@ -126,7 +138,7 @@ if [ -n "$SESSION" ]; then
         USED=$(( TOTAL - REMAINING ))
         [ "$USED" -lt 0 ] && USED=0
 
-        $BB echo "{\"logged_in\":true,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"remaining\":$REMAINING,\"total\":$TOTAL,\"used\":$USED,${CONN_JSON}}"
+        $BB echo "{\"logged_in\":true,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"remaining\":$REMAINING,\"total\":$TOTAL,\"used\":$USED,${CONN_JSON}${AVAIL_JSON}}"
         _unlock
         exit 0
     fi
@@ -145,8 +157,8 @@ if [ -n "$PAUSED" ]; then
     # still does the actual resume, so this flag never bypasses its
     # locking/atomic-write path, just who clicks the button.
     AR_BOOL="false"; [ "${AUTO_RESUME_ENABLED:-0}" = "1" ] && AR_BOOL="true"
-    $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"has_paused\":true,\"remaining\":$REMAINING,\"total\":$TOTAL,\"auto_resume\":$AR_BOOL,${CONN_JSON}}"
+    $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"has_paused\":true,\"remaining\":$REMAINING,\"total\":$TOTAL,\"auto_resume\":$AR_BOOL,${CONN_JSON}${AVAIL_JSON}}"
 else
-    $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",${CONN_JSON}}"
+    $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",${CONN_JSON}${AVAIL_JSON}}"
 fi
 _unlock

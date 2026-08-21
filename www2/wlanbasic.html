@@ -706,6 +706,25 @@ function buildIfaceCards(ifaces) {
                 </div>
                 <button type="button" class="btn btn-primary w-100 mt-3"
                         id="save-${id}-btn" onclick="saveIface(${iface.idx})">Save</button>
+                ${isVxd ? `
+                <hr class="my-3">
+                <div class="vxd-status mb-2" id="${id}-conn-status">
+                    <div style="font-size:12px; color:#888;">Connection status</div>
+                    <div id="${id}-conn-line" style="font-size:13px;">Checking…</div>
+                    <div id="${id}-auth-line" style="font-size:13px;"></div>
+                </div>
+                <label class="form-label mt-2">Lock to BSSID <span style="font-weight:400; color:#888;">(optional)</span></label>
+                <div class="d-flex gap-2">
+                    <input type="text" class="form-control" id="${id}-bssid-lock"
+                           maxlength="17" placeholder="AA:BB:CC:DD:EE:FF (blank = any AP with this SSID)">
+                    <button type="button" class="btn btn-outline-secondary" style="white-space:nowrap;"
+                            id="save-${id}-bssid-btn" onclick="saveBssidLock(${iface.idx})">Save</button>
+                </div>
+                <div style="font-size:11px; color:#888; margin-top:4px;">
+                    Pins this radio to one specific access point instead of any AP broadcasting the SSID.
+                    Not guaranteed during automatic roam scans on some firmware — verify it holds if you
+                    have more than one AP using the same network name nearby.
+                </div>` : ''}
             </div>`;
 
         container.appendChild(div);
@@ -714,6 +733,100 @@ function buildIfaceCards(ifaces) {
         document.getElementById(id + '-ssid').value = iface.ssid || '';
         setToggle(id, iface.disabled === 0);
     });
+
+    startVxdStatusPolling();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// VXD (idx 5) — BSSID lock + live connection/auth status
+// ═══════════════════════════════════════════════════════════════
+let vxdPollTimer = null;
+
+function macToColon(hex) {
+    if (!hex || hex.length !== 12) return '';
+    return hex.match(/.{2}/g).join(':').toUpperCase();
+}
+function macToHex(colonOrHex) {
+    return (colonOrHex || '').toLowerCase().replace(/[^0-9a-f]/g, '');
+}
+
+function applyVxdStatus(vs) {
+    const id = 'iface-5';
+    const connLine = document.getElementById(id + '-conn-line');
+    const authLine = document.getElementById(id + '-auth-line');
+    const lockInput = document.getElementById(id + '-bssid-lock');
+    if (!connLine) return; // VXD card not currently rendered
+
+    if (vs.connected) {
+        connLine.textContent = 'Connected to "' + vs.ssid + '" (' + macToColon(vs.bssid) +
+            ') · ch ' + vs.channel + ' · signal ' + vs.rssi + '/100';
+        connLine.style.color = '#2e7d32';
+    } else {
+        connLine.textContent = 'Not connected';
+        connLine.style.color = '#c62828';
+    }
+
+    if (vs.authFinished === 1 && vs.authStatus === 0) {
+        authLine.textContent = 'Authentication: OK';
+        authLine.style.color = '#2e7d32';
+    } else if (vs.authStatus > 0) {
+        authLine.textContent = 'Authentication: ' + vs.authText;
+        authLine.style.color = '#c62828';
+    } else {
+        authLine.textContent = '';
+    }
+
+    // Don't stomp on a value the user is actively typing
+    if (document.activeElement !== lockInput) {
+        lockInput.value = macToColon(vs.lockedBssid);
+    }
+}
+
+function loadVxdStatus() {
+    fetch(CGI + '?band=' + currentBand + '&action=vxd_status')
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(applyVxdStatus)
+        .catch(() => {}); // silent — this is a background poll
+}
+
+function startVxdStatusPolling() {
+    if (vxdPollTimer) { clearInterval(vxdPollTimer); vxdPollTimer = null; }
+    if (!document.getElementById('iface-5-conn-line')) return; // no VXD card this band
+    loadVxdStatus();
+    vxdPollTimer = setInterval(loadVxdStatus, 5000);
+}
+
+// Save VXD BSSID lock  (POST ?action=save_bssid_lock)
+function saveBssidLock(idx) {
+    const id = 'iface-' + idx;
+    const raw = document.getElementById(id + '-bssid-lock').value.trim();
+    const hex = macToHex(raw);
+
+    if (raw && hex.length !== 12) {
+        toastr["warning"]('Enter a full MAC address (AA:BB:CC:DD:EE:FF) or leave it blank.', "Error");
+        return;
+    }
+
+    setFormEnabled(false);
+    startCountdown('Applying');
+    let aborted = false;
+    fetch(CGI + '?action=save_bssid_lock&band=' + currentBand, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'bssid=' + encodeURIComponent(hex)
+    })
+    .then(r => {
+        if (r && !r.ok) { aborted = true; return r.text().then(t => { throw new Error(t || ('HTTP ' + r.status)); }); }
+    })
+    .catch(err => {
+        if (aborted) {
+            if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+            hideOverlay();
+            setFormEnabled(true);
+            toastr["warning"](err.message || 'Save failed', "Error");
+        }
+    });
+    setTimeout(() => { if (!aborted) pollUntilBack(); }, 4500);
 }
 
 // ═══════════════════════════════════════════════════════════════

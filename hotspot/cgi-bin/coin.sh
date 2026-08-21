@@ -18,9 +18,51 @@
 # GET ?action=cancel&sid=SID   → tells NodeMCU to end session immediately or leaves queue
 
 [ -f /tmp/coin_config.env ] && . /tmp/coin_config.env
+[ -f /lmepisowifi/hotspot/macfix.sh ] && . /lmepisowifi/hotspot/macfix.sh
+
+_unlock() { rm -f /tmp/hotspot_session.lock/pid 2>/dev/null; rmdir /tmp/hotspot_session.lock 2>/dev/null; }
+_lock() {
+    local i=0
+    while ! mkdir /tmp/hotspot_session.lock 2>/dev/null; do
+        # Only steal the lock once its holder is provably dead (see
+        # lmehspt.sh's _lock for the full explanation) - a flat 5s wait was
+        # force-breaking a live holder's lock under normal polling load and
+        # letting two writers stomp the same USERS_FILE.tmp at once.
+        if [ "$((i % 10))" -eq 0 ] && [ "$i" -gt 0 ]; then
+            if [ "$i" -ge 300 ]; then
+                rm -f /tmp/hotspot_session.lock/pid 2>/dev/null
+                rmdir /tmp/hotspot_session.lock 2>/dev/null
+            else
+                _HPID=$(cat /tmp/hotspot_session.lock/pid 2>/dev/null)
+                if [ -z "$_HPID" ] || ! kill -0 "$_HPID" 2>/dev/null; then
+                    rm -f /tmp/hotspot_session.lock/pid 2>/dev/null
+                    rmdir /tmp/hotspot_session.lock 2>/dev/null
+                fi
+            fi
+        fi
+        sleep 0.1 2>/dev/null || sleep 1
+        i=$((i + 1))
+    done
+    echo $$ > /tmp/hotspot_session.lock/pid 2>/dev/null
+    trap _unlock EXIT INT TERM
+}
+
+# --- Get client MAC from ARP — server-side, client cannot forge this ---
+CLIENT_MAC=$(awk -v ip="$REMOTE_ADDR" -v br="$HOTSPOT_BR" \
+    '$1==ip && $6==br {print tolower($4); exit}' /proc/net/arp 2>/dev/null)
+
+# Verify/refresh this browser's fingerprint cookie and, if it was last seen
+# on a different MAC (a randomized-MAC reconnect), migrate its banked
+# below-minimum-tier coin balance (plus session/users rows) onto the
+# current MAC before any CLIENT_MAC-keyed lookup below runs — same call
+# macfix.sh's other callers (status.sh/login.sh/logout.sh) already make.
+# _lock/_unlock just above exist to satisfy mf_reconcile()'s own locking;
+# this file has no SESSION_FILE/USERS_FILE of its own to protect.
+mf_reconcile
 
 printf 'Content-Type: application/json\r\n'
 printf 'Cache-Control: no-cache, no-store\r\n'
+[ -n "$MF_COOKIE_HEADER" ] && printf '%s\r\n' "$MF_COOKIE_HEADER"
 printf '\r\n'
 
 _err() { printf '{"error":"%s"}\n' "$1"; exit 0; }
@@ -166,9 +208,8 @@ ACTION=$(get_qs "action")
 NODE_ID=$(get_qs "nodemcu")
 case "$NODE_ID" in ''|*[!0-9]*) NODE_ID=1 ;; esac
 
-# --- Get client MAC from ARP — server-side, client cannot forge this ---
-CLIENT_MAC=$(awk -v ip="$REMOTE_ADDR" -v br="$HOTSPOT_BR" \
-    '$1==ip && $6==br {print tolower($4); exit}' /proc/net/arp 2>/dev/null)
+# CLIENT_MAC was already resolved above (before headers, so mf_reconcile()
+# could run and possibly emit a Set-Cookie) — not recomputed here.
 
 # config action works regardless of enabled state so the JS can show/hide the button
 if [ "$ACTION" = "config" ]; then

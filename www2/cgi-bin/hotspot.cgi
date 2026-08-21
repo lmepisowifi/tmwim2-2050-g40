@@ -66,6 +66,9 @@ HDATA="/lmepisowifi/hotspot_data"
 SESSION_DATA="/tmp/active_sessions.txt"
 USERS_FILE="$HDATA/users.txt"
 WHITELIST_FILE="$HDATA/whitelist.txt"
+# Below-minimum-tier coin balances banked per-MAC by coin_result.sh — see
+# that file's COIN_BANK_FILE comment for the full explanation.
+COIN_BANK_FILE="$HDATA/coin_bank.txt"
 
 _unlock() { rm -f /tmp/hotspot_session.lock/pid 2>/dev/null; rmdir /tmp/hotspot_session.lock 2>/dev/null; }
 _lock() {
@@ -617,6 +620,8 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
     LI_BOOL="true"; [ "${LI:-1}" = "0" ] && LI_BOOL="false"
     MRF="${MAC_RANDOMIZATION_FIX:-$(read_lmehspt_var MAC_RANDOMIZATION_FIX)}"
     MRF_BOOL="true"; [ "${MRF:-1}" = "0" ] && MRF_BOOL="false"
+    POB="${PAUSE_ON_BOOT:-$(read_lmehspt_var PAUSE_ON_BOOT)}"
+    POB_BOOL="true"; [ "${POB:-1}" = "0" ] && POB_BOOL="false"
     CRI="${COIN_REQUIRE_INTERNET:-$(read_lmehspt_var COIN_REQUIRE_INTERNET)}"
     CRI_BOOL="true"; [ "${CRI:-0}" = "0" ] && CRI_BOOL="false"
     VRI="${VOUCHER_REQUIRE_INTERNET:-$(read_lmehspt_var VOUCHER_REQUIRE_INTERNET)}"
@@ -662,6 +667,7 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
 \"anti_tether\":$AT_BOOL,
 \"lan_isolate\":$LI_BOOL,
 \"mac_randomization_fix\":$MRF_BOOL,
+\"pause_on_boot\":$POB_BOOL,
 \"coin_require_internet\":$CRI_BOOL,
 \"voucher_require_internet\":$VRI_BOOL,
 \"voucher_strike_enabled\":$VSE_BOOL,
@@ -862,7 +868,7 @@ fi
 if echo "$QS" | $BB grep -q "action=sessions"; then
     _lock
     UPTIME=$($BB awk '{print int($1)}' /proc/uptime)
-    OUT="["; SEP=""
+    OUT="["; SEP=""; SEEN_MACS=" "
     if [ -f "$SESSION_DATA" ]; then
         while read -r mac expiry total; do
             [ -n "$mac" ] || continue
@@ -873,8 +879,12 @@ if echo "$QS" | $BB grep -q "action=sessions"; then
             ip=""
             [ -f /tmp/hotspot_ip_map.txt ] && ip=$($BB grep "^$mac " /tmp/hotspot_ip_map.txt | $BB awk '{print $2}' | head -1)
             [ -z "$ip" ] && ip=$($BB awk -v m="$mac" '$4==m{print $1;exit}' /proc/net/arp 2>/dev/null)
-            OUT="${OUT}${SEP}{\"mac\":\"$mac\",\"ip\":\"${ip:-?}\",\"remaining\":$rem,\"total\":$total,\"used\":$used,\"paused\":false}"
+            bank=0
+            [ -f "$COIN_BANK_FILE" ] && bank=$($BB awk -v m="$mac" '$1==m{print $2;exit}' "$COIN_BANK_FILE")
+            case "$bank" in ''|*[!0-9]*) bank=0 ;; esac
+            OUT="${OUT}${SEP}{\"mac\":\"$mac\",\"ip\":\"${ip:-?}\",\"remaining\":$rem,\"total\":$total,\"used\":$used,\"paused\":false,\"available_coins\":$bank}"
             SEP=","
+            SEEN_MACS="${SEEN_MACS}${mac} "
         done < "$SESSION_DATA"
     fi
     if [ -f "$USERS_FILE" ]; then
@@ -883,9 +893,28 @@ if echo "$QS" | $BB grep -q "action=sessions"; then
             [ -z "$total" ] && total=$rem
             used=$(( total - rem )); [ "$used" -lt 0 ] && used=0
             ip=$($BB awk -v m="$mac" '$4==m{print $1;exit}' /proc/net/arp 2>/dev/null)
-            OUT="${OUT}${SEP}{\"mac\":\"$mac\",\"ip\":\"${ip:-?}\",\"remaining\":$rem,\"total\":$total,\"used\":$used,\"paused\":true}"
+            bank=0
+            [ -f "$COIN_BANK_FILE" ] && bank=$($BB awk -v m="$mac" '$1==m{print $2;exit}' "$COIN_BANK_FILE")
+            case "$bank" in ''|*[!0-9]*) bank=0 ;; esac
+            OUT="${OUT}${SEP}{\"mac\":\"$mac\",\"ip\":\"${ip:-?}\",\"remaining\":$rem,\"total\":$total,\"used\":$used,\"paused\":true,\"available_coins\":$bank}"
             SEP=","
+            SEEN_MACS="${SEEN_MACS}${mac} "
         done < "$USERS_FILE"
+    fi
+    # A MAC that inserted coins below the minimum tier has no active/paused
+    # session at all until it crosses one — nothing above would otherwise
+    # surface it, so the admin would have no way to see the balance is
+    # sitting there. Give it its own row instead.
+    if [ -f "$COIN_BANK_FILE" ]; then
+        while read -r mac bank; do
+            [ -n "$mac" ] || continue
+            case "$bank" in ''|*[!0-9]*) bank=0 ;; esac
+            [ "$bank" -gt 0 ] || continue
+            case "$SEEN_MACS" in *" ${mac} "*) continue ;; esac
+            ip=$($BB awk -v m="$mac" '$4==m{print $1;exit}' /proc/net/arp 2>/dev/null)
+            OUT="${OUT}${SEP}{\"mac\":\"$mac\",\"ip\":\"${ip:-?}\",\"remaining\":0,\"total\":0,\"used\":0,\"paused\":false,\"coins_only\":true,\"available_coins\":$bank}"
+            SEP=","
+        done < "$COIN_BANK_FILE"
     fi
     _unlock
     ok_json "${OUT}]"
@@ -1172,6 +1201,7 @@ if echo "$QS" | $BB grep -q "action=remove_user"; then
     # Clean up auxiliary files
     [ -f "$RM_ACTIVITY" ]         && { $BB grep -v "^$MAC " "$RM_ACTIVITY"         > /tmp/rm_a.tmp 2>/dev/null; $BB mv /tmp/rm_a.tmp "$RM_ACTIVITY"; }
     [ -f /tmp/hotspot_ip_map.txt ] && { $BB grep -v "^$MAC " /tmp/hotspot_ip_map.txt > /tmp/rm_i.tmp;           $BB mv /tmp/rm_i.tmp /tmp/hotspot_ip_map.txt; }
+    [ -f "$COIN_BANK_FILE" ]       && { $BB grep -v "^$MAC " "$COIN_BANK_FILE"       > /tmp/rm_b.tmp 2>/dev/null; $BB mv /tmp/rm_b.tmp "$COIN_BANK_FILE"; }
 
     ok_json "{\"ok\":true,\"mac\":\"$MAC\"}"
 fi
@@ -2092,6 +2122,35 @@ if echo "$QS" | $BB grep -q "action=mac_fix_set"; then
             set_lmehspt_var   "MAC_RANDOMIZATION_FIX" "0"
             set_globals_var   "MAC_RANDOMIZATION_FIX" "0"
             ok_json '{"ok":true,"mac_randomization_fix":false}'
+            ;;
+        *) err_json "bad_value" ;;
+    esac
+fi
+
+# ================================================================
+# POST ?action=pause_on_boot_set   body: enabled=1|0
+# Toggles whether the boot-time sync (BOOT_MARKER block in lmehspt.sh)
+# converts any users.txt row still "active" from before a reboot into
+# "paused". Same save_coin_env_var/set_lmehspt_var/set_globals_var pattern
+# as every other simple on/off toggle here — no firewall chain or
+# running-daemon effect to apply live, this only changes what the boot
+# sequence does the *next* time the box actually reboots.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=pause_on_boot_set"; then
+    read -n "${CONTENT_LENGTH:-0}" POST_DATA
+    VAL=$(printf '%s' "$POST_DATA" | $BB sed -n 's/.*enabled=\([^&]*\).*/\1/p')
+    case "$VAL" in
+        1)
+            save_coin_env_var "PAUSE_ON_BOOT" "1"
+            set_lmehspt_var   "PAUSE_ON_BOOT" "1"
+            set_globals_var   "PAUSE_ON_BOOT" "1"
+            ok_json '{"ok":true,"pause_on_boot":true}'
+            ;;
+        0)
+            save_coin_env_var "PAUSE_ON_BOOT" "0"
+            set_lmehspt_var   "PAUSE_ON_BOOT" "0"
+            set_globals_var   "PAUSE_ON_BOOT" "0"
+            ok_json '{"ok":true,"pause_on_boot":false}'
             ;;
         *) err_json "bad_value" ;;
     esac

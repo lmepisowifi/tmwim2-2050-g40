@@ -62,6 +62,7 @@ band_keys() {
             TP_KEY="WLAN_RFPOWER_SCALE"
             AC_KEY="AUTO_CHANNEL"
             WLAN_IF="wlan0"
+            VXD_IF="wlan0-vxd"
             RV_PFX="/tmp/wbasic5"
             SEC_PFX="/tmp/wsec5"
             REPEATER_EN_KEY="REPEATER_ENABLED1"
@@ -75,6 +76,7 @@ band_keys() {
             TP_KEY="WLAN1_RFPOWER_SCALE"
             AC_KEY="WLAN1_AUTO_CHANNEL"
             WLAN_IF="wlan1"
+            VXD_IF="wlan1-vxd"
             RV_PFX="/tmp/wbasic24"
             SEC_PFX="/tmp/wsec24"
             REPEATER_EN_KEY="REPEATER_ENABLED2"
@@ -110,6 +112,58 @@ get_ch_list() {
     else
         printf '%s' "$AVAIL"
     fi
+}
+
+# ── VXD (idx 5) live connection + auth status ────────────────────────────────
+# proc_field FILE LABEL  → value after "LABEL:" on the matching line, trimmed
+proc_field() {
+    [ -f "$1" ] || return
+    busybox grep -m1 "^[[:space:]]*$2:" "$1" 2>/dev/null \
+        | busybox sed "s/^[[:space:]]*$2:[[:space:]]*//" \
+        | busybox tr -d '\r\n'
+}
+
+# auth_text CODE  → human-readable 4-way handshake status
+auth_text() {
+    case "$1" in
+        0)  printf 'OK' ;;
+        14) printf 'Wrong password (MIC failure)' ;;
+        15) printf 'Handshake timeout (no reply from AP)' ;;
+        '') printf 'Unknown' ;;
+        *)  printf 'Failed (reason %s)' "$1" ;;
+    esac
+}
+
+# emit_vxd_status_json VXD_IF TBL_PFX  → JSON connection/auth snapshot
+emit_vxd_status_json() {
+    _vif="$1"; _pfx="$2"
+    _bssdesc="/proc/${_vif}/mib_bssdesc"
+    _authf="/proc/${_vif}/mib_auth"
+
+    _lock=$(mib_field "${_pfx}.5.prefer_bssid")
+    [ -z "$_lock" ] && _lock="000000000000"
+
+    _bssid=$(proc_field "$_bssdesc" "bssid")
+    [ -z "$_bssid" ] && _bssid="000000000000"
+    if [ "$_bssid" = "000000000000" ]; then
+        _connected=false
+    else
+        _connected=true
+    fi
+
+    _ssid=$(proc_field "$_bssdesc" "ssid")
+    _chan=$(proc_field "$_bssdesc" "channel");  [ -z "$_chan" ] && _chan=0
+    _rssi=$(proc_field "$_bssdesc" "rssi");     [ -z "$_rssi" ] && _rssi=0
+    _sq=$(proc_field   "$_bssdesc" "sq");       [ -z "$_sq"   ] && _sq=0
+
+    _authst=$(proc_field "$_authf" "4-way status")
+    _authfin=$(proc_field "$_authf" "4-way finished"); [ -z "$_authfin" ] && _authfin=0
+    _authtxt=$(auth_text "$_authst")
+    [ -z "$_authst" ] && _authst=-1
+
+    printf '{"vxdIf":"%s","lockedBssid":"%s","connected":%s,"bssid":"%s","ssid":"%s","channel":%s,"rssi":%s,"sq":%s,"authStatus":%s,"authFinished":%s,"authText":"%s"}' \
+        "$(json_esc "$_vif")" "$_lock" "$_connected" "$_bssid" "$(json_esc "$_ssid")" \
+        "$_chan" "$_rssi" "$_sq" "$_authst" "$_authfin" "$(json_esc "$_authtxt")"
 }
 
 # POST field helpers ─────────────────────────────────────────────────────────
@@ -227,6 +281,21 @@ urlenc() {
     printf '%s' "$_uo"
 }
 
+# ascii_to_hex STR  → lowercase 2-digit-hex-per-character MIB encoding
+# (WEP ASCII key convention, e.g. "wep12" -> 7765703132). Used when
+# wepKeyType=0 (ASCII key format) so the raw passphrase is stored the
+# same way the vendor GUI/MIB expects, mirroring urlenc's char-by-char
+# ordinal trick above.
+ascii_to_hex() {
+    _as="$1"; _ao=""; _ai=0; _alen=${#_as}
+    while [ "$_ai" -lt "$_alen" ]; do
+        _ac=$(printf '%s' "$_as" | busybox cut -c$((_ai + 1)))
+        _ao="${_ao}$(printf '%02x' "'$_ac")"
+        _ai=$((_ai + 1))
+    done
+    printf '%s' "$_ao"
+}
+
 # nm_push NEW_SSID NEW_PASS  → 0 on NodeMCU ACK, 1 on any failure
 # Two-step signed handshake (matches the firmware's /reset flow):
 #   1. GET /nonce                              → fresh single-use nonce
@@ -259,9 +328,15 @@ nm_push() {
 
 # nm_effective_pass TBL_PFX IDX  → the Wi-Fi password the station needs
 # (empty for an open network, else the interface's WPA-PSK)
+# NOTE: encrypt=1 is WEP, which has no wpaPSK — this returns empty for it,
+# same as open. The coin-slot NodeMCU is not currently handed a WEP key at
+# all (nm_push only ever carries a WPA passphrase), so a coin-slot SSID
+# switched to WEP will look "open" to the sync logic and the NodeMCU will
+# fail to associate. Not fixed here — flagging so it isn't mistaken for
+# working WEP support on the coin-slot path.
 nm_effective_pass() {
     _ee=$(mib_field "${1}.${2}.encrypt"); [ -z "$_ee" ] && _ee=0
-    if [ "$_ee" = "0" ]; then printf ''; else mib_field "${1}.${2}.wpaPSK"; fi
+    case "$_ee" in 0|1) printf '' ;; *) mib_field "${1}.${2}.wpaPSK" ;; esac
 }
 
 # nm_sync_iface BAND IDX NEW_SSID NEW_PASS
@@ -321,6 +396,15 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
         exit 0
     fi
 
+    # ── action=vxd_status: VXD (idx 5) BSSID lock + live connection/auth ──
+    if echo "$QUERY_STRING" | busybox grep -q "action=vxd_status"; then
+        dbg "GET vxd_status: band=$BAND vxd_if=$VXD_IF"
+        printf "Status: 200 OK\r\n"
+        printf "Content-Type: application/json\r\n\r\n"
+        emit_vxd_status_json "$VXD_IF" "$TBL_PFX"
+        exit 0
+    fi
+
     # ── action=status: return full per-band JSON ─────────────────────────────
     if echo "$QUERY_STRING" | busybox grep -q "action=status"; then
 
@@ -377,6 +461,19 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
             UC=$(mib_field   "${TBL_PFX}.${I}.unicastCipher");     [ -z "$UC"  ] && UC=0
             U2C=$(mib_field  "${TBL_PFX}.${I}.wpa2UnicastCipher"); [ -z "$U2C" ] && U2C=2
             PSK=$(mib_field  "${TBL_PFX}.${I}.wpaPSK")
+            WEP=$(mib_field  "${TBL_PFX}.${I}.wep");          [ -z "$WEP"   ] && WEP=1
+            WKT=$(mib_field  "${TBL_PFX}.${I}.wepKeyType");   [ -z "$WKT"   ] && WKT=0
+            WDK=$(mib_field  "${TBL_PFX}.${I}.wepDefaultKey"); [ -z "$WDK"  ] && WDK=0
+            AUTHTYPE=$(mib_field "${TBL_PFX}.${I}.authType"); [ -z "$AUTHTYPE" ] && AUTHTYPE=0
+
+            # wep = key length (1=64-bit, 2=128-bit) selects which slot table
+            # to read from; wepKeyType is key *format* (ASCII/Hex) and has no
+            # bearing on which slot the key lives in.
+            if [ "$WEP" = "2" ]; then
+                WEPKEY=$(mib_field "${TBL_PFX}.${I}.wep128Key$((WDK + 1))")
+            else
+                WEPKEY=$(mib_field "${TBL_PFX}.${I}.wep64Key$((WDK + 1))")
+            fi
 
             if [ -z "$SSID" ] && [ "$I" = "0" ]; then
                 dbg "WARN: ${TBL_PFX}.0.ssid is empty (main AP has no SSID set)"
@@ -388,7 +485,7 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
             elif [ "$I" = "5" ]; then TY="vxd"
             else                       TY="vap"
             fi
-            IFACES_J="${IFACES_J}${ISEP}{\"idx\":${I},\"type\":\"${TY}\",\"ssid\":\"${SE}\",\"disabled\":${DIS},\"wlanMode\":${WMOD},\"wlanBand\":${WBD},\"encrypt\":${ENC},\"unicastCipher\":${UC},\"wpa2UnicastCipher\":${U2C},\"psk\":\"${PE}\"}"
+            IFACES_J="${IFACES_J}${ISEP}{\"idx\":${I},\"type\":\"${TY}\",\"ssid\":\"${SE}\",\"disabled\":${DIS},\"wlanMode\":${WMOD},\"wlanBand\":${WBD},\"encrypt\":${ENC},\"unicastCipher\":${UC},\"wpa2UnicastCipher\":${U2C},\"psk\":\"${PE}\",\"wep\":${WEP},\"wepKeyType\":${WKT},\"wepDefaultKey\":${WDK},\"wepKey\":\"${WEPKEY}\",\"authType\":${AUTHTYPE}}"
             ISEP=","
             I=$((I + 1))
         done
@@ -937,6 +1034,42 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         exit 0
     fi
 
+    # ── action=save_bssid_lock: pin/unpin VXD (idx 5) to one specific AP ──
+    # Body: bssid=<12 hex chars>  (empty or all-zero clears the lock)
+    # Writes dot11DesiredBssid (bssid2join) via WLAN_MBSSIB_TBL.5.prefer_bssid.
+    # NOTE: the driver's own join-candidate loop has a compile-time carve-out
+    # (SMART_REPEATER_MODE / SSFROM_REPEATER_VXD) that skips this BSSID check
+    # entirely for scans it tags as VXD-repeater-originated, so treat this as
+    # a preference the firmware is *supposed* to honor, not a hard guarantee —
+    # verify empirically if a same-SSID neighbor AP exists nearby.
+    if [ "$ACTION" = "save_bssid_lock" ]; then
+        RAW_BSSID=$(pd_str bssid)
+        BSSID=$(printf '%s' "$RAW_BSSID" | busybox tr 'A-Z' 'a-z' | busybox sed 's/[^0-9a-f]//g')
+
+        if [ -z "$BSSID" ]; then
+            BSSID="000000000000"
+        elif [ ${#BSSID} -ne 12 ]; then
+            dbg "WARN save_bssid_lock: invalid bssid '$RAW_BSSID' (len ${#BSSID})"
+            printf "Status: 400 Bad Request\r\n"
+            printf "Content-Type: text/plain\r\n\r\n"
+            printf "BSSID must be 12 hex characters (or empty to unlock)"
+            exit 0
+        fi
+
+        mib set "${TBL_PFX}.5.prefer_bssid" "$BSSID"
+        mib commit
+        dbg "save_bssid_lock: band=$BAND ${TBL_PFX}.5.prefer_bssid=$BSSID"
+
+        wlan_apply restart
+        dbg "save_bssid_lock: also restarting multi-ap agent service"
+        sysconf multi_ap_agent_restart
+
+        printf "Status: 200 OK\r\n"
+        printf "Content-Type: text/plain\r\n\r\n"
+        printf "OK"
+        exit 0
+    fi
+
     # ── action=save_security: save security settings for any interface ───────
     if [ "$ACTION" = "save_security" ]; then
         IDX=$(echo "$QUERY_STRING" \
@@ -957,19 +1090,72 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         FORM_UC=$(pd_int   unicastCipher     0)
         FORM_U2C=$(pd_int  wpa2UnicastCipher 2)
         FORM_PSK=$(pd_str  psk)
+        # WEP fields — mapping per vendor MIB spec:
+        #   encrypt=1        WEP State (this IS the WEP toggle, not a forced-0 value)
+        #   wep=1|2          Key Length: 1=64-bit, 2=128-bit
+        #   wepKeyType=0|1   Key Format: 0=ASCII, 1=Hex
+        #   wepDefaultKey    0-indexed default key slot (0=Key1 ... 3=Key4)
+        #   authType=0|1|2   Authentication: 0=Open System, 1=Shared Key, 2=Auto
+        FORM_WEP=$(pd_int  wep               1)
+        FORM_WKT=$(pd_int  wepKeyType        0)
+        FORM_WDK=$(pd_int  wepKeyIdx         0)
+        FORM_AUTHTYPE=$(pd_int authType      0)
+        FORM_WKEY_RAW=$(pd_str wepKey)
 
         # Validate
-        case "$FORM_ENC" in 0|2|4|6|16|20)  ;; *) FORM_ENC=0 ;; esac
+        case "$FORM_ENC" in 0|1|2|4|6|16|20) ;; *) FORM_ENC=0 ;; esac
         case "$FORM_UC"  in 0|1|2|3)         ;; *) FORM_UC=0  ;; esac
         case "$FORM_U2C" in 0|1|2|3)         ;; *) FORM_U2C=2 ;; esac
+        case "$FORM_WEP" in 1|2)             ;; *) FORM_WEP=1 ;; esac
+        case "$FORM_WKT" in 0|1)             ;; *) FORM_WKT=0 ;; esac
+        case "$FORM_WDK" in 0|1|2|3)         ;; *) FORM_WDK=0 ;; esac
+        case "$FORM_AUTHTYPE" in 0|1|2)      ;; *) FORM_AUTHTYPE=0 ;; esac
 
         # WPA3 (enc 16 or 20): WPA cipher must be disabled, WPA2/WPA3 cipher must be AES
         case "$FORM_ENC" in
             16|20) FORM_UC=0; FORM_U2C=2 ;;
         esac
 
-        # PSK required for all non-open modes
-        if [ "$FORM_ENC" != "0" ]; then
+        # WEP (encrypt=1): key length comes from `wep` (1=64-bit/2=128-bit),
+        # key format from `wepKeyType` (0=ASCII/1=Hex). ASCII input must be
+        # the exact byte length for the chosen key size (5 or 13 chars) and
+        # gets hex-encoded (2 hex digits per ASCII byte) before storage; Hex
+        # input is parsed directly (lowercased, non-hex chars stripped) and
+        # must already be the exact hex-digit length (10 or 26).
+        if [ "$FORM_ENC" = "1" ]; then
+            if [ "$FORM_WEP" = "2" ]; then ASCII_LEN=13; HEX_LEN=26; else ASCII_LEN=5; HEX_LEN=10; fi
+
+            if [ "$FORM_WKT" = "1" ]; then
+                FORM_WKEY=$(printf '%s' "$FORM_WKEY_RAW" | busybox tr 'A-Z' 'a-z' | busybox sed 's/[^0-9a-f]//g')
+                if [ ${#FORM_WKEY} -ne "$HEX_LEN" ]; then
+                    dbg "WARN save_security idx=$IDX: WEP hex key length ${#FORM_WKEY} != $HEX_LEN (wep=$FORM_WEP)"
+                    printf "Status: 400 Bad Request\r\n"
+                    printf "Content-Type: text/plain\r\n\r\n"
+                    if [ "$FORM_WEP" = "2" ]; then
+                        printf "128-bit WEP hex key must be 26 hex characters (13 bytes)"
+                    else
+                        printf "64-bit WEP hex key must be 10 hex characters (5 bytes)"
+                    fi
+                    exit 0
+                fi
+            else
+                if [ ${#FORM_WKEY_RAW} -ne "$ASCII_LEN" ]; then
+                    dbg "WARN save_security idx=$IDX: WEP ascii key length ${#FORM_WKEY_RAW} != $ASCII_LEN (wep=$FORM_WEP)"
+                    printf "Status: 400 Bad Request\r\n"
+                    printf "Content-Type: text/plain\r\n\r\n"
+                    if [ "$FORM_WEP" = "2" ]; then
+                        printf "128-bit WEP ASCII key must be 13 characters"
+                    else
+                        printf "64-bit WEP ASCII key must be 5 characters"
+                    fi
+                    exit 0
+                fi
+                FORM_WKEY=$(ascii_to_hex "$FORM_WKEY_RAW")
+            fi
+        fi
+
+        # PSK required for all non-open, non-WEP modes
+        if [ "$FORM_ENC" != "0" ] && [ "$FORM_ENC" != "1" ]; then
             PSK_LEN=$(printf '%s' "$FORM_PSK" \
                 | busybox wc -c | busybox tr -d ' ')
             if [ "$PSK_LEN" -lt 8 ] || [ "$PSK_LEN" -gt 63 ]; then
@@ -990,6 +1176,17 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         SV_U2C=$(mib_field "${TBL_PFX}.${IDX}.wpa2UnicastCipher")
         SV_PSK=$(mib_field "${TBL_PFX}.${IDX}.wpaPSK")
         SV_PMF=$(mib_field "${TBL_PFX}.${IDX}.dotIEEE80211W")
+        SV_WEP=$(mib_field "${TBL_PFX}.${IDX}.wep");           [ -z "$SV_WEP" ] && SV_WEP=1
+        SV_WKT=$(mib_field "${TBL_PFX}.${IDX}.wepKeyType");    [ -z "$SV_WKT" ] && SV_WKT=0
+        SV_WDK=$(mib_field "${TBL_PFX}.${IDX}.wepDefaultKey"); [ -z "$SV_WDK" ] && SV_WDK=0
+        SV_AUTHTYPE=$(mib_field "${TBL_PFX}.${IDX}.authType"); [ -z "$SV_AUTHTYPE" ] && SV_AUTHTYPE=0
+        # Only the exact slot this save is about to (possibly) overwrite needs
+        # a snapshot — other WEP key slots are never touched by this action.
+        # Slot is chosen by key LENGTH (wep), not key format (wepKeyType).
+        if [ "$FORM_WEP" = "2" ]; then SV_WKEY_FIELD="wep128Key$((FORM_WDK + 1))"
+        else                           SV_WKEY_FIELD="wep64Key$((FORM_WDK + 1))"
+        fi
+        SV_WKEY_VAL=$(mib_field "${TBL_PFX}.${IDX}.${SV_WKEY_FIELD}")
 
         # ── Coin-slot NodeMCU: if the passphrase/encryption of the SSID it
         #    rides on is changing, push the new credentials and wait for ACK
@@ -1016,7 +1213,19 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
 
         # Apply security settings
         mib set "${TBL_PFX}.${IDX}.encrypt" "$FORM_ENC"
-        if [ "$FORM_ENC" != "0" ]; then
+        if [ "$FORM_ENC" = "1" ]; then
+            # WEP
+            mib set "${TBL_PFX}.${IDX}.wep"           "$FORM_WEP"
+            mib set "${TBL_PFX}.${IDX}.wepKeyType"    "$FORM_WKT"
+            mib set "${TBL_PFX}.${IDX}.wepDefaultKey" "$FORM_WDK"
+            mib set "${TBL_PFX}.${IDX}.authType"      "$FORM_AUTHTYPE"
+            if [ "$FORM_WEP" = "2" ]; then
+                mib set "${TBL_PFX}.${IDX}.wep128Key$((FORM_WDK + 1))" "$FORM_WKEY"
+            else
+                mib set "${TBL_PFX}.${IDX}.wep64Key$((FORM_WDK + 1))" "$FORM_WKEY"
+            fi
+        elif [ "$FORM_ENC" != "0" ]; then
+            # WPA family
             mib set "${TBL_PFX}.${IDX}.wpaAuth"          2
             mib set "${TBL_PFX}.${IDX}.enable1X"         0
             mib set "${TBL_PFX}.${IDX}.unicastCipher"    "$FORM_UC"
@@ -1036,6 +1245,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         #    previous values first so the revert timer can restore them.
         FORCE_RESTART=0
         SVP_ENC=""; SVP_UC=""; SVP_U2C=""; SVP_PSK=""; SVP_PMF=""; SVP_PFX=""; SVP_IDX=""
+        SVP_WEP=""; SVP_WKT=""; SVP_WDK=""; SVP_WKEY_FIELD=""; SVP_WKEY_VAL=""
         resolve_partner "$BAND" "$IDX"
         if [ -n "$PART_PFX" ]; then
             SVP_ENC=$(mib_field "${PART_PFX}.${PART_IDX}.encrypt")
@@ -1043,10 +1253,28 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             SVP_U2C=$(mib_field "${PART_PFX}.${PART_IDX}.wpa2UnicastCipher")
             SVP_PSK=$(mib_field "${PART_PFX}.${PART_IDX}.wpaPSK")
             SVP_PMF=$(mib_field "${PART_PFX}.${PART_IDX}.dotIEEE80211W")
+            SVP_WEP=$(mib_field "${PART_PFX}.${PART_IDX}.wep");           [ -z "$SVP_WEP" ] && SVP_WEP=1
+            SVP_WKT=$(mib_field "${PART_PFX}.${PART_IDX}.wepKeyType");    [ -z "$SVP_WKT" ] && SVP_WKT=0
+            SVP_WDK=$(mib_field "${PART_PFX}.${PART_IDX}.wepDefaultKey"); [ -z "$SVP_WDK" ] && SVP_WDK=0
+            SVP_AUTHTYPE=$(mib_field "${PART_PFX}.${PART_IDX}.authType"); [ -z "$SVP_AUTHTYPE" ] && SVP_AUTHTYPE=0
+            if [ "$FORM_WEP" = "2" ]; then SVP_WKEY_FIELD="wep128Key$((FORM_WDK + 1))"
+            else                           SVP_WKEY_FIELD="wep64Key$((FORM_WDK + 1))"
+            fi
+            SVP_WKEY_VAL=$(mib_field "${PART_PFX}.${PART_IDX}.${SVP_WKEY_FIELD}")
             SVP_PFX="$PART_PFX"; SVP_IDX="$PART_IDX"
 
             mib set "${PART_PFX}.${PART_IDX}.encrypt" "$FORM_ENC"
-            if [ "$FORM_ENC" != "0" ]; then
+            if [ "$FORM_ENC" = "1" ]; then
+                mib set "${PART_PFX}.${PART_IDX}.wep"           "$FORM_WEP"
+                mib set "${PART_PFX}.${PART_IDX}.wepKeyType"    "$FORM_WKT"
+                mib set "${PART_PFX}.${PART_IDX}.wepDefaultKey" "$FORM_WDK"
+                mib set "${PART_PFX}.${PART_IDX}.authType"      "$FORM_AUTHTYPE"
+                if [ "$FORM_WEP" = "2" ]; then
+                    mib set "${PART_PFX}.${PART_IDX}.wep128Key$((FORM_WDK + 1))" "$FORM_WKEY"
+                else
+                    mib set "${PART_PFX}.${PART_IDX}.wep64Key$((FORM_WDK + 1))" "$FORM_WKEY"
+                fi
+            elif [ "$FORM_ENC" != "0" ]; then
                 mib set "${PART_PFX}.${PART_IDX}.wpaAuth"           2
                 mib set "${PART_PFX}.${PART_IDX}.enable1X"          0
                 mib set "${PART_PFX}.${PART_IDX}.unicastCipher"     "$FORM_UC"
@@ -1063,7 +1291,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             dbg "save_security idx=$IDX: merged mirror -> band $PART_BAND idx $PART_IDX (force_restart=$FORCE_RESTART)"
         fi
 
-        dbg "save_security idx=$IDX: applied enc=$FORM_ENC uc=$FORM_UC u2c=$FORM_U2C cur_dis=$CUR_DIS"
+        dbg "save_security idx=$IDX: applied enc=$FORM_ENC uc=$FORM_UC u2c=$FORM_U2C wep=$FORM_WEP wkt=$FORM_WKT authType=$FORM_AUTHTYPE cur_dis=$CUR_DIS"
 
         # If interface is disabled no restart needed (unless a merged partner
         # on the other band is live and needs the mirrored change)
@@ -1081,6 +1309,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         printf '%s' "$SV_U2C" > "${SP}_u2c"
         printf '%s' "$SV_PSK" > "${SP}_psk"
         printf '%s' "$SV_PMF" > "${SP}_pmf"
+        printf '%s' "$SV_WEP" > "${SP}_wep"
+        printf '%s' "$SV_WKT" > "${SP}_wkt"
+        printf '%s' "$SV_WDK" > "${SP}_wdk"
+        printf '%s' "$SV_AUTHTYPE" > "${SP}_authtype"
+        printf '%s' "$SV_WKEY_FIELD" > "${SP}_wkey_field"
+        printf '%s' "$SV_WKEY_VAL"   > "${SP}_wkey_val"
         # Merged partner security rollback (only present when a mirror happened)
         if [ -n "$SVP_PFX" ]; then
             printf '%s' "$SVP_ENC" > "${SP}_p_enc"
@@ -1090,6 +1324,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             printf '%s' "$SVP_PMF" > "${SP}_p_pmf"
             printf '%s' "$SVP_PFX" > "${SP}_p_pfx"
             printf '%s' "$SVP_IDX" > "${SP}_p_idx"
+            printf '%s' "$SVP_WEP" > "${SP}_p_wep"
+            printf '%s' "$SVP_WKT" > "${SP}_p_wkt"
+            printf '%s' "$SVP_WDK" > "${SP}_p_wdk"
+            printf '%s' "$SVP_AUTHTYPE" > "${SP}_p_authtype"
+            printf '%s' "$SVP_WKEY_FIELD" > "${SP}_p_wkey_field"
+            printf '%s' "$SVP_WKEY_VAL"   > "${SP}_p_wkey_val"
         fi
         touch "${SP}_pending"
         date +%s > "${SP}_start"
@@ -1105,6 +1345,11 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                 mib set "${TBL_PFX}.${IDX}.wpaPSK"           "$(cat ${SP}_psk)"
                 mib set "${TBL_PFX}.${IDX}.wscPsk"           "$(cat ${SP}_psk)"
                 mib set "${TBL_PFX}.${IDX}.dotIEEE80211W"    "$(cat ${SP}_pmf)"
+                mib set "${TBL_PFX}.${IDX}.wep"              "$(cat ${SP}_wep)"
+                mib set "${TBL_PFX}.${IDX}.wepKeyType"       "$(cat ${SP}_wkt)"
+                mib set "${TBL_PFX}.${IDX}.wepDefaultKey"    "$(cat ${SP}_wdk)"
+                mib set "${TBL_PFX}.${IDX}.authType"         "$(cat ${SP}_authtype)"
+                mib set "${TBL_PFX}.${IDX}.$(cat ${SP}_wkey_field)" "$(cat ${SP}_wkey_val)"
                 # Roll back the mirrored security on the merged partner too
                 if [ -f "${SP}_p_pfx" ]; then
                     _pp=$(cat ${SP}_p_pfx); _pi=$(cat ${SP}_p_idx)
@@ -1114,6 +1359,11 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                     mib set "${_pp}.${_pi}.wpaPSK"           "$(cat ${SP}_p_psk)"
                     mib set "${_pp}.${_pi}.wscPsk"           "$(cat ${SP}_p_psk)"
                     mib set "${_pp}.${_pi}.dotIEEE80211W"    "$(cat ${SP}_p_pmf)"
+                    mib set "${_pp}.${_pi}.wep"              "$(cat ${SP}_p_wep)"
+                    mib set "${_pp}.${_pi}.wepKeyType"       "$(cat ${SP}_p_wkt)"
+                    mib set "${_pp}.${_pi}.wepDefaultKey"    "$(cat ${SP}_p_wdk)"
+                    mib set "${_pp}.${_pi}.authType"         "$(cat ${SP}_p_authtype)"
+                    mib set "${_pp}.${_pi}.$(cat ${SP}_p_wkey_field)" "$(cat ${SP}_p_wkey_val)"
                 fi
                 mib commit
                 wlan_apply restart
@@ -1133,20 +1383,34 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         exit 0
     fi
 
-    # ── action=sta_connect: point client / VXD interface at a scanned AP ──────
-    # Used by the Site Survey "Connect" button. Writes the chosen network's
-    # SSID + security onto the band's client-capable interface, then applies.
+    # ── action=sta_connect: point client / VXD interface at a network ────────
+    # Used by both the Site Survey "Connect" button (scanned AP) and "Connect
+    # Manually" (hand-typed SSID/security, no scan result required). Writes
+    # the target network's SSID + security onto the band's client-capable
+    # interface, optionally pins prefer_bssid (see save_bssid_lock), then
+    # applies.
     if [ "$ACTION" = "sta_connect" ]; then
         FORM_SSID=$(pd_str ssid)
         FORM_ENC=$(pd_int  encrypt           0)
         FORM_UC=$(pd_int   unicastCipher     0)
         FORM_U2C=$(pd_int  wpa2UnicastCipher 2)
         FORM_PSK=$(pd_str  psk)
+        FORM_BSSID_RAW=$(pd_str bssid)
+        FORM_BSSID=$(printf '%s' "$FORM_BSSID_RAW" | busybox tr 'A-Z' 'a-z' | busybox sed 's/[^0-9a-f]//g')
+        FORM_WEP=$(pd_int  wep               1)
+        FORM_WKT=$(pd_int  wepKeyType        0)
+        FORM_WDK=$(pd_int  wepKeyIdx         0)
+        FORM_AUTHTYPE=$(pd_int authType      0)
+        FORM_WKEY_RAW=$(pd_str wepKey)
 
         # Validate encryption + cipher codes (same set as save_security)
-        case "$FORM_ENC" in 0|2|4|6|16|20) ;; *) FORM_ENC=0 ;; esac
-        case "$FORM_UC"  in 0|1|2|3)        ;; *) FORM_UC=0  ;; esac
-        case "$FORM_U2C" in 0|1|2|3)        ;; *) FORM_U2C=2 ;; esac
+        case "$FORM_ENC" in 0|1|2|4|6|16|20) ;; *) FORM_ENC=0 ;; esac
+        case "$FORM_UC"  in 0|1|2|3)         ;; *) FORM_UC=0  ;; esac
+        case "$FORM_U2C" in 0|1|2|3)         ;; *) FORM_U2C=2 ;; esac
+        case "$FORM_WEP" in 1|2)             ;; *) FORM_WEP=1 ;; esac
+        case "$FORM_WKT" in 0|1)             ;; *) FORM_WKT=0 ;; esac
+        case "$FORM_WDK" in 0|1|2|3)         ;; *) FORM_WDK=0 ;; esac
+        case "$FORM_AUTHTYPE" in 0|1|2)      ;; *) FORM_AUTHTYPE=0 ;; esac
         # WPA3 (16/20) forces AES-only cipher + PMF
         case "$FORM_ENC" in 16|20) FORM_UC=0; FORM_U2C=2 ;; esac
 
@@ -1158,8 +1422,55 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             exit 0
         fi
 
-        # Secured networks require a valid 8-63 char PSK
-        if [ "$FORM_ENC" != "0" ]; then
+        # Optional BSSID pin: empty clears any existing lock, else must be a
+        # full 12 hex-char MAC (same rule as action=save_bssid_lock)
+        if [ -z "$FORM_BSSID" ]; then
+            FORM_BSSID="000000000000"
+        elif [ ${#FORM_BSSID} -ne 12 ]; then
+            dbg "WARN sta_connect: invalid bssid '$FORM_BSSID_RAW' (len ${#FORM_BSSID})"
+            printf "Status: 400 Bad Request\r\n"
+            printf "Content-Type: text/plain\r\n\r\n"
+            printf "BSSID must be 12 hex characters (or empty)"
+            exit 0
+        fi
+
+        # WEP (encrypt=1): see save_security for full field provenance. Key
+        # length from `wep`, key format from `wepKeyType`; ASCII input is
+        # hex-encoded before storage, Hex input is parsed directly.
+        if [ "$FORM_ENC" = "1" ]; then
+            if [ "$FORM_WEP" = "2" ]; then ASCII_LEN=13; HEX_LEN=26; else ASCII_LEN=5; HEX_LEN=10; fi
+
+            if [ "$FORM_WKT" = "1" ]; then
+                FORM_WKEY=$(printf '%s' "$FORM_WKEY_RAW" | busybox tr 'A-Z' 'a-z' | busybox sed 's/[^0-9a-f]//g')
+                if [ ${#FORM_WKEY} -ne "$HEX_LEN" ]; then
+                    dbg "WARN sta_connect: WEP hex key length ${#FORM_WKEY} != $HEX_LEN (wep=$FORM_WEP)"
+                    printf "Status: 400 Bad Request\r\n"
+                    printf "Content-Type: text/plain\r\n\r\n"
+                    if [ "$FORM_WEP" = "2" ]; then
+                        printf "128-bit WEP hex key must be 26 hex characters (13 bytes)"
+                    else
+                        printf "64-bit WEP hex key must be 10 hex characters (5 bytes)"
+                    fi
+                    exit 0
+                fi
+            else
+                if [ ${#FORM_WKEY_RAW} -ne "$ASCII_LEN" ]; then
+                    dbg "WARN sta_connect: WEP ascii key length ${#FORM_WKEY_RAW} != $ASCII_LEN (wep=$FORM_WEP)"
+                    printf "Status: 400 Bad Request\r\n"
+                    printf "Content-Type: text/plain\r\n\r\n"
+                    if [ "$FORM_WEP" = "2" ]; then
+                        printf "128-bit WEP ASCII key must be 13 characters"
+                    else
+                        printf "64-bit WEP ASCII key must be 5 characters"
+                    fi
+                    exit 0
+                fi
+                FORM_WKEY=$(ascii_to_hex "$FORM_WKEY_RAW")
+            fi
+        fi
+
+        # Secured (non-open, non-WEP) networks require a valid 8-63 char PSK
+        if [ "$FORM_ENC" != "0" ] && [ "$FORM_ENC" != "1" ]; then
             PSK_LEN=$(printf '%s' "$FORM_PSK" | busybox wc -c | busybox tr -d ' ')
             if [ "$PSK_LEN" -lt 8 ] || [ "$PSK_LEN" -gt 63 ]; then
                 dbg "WARN sta_connect: PSK length $PSK_LEN invalid (8-63 required)"
@@ -1189,12 +1500,26 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             exit 0
         fi
 
-        dbg "sta_connect: band=$BAND idx=$IDX ssid=$FORM_SSID enc=$FORM_ENC"
+        dbg "sta_connect: band=$BAND idx=$IDX ssid=$FORM_SSID enc=$FORM_ENC wep=$FORM_WEP wkt=$FORM_WKT authType=$FORM_AUTHTYPE bssid=$FORM_BSSID"
 
         # Point the interface at the target network
-        mib set "${TBL_PFX}.${IDX}.ssid"    "$FORM_SSID"
-        mib set "${TBL_PFX}.${IDX}.encrypt" "$FORM_ENC"
-        if [ "$FORM_ENC" != "0" ]; then
+        mib set "${TBL_PFX}.${IDX}.ssid"          "$FORM_SSID"
+        mib set "${TBL_PFX}.${IDX}.encrypt"       "$FORM_ENC"
+        mib set "${TBL_PFX}.${IDX}.prefer_bssid"  "$FORM_BSSID"
+        if [ "$FORM_ENC" = "1" ]; then
+            mib set "${TBL_PFX}.${IDX}.wep"           "$FORM_WEP"
+            mib set "${TBL_PFX}.${IDX}.wepKeyType"    "$FORM_WKT"
+            mib set "${TBL_PFX}.${IDX}.wepDefaultKey" "$FORM_WDK"
+            mib set "${TBL_PFX}.${IDX}.authType"      "$FORM_AUTHTYPE"
+            if [ "$FORM_WEP" = "2" ]; then
+                mib set "${TBL_PFX}.${IDX}.wep128Key$((FORM_WDK + 1))" "$FORM_WKEY"
+            else
+                mib set "${TBL_PFX}.${IDX}.wep64Key$((FORM_WDK + 1))" "$FORM_WKEY"
+            fi
+            mib set "${TBL_PFX}.${IDX}.wpaPSK" ""
+            mib set "${TBL_PFX}.${IDX}.wscPsk" ""
+            mib set "${TBL_PFX}.${IDX}.dotIEEE80211W" 0
+        elif [ "$FORM_ENC" != "0" ]; then
             mib set "${TBL_PFX}.${IDX}.wpaAuth"           2
             mib set "${TBL_PFX}.${IDX}.enable1X"          0
             mib set "${TBL_PFX}.${IDX}.unicastCipher"     "$FORM_UC"
