@@ -678,27 +678,6 @@
 
     .add-panel { display: none; padding-top: 14px; margin-top: 10px; border-top: 1px dashed var(--border-color); }
 
-    /* Persistent "you have leftover coins" banner — shown above whichever
-       view (v-login/v-status) is currently active, driven by status.sh's
-       available_coins field. Reuses the coin-button color family so it
-       reads as coin-related without introducing new variables. */
-    .avail-coins-banner {
-      display: none;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      margin: 0 0 12px;
-      padding: 8px 12px;
-      border-radius: 8px;
-      background: var(--btn-coin-bg);
-      border: 1px solid var(--btn-coin-border);
-      color: var(--btn-coin-color);
-      font-size: 12.5px;
-      font-weight: 600;
-      text-align: center;
-    }
-    .avail-coins-banner .coin-sym { font-size: 1rem; font-weight: 700; color: var(--coin-sym-color); }
-
     /* ======================================= COIN VIEW ======================================= */
     .coin-display { 
       text-align: center; 
@@ -893,11 +872,6 @@
         </button>
       </div>
 
-      <div id="avail-coins-banner" class="avail-coins-banner">
-        <span class="coin-sym">&#8369;</span>
-        <span>Available coins: <span id="avail-coins-amount">0</span> — insert more to use it</span>
-      </div>
-
       <div id="v-load">
         <div class="d-flex flex-column align-items-center justify-content-center py-4 gap-3">
           <div class="portal-spinner"></div>
@@ -939,6 +913,10 @@
               <span class="sk">SNR</span>
               <span class="sv" id="l-snr">--</span>
             </div>
+          </div>
+          <div class="session-row" id="l-coins-row" style="display:none;">
+            <span class="sk">Available Coins</span>
+            <span class="sv" id="l-coins" style="color: var(--coin-val-color);">--</span>
           </div>
         </div>
 
@@ -994,6 +972,10 @@
               <span class="sk">SNR</span>
               <span class="sv" id="s-snr">--</span>
             </div>
+          </div>
+          <div class="session-row" id="s-coins-row" style="display:none;">
+            <span class="sk">Available Coins</span>
+            <span class="sv" id="s-coins" style="color: var(--coin-val-color);">--</span>
           </div>
         </div>
 
@@ -1524,7 +1506,7 @@ function refreshWlanData(prefix) {
   fetch('/cgi-bin/status.sh?_=' + Math.random(), { cache: 'no-store' })
     .then(function(r) { return r.json(); })
     .then(function(d) {
-      updateAvailCoinsBanner(d);
+      updateAvailCoinsRow(d);
       // Render into whichever view currently matches the connection state.
       var activePrefix = d.logged_in ? 's' : 'l';
       renderDeviceInfo(d, activePrefix);
@@ -1657,19 +1639,26 @@ function renderDeviceInfo(d, prefix) {
   }
 }
 
-/* Shows/updates the persistent "Available coins" banner from status.sh's
-   available_coins field (only present, and only shown, when > 0 — see
-   status.sh). Called regardless of logged_in/paused state since a leftover
-   below-tier balance can coexist with any of those. */
-function updateAvailCoinsBanner(d) {
-  var banner = document.getElementById('avail-coins-banner');
+/* Shows/updates the "Available Coins" row inside the session-info status
+   grid (alongside Device MAC/IP) from status.sh's available_coins field
+   (only present, and only shown, when > 0 — see status.sh). Updates both
+   the l- (disconnected) and s- (connected) grids regardless of which view
+   is currently active, since a leftover below-tier balance can coexist
+   with any state and this keeps the inactive grid correct for whenever
+   renderDeviceInfo() switches views. */
+function updateAvailCoinsRow(d) {
   var amt = parseInt(d.available_coins, 10) || 0;
-  if (amt > 0) {
-    document.getElementById('avail-coins-amount').textContent = amt;
-    banner.style.display = 'flex';
-  } else {
-    banner.style.display = 'none';
-  }
+  ['l', 's'].forEach(function(prefix) {
+    var row = document.getElementById(prefix + '-coins-row');
+    var val = document.getElementById(prefix + '-coins');
+    if (!row || !val) return;
+    if (amt > 0) {
+      val.textContent = '\u20B1' + amt;
+      row.style.display = 'flex';
+    } else {
+      row.style.display = 'none';
+    }
+  });
 }
 
 function checkStatus() {
@@ -1681,7 +1670,7 @@ function checkStatus() {
   fetch(url, { cache: 'no-store' })
     .then(function(r) { return r.json(); })
     .then(function(d) {
-      updateAvailCoinsBanner(d);
+      updateAvailCoinsRow(d);
       if (d.logged_in) {
         renderDeviceInfo(d, 's');
         if (!_coinSID && !_queuePollID && !_coinPendingWait) show('v-status');
@@ -2233,7 +2222,12 @@ function doCoinStart(fromStatus, isPolling) {
       var cancelBtn = document.getElementById('btn-coin-cancel');
       if (cancelBtn) {
         cancelBtn.textContent = 'Cancel'; 
-        if (resumedAmount > 0) {
+        // Only hide Cancel once the amount actually reaches a rate tier
+        // (resumedMinutes > 0). A below-minimum amount is banked on cancel
+        // (see coin_result.sh), not lost — so Cancel must stay available
+        // while resumedAmount > 0 but resumedMinutes is still 0, letting
+        // the user cancel and insert more later instead of getting stuck.
+        if (resumedMinutes > 0) {
           cancelBtn.disabled = true;
         } else {
           cancelBtn.disabled = false;
@@ -2426,7 +2420,12 @@ function startCoinPoll() {
               if (doneBtn) doneBtn.disabled = true;
             }
             if (cancelBtn) {
-              if (d.amount > 0) {
+              // Same rule as doCoinStart's resume handling: hide Cancel only
+              // once the live amount reaches a rate tier (d.minutes > 0), not
+              // just because d.amount > 0 — a below-minimum amount is banked
+              // on cancel, so the user should still be able to cancel and
+              // insert more later instead of the button disappearing on them.
+              if (d.minutes > 0) {
                 cancelBtn.disabled = true;
               } else {
                 cancelBtn.disabled = false;

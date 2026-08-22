@@ -69,6 +69,24 @@ _err() { printf '{"error":"%s"}\n' "$1"; exit 0; }
 _ok()  { printf '%s\n' "$1";           exit 0; }
 _md5() { printf '%s' "$1" | md5sum | awk '{print $1}'; }
 
+# ── Below-minimum-tier coin banking (read-only here) ─────────────────────────
+# Same physical file as coin_result.sh's COIN_BANK_FILE — macfix.sh (sourced
+# above) already defines its path once as MACFIX_BANK_FILE, so it's aliased
+# here rather than re-hardcoded a third time. Only coin_result.sh ever writes
+# to it, once a session actually finalizes; this CGI only ever reads it, to
+# fold a customer's already-banked balance into the amount/minutes it hands
+# back for start/resume/poll — otherwise a returning customer who previously
+# fell short of a rate tier sees the modal reset to ₱0/insert-coins-to-begin
+# instead of showing what they already have sitting there.
+COIN_BANK_FILE="${MACFIX_BANK_FILE:-/lmepisowifi/hotspot_data/coin_bank.txt}"
+_bank_get() {
+    [ -f "$COIN_BANK_FILE" ] || { printf '0'; return; }
+    _bg_v=$($BB awk -v m="$1" '$1==m{print $2; exit}' "$COIN_BANK_FILE")
+    case "$_bg_v" in ''|*[!0-9]*) _bg_v=0 ;; esac
+    printf '%s' "$_bg_v"
+}
+BANKED=$(_bank_get "$CLIENT_MAC")
+
 # ── Multi-NodeMCU node registry ──────────────────────────────────────────────
 # Node #1 is always the primary (NODEMCU_IP/MAC/PORT/COIN_PSK, sourced above
 # from coin_config.env). Units #2+ live in NODEMCU_EXTRA_FILE, one per line:
@@ -428,8 +446,14 @@ start)
                     fi
 
                     if [ "$R_VERIFIED" -eq 1 ]; then
-                        RESUME_MINUTES=$(_calc_time "$RESUME_AMOUNT")
-                        _ok "{\"sid\":\"$LOCK_SID\",\"timeout\":$COIN_TIMEOUT,\"remaining\":$RESUME_REMAINING,\"amount\":$RESUME_AMOUNT,\"minutes\":$RESUME_MINUTES,\"resumed\":true}"
+                        # Fold in BANKED same as the fresh-start and poll
+                        # responses do — RESUME_AMOUNT is only this live
+                        # session's own coins, so without this a reload
+                        # mid-session would show a lower total than the very
+                        # next poll response a second later.
+                        RESUME_TOTAL=$(( BANKED + RESUME_AMOUNT ))
+                        RESUME_MINUTES=$(_calc_time "$RESUME_TOTAL")
+                        _ok "{\"sid\":\"$LOCK_SID\",\"timeout\":$COIN_TIMEOUT,\"remaining\":$RESUME_REMAINING,\"amount\":$RESUME_TOTAL,\"minutes\":$RESUME_MINUTES,\"resumed\":true}"
                     fi
                     if [ -n "$R_LIVE" ]; then
                         _coin_alert "RESUME_SIG_MISMATCH" "SID=${LOCK_SID} response received but HMAC invalid — PSK mismatch or tampered reply"
@@ -537,7 +561,11 @@ start)
         # Success! Upgrade lock to ACTIVE
         printf '%s %s %s %s\n' "$SID" "$NOW" "$CLIENT_MAC" "ACTIVE" > "$LOCK_FILE"
         
-        _ok "{\"sid\":\"$SID\",\"timeout\":$COIN_TIMEOUT}"
+        # No coins have landed on this brand-new session yet, so the only
+        # money in play right now is whatever's already banked (BANKED,
+        # above) — report it so the modal opens showing the customer's real
+        # available balance instead of resetting to ₱0.
+        _ok "{\"sid\":\"$SID\",\"timeout\":$COIN_TIMEOUT,\"amount\":$BANKED,\"minutes\":$(_calc_time "$BANKED")}"
     else
         _coin_alert "NODEMCU_OFFLINE" "SID=${SID} no response from NodeMCU (node ${NODE_ID}) at ${_N_IP}:${_N_PORT}/start"
         rm -f "/tmp/coin_sessions/${SID}" "$LOCK_FILE"
@@ -659,6 +687,14 @@ poll)
             _coin_alert "POLL_SIG_MISMATCH" "SID=${SID} poll response received but HMAC invalid (got=${RAW_SIG} want=${EXP_SIG}) — PSK mismatch or tampered reply"
         fi
     fi
+
+    # LIVE_AMOUNT is only this session's own coins — fold in whatever's
+    # already banked (BANKED, resolved up top) so the amount/minutes handed
+    # back match what coin_result.sh will actually grant at session end (it
+    # folds the same BANKED balance into its own tier calculation), instead
+    # of the modal showing just the fraction that arrived in this session.
+    TOTAL_AMOUNT=$(( BANKED + LIVE_AMOUNT ))
+
     if [ "$LIVE_OK" -eq 1 ]; then
         rm -f "$MISS_PATH"
     else
@@ -676,13 +712,13 @@ poll)
         echo "$MISSES" > "$MISS_PATH" 2>/dev/null
         if [ "$MISSES" -ge 4 ]; then
             FROZEN_REM=$(cat "$REM_PATH" 2>/dev/null); FROZEN_REM=${FROZEN_REM:-$REMAINING}
-            PREVIEW=$(_calc_time "$LIVE_AMOUNT")
-            _ok "{\"status\":\"reconnecting\",\"amount\":${LIVE_AMOUNT},\"minutes\":${PREVIEW},\"remaining\":${FROZEN_REM}}"
+            PREVIEW=$(_calc_time "$TOTAL_AMOUNT")
+            _ok "{\"status\":\"reconnecting\",\"amount\":${TOTAL_AMOUNT},\"minutes\":${PREVIEW},\"remaining\":${FROZEN_REM}}"
         fi
     fi
 
-    PREVIEW=$(_calc_time "$LIVE_AMOUNT")
-    _ok "{\"status\":\"active\",\"amount\":${LIVE_AMOUNT},\"minutes\":${PREVIEW},\"remaining\":${REMAINING}}"
+    PREVIEW=$(_calc_time "$TOTAL_AMOUNT")
+    _ok "{\"status\":\"active\",\"amount\":${TOTAL_AMOUNT},\"minutes\":${PREVIEW},\"remaining\":${REMAINING}}"
     ;;
 
 # ----------------------------------------------------------------

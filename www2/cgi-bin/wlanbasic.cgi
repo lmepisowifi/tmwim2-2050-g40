@@ -240,31 +240,111 @@ emit_ifaces_json() {
     printf '%s]' "$_out"
 }
 
-# ── Coin-slot NodeMCU Wi-Fi sync ─────────────────────────────────────
-# The ESP8266 coin controller rides on one of our WLAN SSIDs as a station.
+# ── Coin-slot NodeMCU Wi-Fi sync (multi-unit) ────────────────────────
+# Every ESP8266 coin controller rides on one of our WLAN SSIDs as a station.
 # If we rename/re-key that SSID without warning it, it is stranded offline.
-# So before retuning that interface we hand the NodeMCU the new credentials
-# over the still-live old link and wait for its ACK (see /setwifi in the
-# firmware). Binding (which band+iface it rides) is stored here; the NodeMCU
-# address + shared PSK come from /tmp/coin_config.env (written by lmehspt.sh).
-NODEMCU_BIND_FILE="/lmepisowifi/www2/data/nodemcu_iface.json"
+# So before retuning an interface we hand every NodeMCU bound to it the new
+# credentials over the still-live old link and wait for each one's ACK (see
+# /setwifi in the firmware). Multiple units can share one interface (e.g.
+# unit 1 and unit 2 both on wlan1) or ride different ones (e.g. unit 1 on
+# wlan1, unit 2 on wlan1-vap0) — each unit's binding is its own row here.
+#
+# Registry: unit #1's connection details (IP/MAC/PORT/PSK/title/enabled)
+# live in /tmp/coin_config.env, written by lmehspt.sh. Units #2+ live in
+# NODEMCU_EXTRA_FILE (ID|TITLE|IP|MAC|PORT|PSK|ENABLED), maintained by
+# hotspot.cgi's nodemcu_add/edit/del — read directly here, same as coin.sh
+# does, so there's nothing that can go stale.
+#
+# Per-unit interface binding (which band+iface *this* unit rides, and
+# whether sync is turned on for it) is separate from the registry above and
+# lives in NODEMCU_IFACES_FILE, one row per unit: ID|ENABLED|BAND|IFACE.
+# A unit with no row here just has sync off (default) for it.
+NODEMCU_IFACES_FILE="/lmepisowifi/www2/data/nodemcu_ifaces.txt"
+# Pre-multi-unit format (single implicit "unit #1" binding). Read once below
+# to migrate an already-configured box's binding forward; never written to
+# again after that.
+NODEMCU_BIND_FILE_LEGACY="/lmepisowifi/www2/data/nodemcu_iface.json"
 [ -f /tmp/coin_config.env ] && . /tmp/coin_config.env 2>/dev/null
+NODEMCU_EXTRA_FILE="${NODEMCU_EXTRA_FILE:-/lmepisowifi/hotspot_data/nodemcus_extra.txt}"
 
-# nm_get KEY DEFAULT  → integer value from NODEMCU_BIND_FILE
-nm_get() {
-    if [ ! -f "$NODEMCU_BIND_FILE" ]; then printf '%s' "$2"; return; fi
-    _ng=$(busybox sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\\(-\\{0,1\\}[0-9]\\{1,\\}\\).*/\\1/p" \
-            "$NODEMCU_BIND_FILE" 2>/dev/null | busybox head -n1 | busybox tr -d '\r\n')
-    [ -z "$_ng" ] && _ng="$2"
-    printf '%s' "$_ng"
+# nm_migrate_legacy_bind  → one-time upgrade of the old single-NodeMCU
+# binding into unit #1's row in NODEMCU_IFACES_FILE, so a box that already
+# picked an interface via the old "Coin Slot (NodeMCU)" card keeps that
+# setting. No-op once NODEMCU_IFACES_FILE exists (never re-migrates).
+nm_migrate_legacy_bind() {
+    [ -f "$NODEMCU_IFACES_FILE" ] && return
+    [ -f "$NODEMCU_BIND_FILE_LEGACY" ] || return
+    _le=$(busybox sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' \
+            "$NODEMCU_BIND_FILE_LEGACY" 2>/dev/null | busybox head -n1)
+    _lb=$(busybox sed -n 's/.*"band"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' \
+            "$NODEMCU_BIND_FILE_LEGACY" 2>/dev/null | busybox head -n1)
+    _li=$(busybox sed -n 's/.*"iface"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' \
+            "$NODEMCU_BIND_FILE_LEGACY" 2>/dev/null | busybox head -n1)
+    [ -z "$_le" ] && _le=0; [ -z "$_lb" ] && _lb=24; [ -z "$_li" ] && _li=0
+    mkdir -p /lmepisowifi/www2/data
+    printf '1|%s|%s|%s\n' "$_le" "$_lb" "$_li" > "$NODEMCU_IFACES_FILE"
+    dbg "nm_migrate_legacy_bind: migrated legacy binding -> unit #1 enabled=$_le band=$_lb iface=$_li"
+}
+nm_migrate_legacy_bind
+
+# nm_unit_ids  → every configured NodeMCU unit id, space-separated: #1
+# first (only if it has ever been set up), then every row in the extras file.
+nm_unit_ids() {
+    _uids=""
+    [ -n "${NODEMCU_IP:-}" ] || [ -n "${NODEMCU_MAC:-}" ] && _uids="1"
+    if [ -f "$NODEMCU_EXTRA_FILE" ]; then
+        _uids="$_uids $(busybox awk -F'|' '$1 ~ /^[0-9]+$/ {printf "%s ", $1}' "$NODEMCU_EXTRA_FILE" 2>/dev/null)"
+    fi
+    printf '%s' "$_uids"
 }
 
-# is_nodemcu_iface BAND IDX  → 0(true) if NodeMCU sync is enabled AND bound here
-is_nodemcu_iface() {
-    [ "${COIN_ENABLED:-0}" = "1" ]  || return 1
-    [ -n "${NODEMCU_IP:-}" ]        || return 1
-    [ "$(nm_get enabled 0)" = "1" ] || return 1
-    [ "$1" = "$(nm_get band 24)" ] && [ "$2" = "$(nm_get iface 0)" ]
+# nm_unit_conn ID  → sets NMC_IP/NMC_PORT/NMC_PSK/NMC_TITLE/NMC_REG_EN from
+# the unit's registry entry (coin_config.env for #1, NODEMCU_EXTRA_FILE for
+# #2+). NMC_REG_EN is the unit's own overall enabled state (separate from
+# the sync-specific toggle in NODEMCU_IFACES_FILE).
+nm_unit_conn() {
+    if [ "$1" = "1" ]; then
+        NMC_IP="${NODEMCU_IP:-}"; NMC_PORT="${NODEMCU_PORT:-8080}"; NMC_PSK="${COIN_PSK:-}"
+        NMC_TITLE="${NODEMCU_1_TITLE:-Coin Slot}"; NMC_REG_EN="${NODEMCU_1_ENABLED:-1}"
+        return
+    fi
+    NMC_IP=""; NMC_PORT="8080"; NMC_PSK=""; NMC_TITLE=""; NMC_REG_EN="0"
+    [ -f "$NODEMCU_EXTRA_FILE" ] || return
+    _row=$(busybox awk -F'|' -v id="$1" '$1==id{print;exit}' "$NODEMCU_EXTRA_FILE" 2>/dev/null)
+    [ -z "$_row" ] && return
+    NMC_TITLE=$(printf '%s' "$_row" | busybox awk -F'|' '{print $2}')
+    NMC_IP=$(printf '%s' "$_row"    | busybox awk -F'|' '{print $3}')
+    NMC_PORT=$(printf '%s' "$_row"  | busybox awk -F'|' '{print $5}')
+    NMC_PSK=$(printf '%s' "$_row"   | busybox awk -F'|' '{print $6}')
+    NMC_REG_EN=$(printf '%s' "$_row" | busybox awk -F'|' '{print $7}')
+    [ -z "$NMC_PORT" ] && NMC_PORT=8080
+    [ -z "$NMC_REG_EN" ] && NMC_REG_EN=1
+}
+
+# nm_unit_bind ID  → sets NMB_EN/NMB_BAND/NMB_IFACE, this unit's WiFi-sync
+# interface binding. NMB_EN=0 (no row, or explicitly off) means "don't sync
+# this unit on any interface".
+nm_unit_bind() {
+    NMB_EN=0; NMB_BAND=24; NMB_IFACE=0
+    [ -f "$NODEMCU_IFACES_FILE" ] || return
+    _row=$(busybox awk -F'|' -v id="$1" '$1==id{print;exit}' "$NODEMCU_IFACES_FILE" 2>/dev/null)
+    [ -z "$_row" ] && return
+    NMB_EN=$(printf '%s' "$_row"    | busybox awk -F'|' '{print $2}')
+    NMB_BAND=$(printf '%s' "$_row"  | busybox awk -F'|' '{print $3}')
+    NMB_IFACE=$(printf '%s' "$_row" | busybox awk -F'|' '{print $4}')
+    [ -z "$NMB_EN" ] && NMB_EN=0
+    [ -z "$NMB_BAND" ] && NMB_BAND=24
+    [ -z "$NMB_IFACE" ] && NMB_IFACE=0
+}
+
+# nm_unit_active_here ID BAND IDX  → 0(true) if unit ID's sync is enabled,
+# it's bound to BAND/IDX, and it currently has an IP to talk to
+nm_unit_active_here() {
+    nm_unit_bind "$1"
+    [ "$NMB_EN" = "1" ] || return 1
+    [ "$NMB_BAND" = "$2" ] && [ "$NMB_IFACE" = "$3" ] || return 1
+    nm_unit_conn "$1"
+    [ -n "$NMC_IP" ]
 }
 
 # urlenc STR  → percent-encode a query value (ASCII; NodeMCU .arg() decodes it)
@@ -296,13 +376,15 @@ ascii_to_hex() {
     printf '%s' "$_ao"
 }
 
-# nm_push NEW_SSID NEW_PASS  → 0 on NodeMCU ACK, 1 on any failure
-# Two-step signed handshake (matches the firmware's /reset flow):
+# nm_push_unit ID NEW_SSID NEW_PASS  → 0 on that unit's NodeMCU ACK, 1 on
+# any failure. Two-step signed handshake (matches the firmware's /reset
+# flow), using unit ID's own IP/port/PSK from nm_unit_conn:
 #   1. GET /nonce                              → fresh single-use nonce
 #   2. GET /setwifi?ssid&pass&token            → token=md5(PSK:nonce:ssid:pass:setwifi)
-nm_push() {
-    _ps="$1"; _pp="$2"
-    _base="http://${NODEMCU_IP}:${NODEMCU_PORT:-8080}"
+nm_push_unit() {
+    _pid="$1"; _ps="$2"; _pp="$3"
+    nm_unit_conn "$_pid"
+    _base="http://${NMC_IP}:${NMC_PORT}"
     # NOTE: use GNU wget (the applet busybox on this ONT does NOT ship), exactly
     # like coin.sh. `busybox wget` here failed instantly with an empty response
     # (applet-not-found -> stderr, swallowed by 2>/dev/null), which surfaced as
@@ -311,18 +393,18 @@ nm_push() {
     _nonce=$(printf '%s' "$_nresp" | busybox grep -o '"nonce":"[^"]*"' \
                 | busybox awk -F'"' '{print $4}' | busybox head -n1)
     if [ -z "$_nonce" ]; then
-        dbg "nm_push: no nonce from NodeMCU at $_base (resp=$_nresp)"
+        dbg "nm_push_unit #$_pid: no nonce from NodeMCU at $_base (resp=$_nresp)"
         return 1
     fi
-    _tok=$(printf '%s' "${COIN_PSK}:${_nonce}:${_ps}:${_pp}:setwifi" \
+    _tok=$(printf '%s' "${NMC_PSK}:${_nonce}:${_ps}:${_pp}:setwifi" \
                 | busybox md5sum | busybox awk '{print $1}')
     _q="ssid=$(urlenc "$_ps")&pass=$(urlenc "$_pp")&token=${_tok}"
     _resp=$(wget -q -T 8 -O - "${_base}/setwifi?${_q}" 2>/dev/null)
     if printf '%s' "$_resp" | busybox grep -q '"ok":true'; then
-        dbg "nm_push: NodeMCU ACK (ssid=$_ps)"
+        dbg "nm_push_unit #$_pid: NodeMCU ACK (ssid=$_ps)"
         return 0
     fi
-    dbg "nm_push: NodeMCU did NOT ACK (resp=$_resp)"
+    dbg "nm_push_unit #$_pid: NodeMCU did NOT ACK (resp=$_resp)"
     return 1
 }
 
@@ -330,7 +412,7 @@ nm_push() {
 # (empty for an open network, else the interface's WPA-PSK)
 # NOTE: encrypt=1 is WEP, which has no wpaPSK — this returns empty for it,
 # same as open. The coin-slot NodeMCU is not currently handed a WEP key at
-# all (nm_push only ever carries a WPA passphrase), so a coin-slot SSID
+# all (nm_push_unit only ever carries a WPA passphrase), so a coin-slot SSID
 # switched to WEP will look "open" to the sync logic and the NodeMCU will
 # fail to associate. Not fixed here — flagging so it isn't mistaken for
 # working WEP support on the coin-slot path.
@@ -340,12 +422,22 @@ nm_effective_pass() {
 }
 
 # nm_sync_iface BAND IDX NEW_SSID NEW_PASS
-#   → 0 if not the bound iface (nothing to do) OR the NodeMCU ACKed
-#   → 1 if bound here but the NodeMCU failed to acknowledge (caller must abort)
+#   → 0 if no unit is bound here (nothing to do) OR every unit bound here ACKed
+#   → 1 if at least one unit bound here failed to acknowledge (caller must abort)
+# Sets NM_FAILED_UNITS to a space-separated list of ids that failed, for the
+# error message. Every unit bound to this (band, idx) — there can be more
+# than one — is notified independently with its own IP/PSK.
 nm_sync_iface() {
-    is_nodemcu_iface "$1" "$2" || return 0
-    dbg "nm_sync_iface: band=$1 idx=$2 -> notifying NodeMCU (ssid=$3)"
-    nm_push "$3" "$4"
+    _sb="$1"; _si="$2"; _sssid="$3"; _spass="$4"
+    NM_FAILED_UNITS=""
+    _sfail=0
+    for _suid in $(nm_unit_ids); do
+        if nm_unit_active_here "$_suid" "$_sb" "$_si"; then
+            dbg "nm_sync_iface: band=$_sb idx=$_si -> notifying NodeMCU #$_suid (ssid=$_sssid)"
+            nm_push_unit "$_suid" "$_sssid" "$_spass" || { _sfail=1; NM_FAILED_UNITS="$NM_FAILED_UNITS $_suid"; }
+        fi
+    done
+    [ "$_sfail" = "0" ]
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -384,15 +476,38 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
         exit 0
     fi
 
-    # ── action=nodemcu_status: coin-slot NodeMCU Wi-Fi-sync binding ──────
+    # ── action=nodemcu_status: every configured NodeMCU unit's Wi-Fi-sync
+    #    binding (one entry per unit — multiple units can be listed) ──────
     if echo "$QUERY_STRING" | busybox grep -q "action=nodemcu_status"; then
-        NE=$(nm_get enabled 0)
-        NB=$(nm_get band  24)
-        NI=$(nm_get iface 0)
+        _out="["; _sep=""
+        for _uid in $(nm_unit_ids); do
+            nm_unit_conn "$_uid"
+            nm_unit_bind "$_uid"
+            _out="${_out}${_sep}{\"id\":${_uid},\"title\":\"$(json_esc "$NMC_TITLE")\",\"regEnabled\":${NMC_REG_EN:-0},\"enabled\":${NMB_EN},\"band\":${NMB_BAND},\"iface\":${NMB_IFACE},\"nodemcuIp\":\"$(json_esc "$NMC_IP")\"}"
+            _sep=","
+        done
+        _out="${_out}]"
         printf "Status: 200 OK\r\n"
         printf "Content-Type: application/json\r\n\r\n"
-        printf '{"coinEnabled":%s,"enabled":%s,"band":%s,"iface":%s,"nodemcuIp":"%s"}' \
-            "${COIN_ENABLED:-0}" "$NE" "$NB" "$NI" "$(json_esc "${NODEMCU_IP:-}")"
+        printf '{"coinEnabled":%s,"units":%s}' "${COIN_ENABLED:-0}" "$_out"
+        exit 0
+    fi
+
+    # ── action=vxd_status: VXD (idx 5) BSSID lock + live connection/auth ──
+    if echo "$QUERY_STRING" | busybox grep -q "action=vxd_status"; then
+        dbg "GET vxd_status: band=$BAND vxd_if=$VXD_IF"
+        printf "Status: 200 OK\r\n"
+        printf "Content-Type: application/json\r\n\r\n"
+        emit_vxd_status_json "$VXD_IF" "$TBL_PFX"
+        exit 0
+    fi
+
+    # ── action=vxd_status: VXD (idx 5) BSSID lock + live connection/auth ──
+    if echo "$QUERY_STRING" | busybox grep -q "action=vxd_status"; then
+        dbg "GET vxd_status: band=$BAND vxd_if=$VXD_IF"
+        printf "Status: 200 OK\r\n"
+        printf "Content-Type: application/json\r\n\r\n"
+        emit_vxd_status_json "$VXD_IF" "$TBL_PFX"
         exit 0
     fi
 
@@ -641,19 +756,30 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         exit 0
     fi
 
-    # ── action=save_nodemcu_bind: which band+iface the coin slot rides ──
+    # ── action=save_nodemcu_bind: which band+iface a given NodeMCU unit
+    #    rides (id selects the unit; #1 is primary, #2+ are extras) ──────
     if [ "$ACTION" = "save_nodemcu_bind" ]; then
+        NB_ID=$(pd_int    id      0)
         NB_EN=$(pd_int    enabled 0)
         NB_BAND=$(pd_int  band  24)
         NB_IFACE=$(pd_int iface 0)
         case "$NB_EN"    in 0|1)         ;; *) NB_EN=0     ;; esac
         case "$NB_BAND"  in 5)           ;; *) NB_BAND=24  ;; esac
         case "$NB_IFACE" in 0|1|2|3|4|5) ;; *) NB_IFACE=0  ;; esac
+        if [ "$NB_ID" -lt 1 ] 2>/dev/null; then
+            dbg "WARN save_nodemcu_bind: invalid/missing unit id"
+            printf "Status: 400 Bad Request\r\n"
+            printf "Content-Type: text/plain\r\n\r\n"
+            printf "Invalid NodeMCU unit id"
+            exit 0
+        fi
         mkdir -p /lmepisowifi/www2/data
-        NB_TMP="${NODEMCU_BIND_FILE}.tmp.$$"
-        printf '{"enabled":%s,"band":%s,"iface":%s}\n' "$NB_EN" "$NB_BAND" "$NB_IFACE" > "$NB_TMP"
-        busybox mv "$NB_TMP" "$NODEMCU_BIND_FILE"
-        dbg "save_nodemcu_bind: enabled=$NB_EN band=$NB_BAND iface=$NB_IFACE"
+        touch "$NODEMCU_IFACES_FILE"
+        NB_TMP="${NODEMCU_IFACES_FILE}.tmp.$$"
+        busybox grep -v "^${NB_ID}|" "$NODEMCU_IFACES_FILE" > "$NB_TMP" 2>/dev/null
+        printf '%s|%s|%s|%s\n' "$NB_ID" "$NB_EN" "$NB_BAND" "$NB_IFACE" >> "$NB_TMP"
+        busybox mv "$NB_TMP" "$NODEMCU_IFACES_FILE"
+        dbg "save_nodemcu_bind: id=$NB_ID enabled=$NB_EN band=$NB_BAND iface=$NB_IFACE"
         printf "Status: 200 OK\r\n"
         printf "Content-Type: text/plain\r\n\r\n"
         printf "OK"
@@ -858,7 +984,19 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             sleep "$REVERT_TIMEOUT"
             if [ -f "${RV_PFX}_pending" ]; then
                 dbg "save_ap: revert timeout reached, rolling back"
-                mib set "${TBL_PFX}.0.ssid"         "$(cat ${RV_PFX}_ssid)"
+                _RB_SSID=$(cat "${RV_PFX}_ssid")
+                # ── Coin-slot NodeMCU(s): the forward path already handed
+                #    every unit bound here $FORM_SSID and they may have
+                #    reassociated. Hand each of them (this interface, and
+                #    the merged partner we mirrored onto) the pre-change
+                #    credentials back *before* we revert the radio, so none
+                #    are left associated to an SSID that's about to stop
+                #    existing. Best-effort: an unreachable unit must not
+                #    block the safety rollback.
+                _RB_PASS=$(nm_effective_pass "$TBL_PFX" 0)
+                nm_sync_iface "$BAND" 0 "$_RB_SSID" "$_RB_PASS" \
+                    || dbg "save_ap: revert - NodeMCU(s)${NM_FAILED_UNITS} did not ACK rollback SSID (continuing anyway)"
+                mib set "${TBL_PFX}.0.ssid"         "$_RB_SSID"
                 mib set "${TBL_PFX}.0.wlanDisabled" "$(cat ${RV_PFX}_dis)"
                 mib set "${TBL_PFX}.0.wlanMode"     "$(cat ${RV_PFX}_mode)"
                 mib set "${TBL_PFX}.0.wlanBand"     "$(cat ${RV_PFX}_wband)"
@@ -869,7 +1007,13 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                 mib set "$TP_KEY"                    "$(cat ${RV_PFX}_tp)"
                 # Roll back the mirrored SSID on the merged partner too
                 if [ -f "${RV_PFX}_p_pfx" ]; then
-                    mib set "$(cat ${RV_PFX}_p_pfx).$(cat ${RV_PFX}_p_idx).ssid" "$(cat ${RV_PFX}_p_ssid)"
+                    _RB_P_PFX=$(cat "${RV_PFX}_p_pfx"); _RB_P_IDX=$(cat "${RV_PFX}_p_idx")
+                    _RB_P_SSID=$(cat "${RV_PFX}_p_ssid")
+                    _RB_P_BAND=$([ "$_RB_P_PFX" = "WLAN_MBSSIB_TBL" ] && echo 5 || echo 24)
+                    _RB_P_PASS=$(nm_effective_pass "$_RB_P_PFX" "$_RB_P_IDX")
+                    nm_sync_iface "$_RB_P_BAND" "$_RB_P_IDX" "$_RB_P_SSID" "$_RB_P_PASS" \
+                        || dbg "save_ap: revert - NodeMCU(s)${NM_FAILED_UNITS} (partner iface) did not ACK rollback SSID (continuing anyway)"
+                    mib set "${_RB_P_PFX}.${_RB_P_IDX}.ssid" "$_RB_P_SSID"
                 fi
                 mib commit
                 wlan_apply restart
@@ -1339,6 +1483,20 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             sleep "$REVERT_TIMEOUT"
             if [ -f "${SP}_pending" ]; then
                 dbg "save_security idx=$IDX: revert timeout reached, rolling back"
+                # ── Coin-slot NodeMCU(s): may have been handed the new
+                #    passphrase on the forward path. Hand every unit bound
+                #    here the pre-change passphrase back *before* the radio
+                #    reverts, so none are left holding credentials the AP no
+                #    longer accepts. Best-effort: an unreachable unit must
+                #    not block the safety rollback. Reconstruct what
+                #    nm_effective_pass would have returned for the rollback
+                #    state directly from the saved fields rather than
+                #    mib_field, since the mib hasn't been reverted yet.
+                _RB_ENC=$(cat "${SP}_enc")
+                case "$_RB_ENC" in 0|1) _RB_PASS="" ;; *) _RB_PASS=$(cat "${SP}_psk") ;; esac
+                _RB_SSID=$(mib_field "${TBL_PFX}.${IDX}.ssid")
+                nm_sync_iface "$BAND" "$IDX" "$_RB_SSID" "$_RB_PASS" \
+                    || dbg "save_security idx=$IDX: revert - NodeMCU(s)${NM_FAILED_UNITS} did not ACK rollback credentials (continuing anyway)"
                 mib set "${TBL_PFX}.${IDX}.encrypt"          "$(cat ${SP}_enc)"
                 mib set "${TBL_PFX}.${IDX}.unicastCipher"    "$(cat ${SP}_uc)"
                 mib set "${TBL_PFX}.${IDX}.wpa2UnicastCipher" "$(cat ${SP}_u2c)"
@@ -1353,6 +1511,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                 # Roll back the mirrored security on the merged partner too
                 if [ -f "${SP}_p_pfx" ]; then
                     _pp=$(cat ${SP}_p_pfx); _pi=$(cat ${SP}_p_idx)
+                    _p_band=$([ "$_pp" = "WLAN_MBSSIB_TBL" ] && echo 5 || echo 24)
+                    _RB_P_ENC=$(cat "${SP}_p_enc")
+                    case "$_RB_P_ENC" in 0|1) _RB_P_PASS="" ;; *) _RB_P_PASS=$(cat "${SP}_p_psk") ;; esac
+                    _RB_P_SSID=$(mib_field "${_pp}.${_pi}.ssid")
+                    nm_sync_iface "$_p_band" "$_pi" "$_RB_P_SSID" "$_RB_P_PASS" \
+                        || dbg "save_security idx=$IDX: revert - NodeMCU(s)${NM_FAILED_UNITS} (partner iface) did not ACK rollback credentials (continuing anyway)"
                     mib set "${_pp}.${_pi}.encrypt"          "$(cat ${SP}_p_enc)"
                     mib set "${_pp}.${_pi}.unicastCipher"    "$(cat ${SP}_p_uc)"
                     mib set "${_pp}.${_pi}.wpa2UnicastCipher" "$(cat ${SP}_p_u2c)"

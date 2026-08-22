@@ -365,6 +365,17 @@ BANK_AFTER=${_MB##* }
 # double-count it.
 _bank_set "$CLIENT_MAC" "$BANK_AFTER"
 
+# Total pesos that actually earned THIS grant — the pre-existing banked
+# balance plus whatever landed this session, minus whatever still didn't
+# reach a tier and rolled forward again (BANK_AFTER). Used for reporting
+# (the Telegram new-sale message + the amount handed back through poll's
+# "complete" status) instead of $AMOUNT alone, which is only the fraction
+# that happened to be inserted in THIS particular session — a customer
+# topping up an earlier below-minimum balance would otherwise see e.g.
+# "₱1" reported for a sale that actually took ₱2 (₱1 banked + ₱1 just
+# inserted) to reach the rate.
+CONSUMED=$(( TOTAL_FOR_TIME - BANK_AFTER ))
+
 # --- Grant or extend session (3-COLUMN AWARE) ---
 if [ "${MINUTES:-0}" -gt 0 ]; then
     $BB grep -v "^$CLIENT_MAC " /tmp/coin_strikes.txt > /tmp/cs.tmp 2>/dev/null
@@ -456,7 +467,7 @@ if [ "${AMOUNT:-0}" -gt 0 ]; then
             totaltime "$(_fmt_dhm ${NEW_TOTAL:-0})" \
             addedtime "$(_fmt_dhm $(( MINUTES * 60 )))" \
             remainingtime "$(_fmt_dhm ${N_REMAIN:-0})" \
-            insertcoinamt "$AMOUNT" \
+            insertcoinamt "$CONSUMED" \
             mac "$CLIENT_MAC" \
             activeusrcount "${_ACTIVE:-0}" \
             dailyamt "${_I_D:-0}" \
@@ -472,7 +483,7 @@ if [ "${AMOUNT:-0}" -gt 0 ]; then
 fi
 # -------------------------------------------------------------------------
 
-printf '%s %s\n' "$AMOUNT" "$MINUTES" > "$RESULT_PATH"
+printf '%s %s\n' "$CONSUMED" "$MINUTES" > "$RESULT_PATH"
 rm -f "$SESSION_PATH" "${SESSION_PATH}.miss" "${SESSION_PATH}.amt" "${SESSION_PATH}.rem" "/tmp/coin_lock_${CALL_NODE}"
 _clear_pending "$SID"   # coins credited → drop the non-volatile crash mirror
 
