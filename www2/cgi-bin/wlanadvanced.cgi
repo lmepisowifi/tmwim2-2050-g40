@@ -112,9 +112,13 @@ unified_enabled() { [ "$(merge_get enabled 0)" = "1" ] && printf '1' || printf '
 
 
 # POST field helper: extract an integer field; $1 = field name, $2 = default
+# Anchored on "&name=" (synthetic leading "&" so the first field matches too)
+# so a field name that's a substring of another field's name later in the
+# body can't be mismatched — see wlanbasic.cgi's pd_str for the sta_connect
+# ssid/bssid bug this pattern caused there.
 pd_int() {
-    V=$(echo "$POST_DATA" \
-        | busybox sed -n "s/.*${1}=\\([^&]*\\).*/\\1/p" \
+    V=$(echo "&$POST_DATA" \
+        | busybox sed -n "s/.*&${1}=\\([^&]*\\).*/\\1/p" \
         | busybox tr -d '\r\n')
     case "$V" in ''|*[!0-9]*) V="${2:-0}" ;; esac
     printf '%s' "$V"

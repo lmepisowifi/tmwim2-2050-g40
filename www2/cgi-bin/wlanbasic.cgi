@@ -167,10 +167,21 @@ emit_vxd_status_json() {
 }
 
 # POST field helpers ─────────────────────────────────────────────────────────
+# Both helpers anchor on "&name=" (with a synthetic leading "&" prepended so
+# the very first field matches too) rather than a bare "name=" substring
+# search. Without that anchor, a field whose name is a substring of another
+# field's name later in the same body — e.g. "ssid" inside "bssid" — makes
+# the greedy sed pattern latch onto the LAST "ssid=" it finds, which is the
+# one buried inside "bssid=", silently returning the bssid value (or empty)
+# instead of the real ssid. This bit action=sta_connect for real: "Connect
+# Manually" posts both ssid and bssid in the same body, so pd_str ssid was
+# reading bssid's value the whole time — reported as SSID being rejected as
+# empty even when typed in, and would have silently mis-set the SSID to the
+# BSSID's hex string on any request where a BSSID pin was also filled in.
 pd_str() {
     # URL-decode a string field from POST_DATA; $1 = field name
-    RAW=$(echo "$POST_DATA" \
-        | busybox sed -n "s/.*${1}=\\([^&]*\\).*/\\1/p" \
+    RAW=$(echo "&$POST_DATA" \
+        | busybox sed -n "s/.*&${1}=\\([^&]*\\).*/\\1/p" \
         | busybox tr -d '\r\n')
     busybox httpd -d "$RAW" 2>/dev/null \
         | busybox tr -d '\r\n'
@@ -178,8 +189,8 @@ pd_str() {
 
 pd_int() {
     # Extract an integer field; $1 = field name, $2 = default value
-    V=$(echo "$POST_DATA" \
-        | busybox sed -n "s/.*${1}=\\([^&]*\\).*/\\1/p" \
+    V=$(echo "&$POST_DATA" \
+        | busybox sed -n "s/.*&${1}=\\([^&]*\\).*/\\1/p" \
         | busybox tr -d '\r\n')
     case "$V" in ''|*[!0-9]*) V="${2:-0}" ;; esac
     printf '%s' "$V"
@@ -271,19 +282,41 @@ NODEMCU_EXTRA_FILE="${NODEMCU_EXTRA_FILE:-/lmepisowifi/hotspot_data/nodemcus_ext
 # binding into unit #1's row in NODEMCU_IFACES_FILE, so a box that already
 # picked an interface via the old "Coin Slot (NodeMCU)" card keeps that
 # setting. No-op once NODEMCU_IFACES_FILE exists (never re-migrates).
+#
+# REPAIR CASE: ota.sh's PRESERVE list didn't cover nodemcu_iface.json until
+# the fix that added this comment, so every box that already made the
+# single-switch -> multi-unit jump had it wiped by that OTA's wholesale www2
+# swap before this function ever got to read it -- migration silently no-op'd
+# and unit #1 came up with sync OFF regardless of what the admin had it set
+# to. That on/off bit is gone for good (no on-box copy of it survived the
+# swap), so it can't be recovered -- it can only be repaired. Per explicit
+# instruction, every already-affected box is assumed to have had it ON, so
+# if a NodeMCU is clearly configured (NODEMCU_IP set) but neither file
+# exists, seed unit #1 as enabled=1 instead of leaving it unmigrated forever.
+# NOTE: this can't distinguish that box from a brand-new multi-unit-only
+# install that registered a NodeMCU but never touched the sync toggle -- such
+# a box would also get defaulted to ON here. Not a concern for an existing
+# fleet that's already past that point; worth revisiting before any public
+# release where fresh installs are the common case.
 nm_migrate_legacy_bind() {
     [ -f "$NODEMCU_IFACES_FILE" ] && return
-    [ -f "$NODEMCU_BIND_FILE_LEGACY" ] || return
-    _le=$(busybox sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' \
-            "$NODEMCU_BIND_FILE_LEGACY" 2>/dev/null | busybox head -n1)
-    _lb=$(busybox sed -n 's/.*"band"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' \
-            "$NODEMCU_BIND_FILE_LEGACY" 2>/dev/null | busybox head -n1)
-    _li=$(busybox sed -n 's/.*"iface"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' \
-            "$NODEMCU_BIND_FILE_LEGACY" 2>/dev/null | busybox head -n1)
-    [ -z "$_le" ] && _le=0; [ -z "$_lb" ] && _lb=24; [ -z "$_li" ] && _li=0
+    if [ -f "$NODEMCU_BIND_FILE_LEGACY" ]; then
+        _le=$(busybox sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' \
+                "$NODEMCU_BIND_FILE_LEGACY" 2>/dev/null | busybox head -n1)
+        _lb=$(busybox sed -n 's/.*"band"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' \
+                "$NODEMCU_BIND_FILE_LEGACY" 2>/dev/null | busybox head -n1)
+        _li=$(busybox sed -n 's/.*"iface"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' \
+                "$NODEMCU_BIND_FILE_LEGACY" 2>/dev/null | busybox head -n1)
+        [ -z "$_le" ] && _le=0; [ -z "$_lb" ] && _lb=24; [ -z "$_li" ] && _li=0
+        dbg "nm_migrate_legacy_bind: migrated legacy binding -> unit #1 enabled=$_le band=$_lb iface=$_li"
+    elif [ -n "${NODEMCU_IP:-}" ]; then
+        _le=1; _lb=24; _li=0
+        dbg "nm_migrate_legacy_bind: legacy bind file already lost (pre-fix OTA) -- repairing unit #1 to enabled=$_le band=$_lb iface=$_li"
+    else
+        return
+    fi
     mkdir -p /lmepisowifi/www2/data
     printf '1|%s|%s|%s\n' "$_le" "$_lb" "$_li" > "$NODEMCU_IFACES_FILE"
-    dbg "nm_migrate_legacy_bind: migrated legacy binding -> unit #1 enabled=$_le band=$_lb iface=$_li"
 }
 nm_migrate_legacy_bind
 

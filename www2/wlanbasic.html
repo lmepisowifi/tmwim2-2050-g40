@@ -687,10 +687,9 @@ function buildIfaceCards(ifaces) {
                         id="save-${id}-btn" onclick="saveIface(${iface.idx})">Save</button>
                 ${isVxd ? `
                 <hr class="my-3">
-                <div class="vxd-status mb-2" id="${id}-conn-status">
-                    <div style="font-size:12px; color:#888;">Connection status</div>
-                    <div id="${id}-conn-line" style="font-size:13px;">Checking…</div>
-                    <div id="${id}-auth-line" style="font-size:13px;"></div>
+                <div style="font-size:11px; color:#888; margin-bottom:8px;">
+                    Live connection status moved to
+                    <a href="/sitesurvey.html" style="color:#9fc5ff;">Site Survey</a>.
                 </div>
                 <label class="form-label mt-2">Lock to BSSID <span style="font-weight:400; color:#888;">(optional)</span></label>
                 <div class="d-flex gap-2">
@@ -717,7 +716,9 @@ function buildIfaceCards(ifaces) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// VXD (idx 5) — BSSID lock + live connection/auth status
+// VXD (idx 5) — BSSID lock field. Live connection/auth status now
+// lives on the Site Survey page (Android-style card at the top);
+// this page only needs vxd_status for the lockedBssid value.
 // ═══════════════════════════════════════════════════════════════
 let vxdPollTimer = null;
 
@@ -731,29 +732,8 @@ function macToHex(colonOrHex) {
 
 function applyVxdStatus(vs) {
     const id = 'iface-5';
-    const connLine = document.getElementById(id + '-conn-line');
-    const authLine = document.getElementById(id + '-auth-line');
     const lockInput = document.getElementById(id + '-bssid-lock');
-    if (!connLine) return; // VXD card not currently rendered
-
-    if (vs.connected) {
-        connLine.textContent = 'Connected to "' + vs.ssid + '" (' + macToColon(vs.bssid) +
-            ') · ch ' + vs.channel + ' · signal ' + vs.rssi + '/100';
-        connLine.style.color = '#2e7d32';
-    } else {
-        connLine.textContent = 'Not connected';
-        connLine.style.color = '#c62828';
-    }
-
-    if (vs.authFinished === 1 && vs.authStatus === 0) {
-        authLine.textContent = 'Authentication: OK';
-        authLine.style.color = '#2e7d32';
-    } else if (vs.authStatus > 0) {
-        authLine.textContent = 'Authentication: ' + vs.authText;
-        authLine.style.color = '#c62828';
-    } else {
-        authLine.textContent = '';
-    }
+    if (!lockInput) return; // VXD card not currently rendered
 
     // Don't stomp on a value the user is actively typing
     if (document.activeElement !== lockInput) {
@@ -770,7 +750,7 @@ function loadVxdStatus() {
 
 function startVxdStatusPolling() {
     if (vxdPollTimer) { clearInterval(vxdPollTimer); vxdPollTimer = null; }
-    if (!document.getElementById('iface-5-conn-line')) return; // no VXD card this band
+    if (!document.getElementById('iface-5-bssid-lock')) return; // no VXD card this band
     loadVxdStatus();
     vxdPollTimer = setInterval(loadVxdStatus, 5000);
 }
@@ -1214,7 +1194,7 @@ function nmEscHtml(s) {
     }[c]));
 }
 
-function onNodemcuUnitToggle(id) { updateNodemcuUnitFieldsState(id); }
+function onNodemcuUnitToggle(id) { localToggle('nodemcu-' + id); updateNodemcuUnitFieldsState(id); }
 
 function updateNodemcuUnitFieldsState(id) {
     const on = isToggleOn('nodemcu-' + id);

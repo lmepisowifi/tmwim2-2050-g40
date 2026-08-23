@@ -155,6 +155,31 @@
             color: #ffb74d;
             margin-top: 8px;
         }
+        /* ── Connected network (VXD/client) — Android WiFi-page style ── */
+        #connected-network-card { display: none; }
+        .connected-net-row {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 14px 16px;
+        }
+        .connected-net-icon {
+            width: 40px; height: 40px;
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0;
+        }
+        .connected-net-icon svg { width: 22px; height: 22px; }
+        .connected-net-icon.state-connected { background: rgba(76,175,80,.15);  color: #81c784; }
+        .connected-net-icon.state-problem   { background: rgba(255,152,0,.15);  color: #ffb74d; }
+        .connected-net-icon.state-off       { background: rgba(244,67,54,.12);  color: #ef9a9a; }
+        .connected-net-info { flex: 1; min-width: 0; }
+        .connected-net-title {
+            font-size: 15px; font-weight: 600; color: var(--text-primary);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .connected-net-sub { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+        .connected-net-sub.problem { color: #ffb74d; }
     </style>
     <link href="/css/toastr.min.css?v=1.0.0" rel="stylesheet">
 </head>
@@ -170,6 +195,20 @@
     </div>
 
     <div class="container mt-4">
+
+        <!-- ── Connected network (VXD/client) — Android WiFi-page style,
+             sits above everything else; hidden entirely when the VXD
+             interface for the selected band is disabled ── -->
+        <div class="card mb-3" id="connected-network-card">
+            <div class="connected-net-row">
+                <div class="connected-net-icon" id="connected-net-icon"></div>
+                <div class="connected-net-info">
+                    <div class="connected-net-title" id="connected-net-title">—</div>
+                    <div class="connected-net-sub" id="connected-net-sub">—</div>
+                </div>
+                <span class="rssi-badge" id="connected-net-rssi" style="display:none;"></span>
+            </div>
+        </div>
 
         <!-- ── Controls card ── -->
         <div class="card mb-3">
@@ -376,6 +415,9 @@
     var lastChannels  = [];    // Most recent channel stats JSON array from CGI
     var wlanDisabled  = false; // True when main AP is disabled for selected band
     var clientTarget  = null;  // {type:'vxd'|'ap', label} — client-capable iface for this band, or null
+    var vxdEnabled    = false; // True when the VXD (idx 5) iface itself is enabled for this band
+    var vxdPollTimer  = null;
+    var vxdPollBand   = null;  // band the current poll timer is fetching for (5 or 24)
 
     // =====================================================================
     // HELPERS
@@ -442,12 +484,13 @@
         var band  = iface === 'wlan0' ? 5 : 24;
         try {
             var r = await fetch('/cgi-bin/wlanbasic.cgi?band=' + band + '&action=status');
-            if (!r.ok) { wlanDisabled = false; clientTarget = null; renderAPs(lastAPs); return; }
+            if (!r.ok) { wlanDisabled = false; clientTarget = null; vxdEnabled = false; updateVxdStatusVisibility(band); renderAPs(lastAPs); return; }
             var data = await r.json();
             var ifaces = data.ifaces || [];
             var ap  = ifaces.find(function(i) { return i.type === 'ap';  });
             var vxd = ifaces.find(function(i) { return i.type === 'vxd'; });
             wlanDisabled = ap ? (ap.disabled === 1) : false;
+            vxdEnabled = !!(vxd && vxd.disabled === 0);
 
             // A "Connect" action is possible when a client-capable interface is
             // enabled on this band: the dedicated VXD/repeater (idx 5), or the
@@ -462,7 +505,9 @@
         } catch (e) {
             wlanDisabled = false;
             clientTarget = null;
+            vxdEnabled = false;
         }
+        updateVxdStatusVisibility(band);
         applyWlanDisabledState();
         renderAPs(lastAPs);   // reflect Connect column availability
     }
@@ -491,6 +536,81 @@
             mcBtn.title    = '';
             notice.style.display = 'none';
         }
+    }
+
+    // =====================================================================
+    // CONNECTED NETWORK CARD (VXD/client) — Android WiFi-page style
+    // =====================================================================
+    var WIFI_ICON_SVG =
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" ' +
+        'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M5 12.55a11 11 0 0 1 14.08 0"></path>' +
+        '<path d="M1.42 9a16 16 0 0 1 21.16 0"></path>' +
+        '<path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path>' +
+        '<line x1="12" y1="20" x2="12.01" y2="20"></line></svg>';
+    var WIFI_OFF_ICON_SVG =
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" ' +
+        'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<line x1="1" y1="1" x2="23" y2="23"></line>' +
+        '<path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"></path>' +
+        '<path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"></path>' +
+        '<path d="M10.71 5.05A16 16 0 0 1 22.58 9"></path>' +
+        '<path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"></path>' +
+        '<path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path>' +
+        '<line x1="12" y1="20" x2="12.01" y2="20"></line></svg>';
+
+    function applyVxdStatus(vs) {
+        if (!vxdEnabled) return; // band/iface state changed while this fetch was in-flight
+
+        var card  = document.getElementById('connected-network-card');
+        var icon  = document.getElementById('connected-net-icon');
+        var title = document.getElementById('connected-net-title');
+        var sub   = document.getElementById('connected-net-sub');
+        var rssiEl= document.getElementById('connected-net-rssi');
+
+        if (vs.connected) {
+            var authOk = vs.authFinished === 1 && vs.authStatus === 0;
+            icon.className = 'connected-net-icon ' + (authOk ? 'state-connected' : 'state-problem');
+            icon.innerHTML  = WIFI_ICON_SVG;
+            title.textContent = vs.ssid || '(hidden)';
+            sub.textContent = authOk ? 'Connected' : ('Connected \u2014 ' + vs.authText);
+            sub.className = 'connected-net-sub' + (authOk ? '' : ' problem');
+            rssiEl.style.display = '';
+            rssiEl.className = 'rssi-badge ' + rssiClass(vs.rssi);
+            rssiEl.textContent = vs.rssi + '%';
+        } else {
+            icon.className = 'connected-net-icon state-off';
+            icon.innerHTML  = WIFI_OFF_ICON_SVG;
+            title.textContent = 'Not connected';
+            sub.textContent = 'Repeater / VXD is on but not associated to any network';
+            sub.className = 'connected-net-sub';
+            rssiEl.style.display = 'none';
+        }
+        card.style.display = '';
+    }
+
+    function loadVxdStatus(band) {
+        fetch('/cgi-bin/wlanbasic.cgi?band=' + band + '&action=vxd_status')
+            .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+            .then(applyVxdStatus)
+            .catch(function() {}); // silent — this is a background poll
+    }
+
+    // Show/hide the card and (re)start polling for the given band, per the
+    // current vxdEnabled flag set by checkWlanState().
+    function updateVxdStatusVisibility(band) {
+        var card = document.getElementById('connected-network-card');
+        if (!vxdEnabled) {
+            if (vxdPollTimer) { clearInterval(vxdPollTimer); vxdPollTimer = null; }
+            vxdPollBand = null;
+            card.style.display = 'none';
+            return;
+        }
+        if (vxdPollTimer && vxdPollBand === band) return; // already polling this band
+        if (vxdPollTimer) { clearInterval(vxdPollTimer); vxdPollTimer = null; }
+        vxdPollBand = band;
+        loadVxdStatus(band);
+        vxdPollTimer = setInterval(function() { loadVxdStatus(band); }, 5000);
     }
 
     // =====================================================================
@@ -1392,6 +1512,13 @@
         clientTarget = null;
         document.getElementById('wlan-disabled-notice').style.display = 'none';
         document.getElementById('refresh-btn').disabled = false;
+
+        // Hide the connected-network card immediately too — don't let the old
+        // band's VXD status linger on screen while the new band's is fetched
+        vxdEnabled = false;
+        if (vxdPollTimer) { clearInterval(vxdPollTimer); vxdPollTimer = null; }
+        vxdPollBand = null;
+        document.getElementById('connected-network-card').style.display = 'none';
 
         // Clear cached data from the previous band — stale APs from the old
         // band must not bleed through while the new band's request is in-flight
