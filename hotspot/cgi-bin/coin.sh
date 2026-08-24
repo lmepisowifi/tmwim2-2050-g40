@@ -516,23 +516,44 @@ start)
                     case "$R_STALE_AMT" in ''|*[!0-9]*) R_STALE_AMT=0 ;; esac
                     if [ "$R_STALE_AMT" -gt 0 ]; then
                         _lock
-                        _bank_add "$CLIENT_MAC" "$R_STALE_AMT"
-                        printf '%s 0\n' "$R_STALE_AMT" > "/tmp/coin_sessions/${LOCK_SID}.result"
-                        _unlock
-                        # This rescue bypasses coin_result.sh entirely, which is
-                        # normally the only place a physically-inserted coin gets
-                        # counted as income (at time of insertion, regardless of
-                        # whether it crosses a rate tier) and reported to
-                        # Telegram/Discord. Without this, a coin rescued here
-                        # would still convert to time correctly once later spent
-                        # from the bank, but would never show up in income.sh's
-                        # daily/monthly/yearly totals or send a notification.
-                        # Record and report it now, same event key coin_result.sh
-                        # uses for an ordinary below-tier top-up, so it isn't lost
-                        # and existing per-event mute settings still apply.
-                        /lmepisowifi/hotspot/income.sh add "$R_STALE_AMT" >/dev/null 2>&1
-                        _R_MSG=$(tpl_render "$TPL_COINS_INSERTED" insertcoinamt "$R_STALE_AMT" mac "$CLIENT_MAC")
-                        ( /lmepisowifi/hotspot/notify.sh "$_R_MSG" "" coins_inserted >/dev/null 2>&1 </dev/null & )
+                        # This exact SID can also be rescued from the poll
+                        # action's own LIVE_ACTIVE:false branch (NodeMCU
+                        # coming back online after its reboot and reporting
+                        # it doesn't know this sid), or genuinely finalized
+                        # by NodeMCU's own delayed-but-real end-of-session
+                        # POST landing right now. Both paths — and this one
+                        # — write the SAME .result marker, but only AFTER
+                        # doing their own _bank_add, so without this check
+                        # two of them racing each other bank the same coins
+                        # twice: whichever gets here first correctly banks
+                        # R_STALE_AMT, and without re-checking, whichever
+                        # gets here second would bank the identical amount
+                        # again on top. Checking-and-claiming it here, inside
+                        # the same _lock every one of those paths shares,
+                        # makes this a single atomic "is it still mine to
+                        # bank" test instead of a check then an act two
+                        # requests can both pass through.
+                        if [ -f "/tmp/coin_sessions/${LOCK_SID}.result" ]; then
+                            _unlock
+                        else
+                            _bank_add "$CLIENT_MAC" "$R_STALE_AMT"
+                            printf '%s 0\n' "$R_STALE_AMT" > "/tmp/coin_sessions/${LOCK_SID}.result"
+                            _unlock
+                            # This rescue bypasses coin_result.sh entirely, which is
+                            # normally the only place a physically-inserted coin gets
+                            # counted as income (at time of insertion, regardless of
+                            # whether it crosses a rate tier) and reported to
+                            # Telegram/Discord. Without this, a coin rescued here
+                            # would still convert to time correctly once later spent
+                            # from the bank, but would never show up in income.sh's
+                            # daily/monthly/yearly totals or send a notification.
+                            # Record and report it now, same event key coin_result.sh
+                            # uses for an ordinary below-tier top-up, so it isn't lost
+                            # and existing per-event mute settings still apply.
+                            /lmepisowifi/hotspot/income.sh add "$R_STALE_AMT" >/dev/null 2>&1
+                            _R_MSG=$(tpl_render "$TPL_COINS_INSERTED" insertcoinamt "$R_STALE_AMT" mac "$CLIENT_MAC")
+                            ( /lmepisowifi/hotspot/notify.sh "$_R_MSG" "" coins_inserted >/dev/null 2>&1 </dev/null & )
+                        fi
                     fi
 
                     if [ "$R_VERIFIED" -eq 1 ] && [ "$R_ACTIVE" -eq 0 ]; then
@@ -704,6 +725,29 @@ poll)
     AMT_PATH="${SESSION_PATH}.amt"
     REM_PATH="${SESSION_PATH}.rem"
 
+    # Once the customer has already clicked Done/Cancel (the node's lock
+    # flipped to CANCELLING — see the cancel action), there is no reason to
+    # make the frontend's "Adding time." spinner sit through the FULL
+    # RECONNECT_GRACE window (5 minutes by default) meant for an ACTIVE
+    # session that might still want to insert more coins once the slot
+    # reconnects. The customer is done inserting coins either way at that
+    # point — measured from the lock's own CANCELLING timestamp (set the
+    # instant Done was clicked) rather than SINCE_SEEN below, since a
+    # session that had been idle for a while before Done was clicked would
+    # otherwise start this countdown already most of the way elapsed.
+    LOCK_FILE_FOR_NODE="/tmp/coin_lock_${SESSION_NODE}"
+    CANCEL_GIVEUP=0
+    if [ -f "$LOCK_FILE_FOR_NODE" ]; then
+        _LF_SID=$(awk '{print $1}' "$LOCK_FILE_FOR_NODE")
+        _LF_TIME=$(awk '{print $2}' "$LOCK_FILE_FOR_NODE")
+        _LF_STATE=$(awk '{print $4}' "$LOCK_FILE_FOR_NODE")
+        if [ "$_LF_SID" = "$SID" ] && [ "$_LF_STATE" = "CANCELLING" ]; then
+            case "$_LF_TIME" in ''|*[!0-9]*) _LF_TIME=$NOW ;; esac
+            CANCEL_SINCE=$(( NOW - _LF_TIME ))
+            [ "$CANCEL_SINCE" -gt "${COIN_CANCEL_GIVEUP:-15}" ] && CANCEL_GIVEUP=1
+        fi
+    fi
+
     # Fallback estimate in case NodeMCU doesn't answer this particular poll —
     # overwritten below with NodeMCU's own authoritative value when it does.
     REMAINING=$(( COIN_TIMEOUT - (NOW - CREATED_AT) ))
@@ -715,10 +759,34 @@ poll)
     # answering polls. We now also tolerate a whole RECONNECT_GRACE window of
     # silence on top of that so a mid-insert dropout doesn't nuke the coins the
     # customer already dropped — only give up once even the reconnect grace has
-    # elapsed, and even then hand back the preserved amount rather than zero.
-    if [ "$SINCE_SEEN" -gt $(( COIN_TIMEOUT + 25 + RECONNECT_GRACE )) ]; then
+    # elapsed (or the faster CANCEL_GIVEUP above already fired), and even then
+    # hand back the preserved amount rather than zero.
+    if [ "$CANCEL_GIVEUP" -eq 1 ] || [ "$SINCE_SEEN" -gt $(( COIN_TIMEOUT + 25 + RECONNECT_GRACE )) ]; then
         GIVEUP_AMT=$(cat "$AMT_PATH" 2>/dev/null); GIVEUP_AMT=${GIVEUP_AMT:-0}
-        rm -f "$SESSION_PATH" "$MISS_PATH" "$AMT_PATH" "$REM_PATH" "/tmp/coin_lock_${SESSION_NODE}"
+        if [ "$GIVEUP_AMT" -gt 0 ]; then
+            _lock
+            # Same three-way race as the other two rescue paths (this SID's
+            # own genuine-but-delayed NodeMCU POST, or a concurrent request
+            # hitting one of the other rescue branches) — claim it via the
+            # same .result marker under the same lock before banking, or a
+            # give-up racing either of those would credit these coins twice.
+            if [ -f "$RESULT_PATH" ]; then
+                _unlock
+            else
+                # Previously this branch only ever computed a throwaway
+                # preview number for the toast message and discarded the
+                # actual coins — a customer whose NodeMCU never reconnected
+                # at all lost their money outright once this fired. Bank it
+                # for real, same as the other two rescue paths.
+                _bank_add "$SESSION_MAC" "$GIVEUP_AMT"
+                printf '%s 0\n' "$GIVEUP_AMT" > "$RESULT_PATH"
+                _unlock
+                /lmepisowifi/hotspot/income.sh add "$GIVEUP_AMT" >/dev/null 2>&1
+                _G_MSG=$(tpl_render "$TPL_COINS_INSERTED" insertcoinamt "$GIVEUP_AMT" mac "$SESSION_MAC")
+                ( /lmepisowifi/hotspot/notify.sh "$_G_MSG" "" coins_inserted >/dev/null 2>&1 </dev/null & )
+            fi
+        fi
+        rm -f "$SESSION_PATH" "$MISS_PATH" "$AMT_PATH" "$REM_PATH" "$LOCK_FILE_FOR_NODE"
         _clear_pending "$SID"   # session abandoned → drop the non-volatile mirror
         _ok "{\"status\":\"expired\",\"amount\":${GIVEUP_AMT},\"minutes\":$(_calc_time "$GIVEUP_AMT")}"
     fi
@@ -760,6 +828,25 @@ poll)
                 # the same conclusion the slow way.
                 if [ "$LIVE_AMOUNT" -gt 0 ]; then
                     _lock
+                    # Same sid can also be rescued from the start action's
+                    # own resume-check (a client re-clicking "Insert Coin"
+                    # while this exact reboot-triggered poll is in flight),
+                    # or genuinely finalized by NodeMCU's own delayed-but-
+                    # real end-of-session POST landing right now. All three
+                    # write this same .result marker, but only AFTER doing
+                    # their own _bank_add — so without re-checking here,
+                    # whichever of them loses the race would bank the same
+                    # coins again on top of whichever won it. Checking under
+                    # the same _lock every one of those paths shares makes
+                    # this a single atomic "is it still mine to bank" test.
+                    if [ -f "$RESULT_PATH" ]; then
+                        _unlock
+                        _R_AMOUNT=$(awk '{print $1}' "$RESULT_PATH")
+                        _R_MINUTES=$(awk '{print $2}' "$RESULT_PATH")
+                        rm -f "$SESSION_PATH" "$MISS_PATH" "$AMT_PATH" "$REM_PATH" "/tmp/coin_lock_${SESSION_NODE}"
+                        _clear_pending "$SID"
+                        _ok "{\"status\":\"complete\",\"amount\":${_R_AMOUNT:-0},\"minutes\":${_R_MINUTES:-0}}"
+                    fi
                     _bank_add "$SESSION_MAC" "$LIVE_AMOUNT"
                     printf '%s 0\n' "$LIVE_AMOUNT" > "$RESULT_PATH"
                     _unlock

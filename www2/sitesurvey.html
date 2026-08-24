@@ -527,7 +527,7 @@
             btn.title    = 'WLAN is disabled for this band';
             mcBtn.disabled = true;
             mcBtn.title    = 'WLAN is disabled for this band';
-            notice.style.display = '';
+            notice.style.display = 'block';
             setStatus('WLAN disabled for this band');
         } else {
             btn.disabled = false;
@@ -586,7 +586,7 @@
             sub.className = 'connected-net-sub';
             rssiEl.style.display = 'none';
         }
-        card.style.display = '';
+        card.style.display = 'flex';
     }
 
     function loadVxdStatus(band) {
