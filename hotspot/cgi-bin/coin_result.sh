@@ -306,28 +306,47 @@ else
 fi
 
 if [ "${AMOUNT:-0}" -eq 0 ]; then
-    if [ "${COIN_STRIKE_ENABLED:-1}" = "1" ]; then
-        STRIKES=$($BB grep "^$CLIENT_MAC " /tmp/coin_strikes.txt 2>/dev/null | $BB awk '{print $2}')
-        STRIKES=$(( ${STRIKES:-0} + 1 ))
-        $BB grep -v "^$CLIENT_MAC " /tmp/coin_strikes.txt > /tmp/cs.tmp 2>/dev/null
-        printf '%s %s %s\n' "$CLIENT_MAC" "$STRIKES" "$NOW" >> /tmp/cs.tmp
-        $BB mv /tmp/cs.tmp /tmp/coin_strikes.txt
+    # A session ending with literally zero coins THIS time is only a true
+    # no-op — and only counts as an anti-troll strike — when the customer
+    # also has nothing sitting in the coin bank. Otherwise this is just a
+    # customer cashing in a pre-existing banked balance (e.g. rescued by
+    # coin.sh's RESUME_NODEMCU_OFFLINE/stale-lock paths, which bank coins
+    # directly without ever routing through here) by pressing Done on a
+    # fresh session they didn't feed any new coins into. Bouncing that with
+    # "0 minutes" here both denies time they already paid for and unfairly
+    # flags them as a troll. Peek at the bank now (outside _lock — this is
+    # only a branch decision; the authoritative, lock-protected read still
+    # happens below where it's actually spent) and fall through to the
+    # normal fold/grant logic whenever it's nonzero.
+    _PEEK_BANKED=$(_bank_get "$CLIENT_MAC")
+    case "$_PEEK_BANKED" in ''|*[!0-9]*) _PEEK_BANKED=0 ;; esac
 
-        # Notify once when suspension is first triggered (strikes exactly == threshold)
-        _ST=${COIN_STRIKE_THRESHOLD:-3}
-        _CD=${COIN_COOLDOWN:-300}
-        if [ "$STRIKES" -eq "$_ST" ]; then
-            _CD_MINS=$(( _CD / 60 ))
-            _SUSP_MSG=$(tpl_render "$TPL_ANTI_TROLL" \
-                mac "$CLIENT_MAC" strikes "$STRIKES" strikemax "$_ST" cooldownmins "$_CD_MINS")
-            ( /lmepisowifi/hotspot/notify.sh "$_SUSP_MSG" "" anti_troll >/dev/null 2>&1 </dev/null & )
+    if [ "$_PEEK_BANKED" -eq 0 ]; then
+        if [ "${COIN_STRIKE_ENABLED:-1}" = "1" ]; then
+            STRIKES=$($BB grep "^$CLIENT_MAC " /tmp/coin_strikes.txt 2>/dev/null | $BB awk '{print $2}')
+            STRIKES=$(( ${STRIKES:-0} + 1 ))
+            $BB grep -v "^$CLIENT_MAC " /tmp/coin_strikes.txt > /tmp/cs.tmp 2>/dev/null
+            printf '%s %s %s\n' "$CLIENT_MAC" "$STRIKES" "$NOW" >> /tmp/cs.tmp
+            $BB mv /tmp/cs.tmp /tmp/coin_strikes.txt
+
+            # Notify once when suspension is first triggered (strikes exactly == threshold)
+            _ST=${COIN_STRIKE_THRESHOLD:-3}
+            _CD=${COIN_COOLDOWN:-300}
+            if [ "$STRIKES" -eq "$_ST" ]; then
+                _CD_MINS=$(( _CD / 60 ))
+                _SUSP_MSG=$(tpl_render "$TPL_ANTI_TROLL" \
+                    mac "$CLIENT_MAC" strikes "$STRIKES" strikemax "$_ST" cooldownmins "$_CD_MINS")
+                ( /lmepisowifi/hotspot/notify.sh "$_SUSP_MSG" "" anti_troll >/dev/null 2>&1 </dev/null & )
+            fi
         fi
-    fi
 
-    printf '0 0\n' > "$RESULT_PATH"
-    rm -f "$SESSION_PATH" "${SESSION_PATH}.miss" "${SESSION_PATH}.amt" "${SESSION_PATH}.rem" "/tmp/coin_lock_${CALL_NODE}"
-    _clear_pending "$SID"
-    _ok '{"ok":true,"amount":0,"minutes":0}'
+        printf '0 0\n' > "$RESULT_PATH"
+        rm -f "$SESSION_PATH" "${SESSION_PATH}.miss" "${SESSION_PATH}.amt" "${SESSION_PATH}.rem" "/tmp/coin_lock_${CALL_NODE}"
+        _clear_pending "$SID"
+        _ok '{"ok":true,"amount":0,"minutes":0}'
+    fi
+    # else: fall through — the banked balance gets folded and evaluated
+    # against the rate tiers below, same as any other top-up.
 fi
 
 # Fold in whatever's already banked for this MAC (see COIN_BANK_FILE above)

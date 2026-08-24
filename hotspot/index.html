@@ -2490,7 +2490,7 @@ function startCoinPoll() {
           } else {
             _pauseCoinBgMusic();
             _hideCoinButtons();
-            toastr.error("No was time granted, there wasn't not enough coins inserted.");
+            toastr.error("No time granted, there wasn't enough coins inserted.");
             setTimeout(function() { _coinSID = null; closeCoinModalUI(); checkStatus(); }, 2000);
           }
 

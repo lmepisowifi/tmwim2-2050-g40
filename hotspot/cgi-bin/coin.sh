@@ -19,6 +19,12 @@
 
 [ -f /tmp/coin_config.env ] && . /tmp/coin_config.env
 [ -f /lmepisowifi/hotspot/macfix.sh ] && . /lmepisowifi/hotspot/macfix.sh
+# tpl_render + TPL_COINS_INSERTED — needed so the two bank-rescue paths
+# below (RESUME_NODEMCU_OFFLINE and poll's LIVE_ACTIVE:false branch) can
+# send the same customer-facing Telegram/Discord notification a normal
+# below-tier top-up gets from coin_result.sh, instead of that sale going
+# silently unreported just because it happened to bypass coin_result.sh.
+[ -f /lmepisowifi/hotspot/notify_templates.sh ] && . /lmepisowifi/hotspot/notify_templates.sh
 
 _unlock() { rm -f /tmp/hotspot_session.lock/pid 2>/dev/null; rmdir /tmp/hotspot_session.lock 2>/dev/null; }
 _lock() {
@@ -513,6 +519,20 @@ start)
                         _bank_add "$CLIENT_MAC" "$R_STALE_AMT"
                         printf '%s 0\n' "$R_STALE_AMT" > "/tmp/coin_sessions/${LOCK_SID}.result"
                         _unlock
+                        # This rescue bypasses coin_result.sh entirely, which is
+                        # normally the only place a physically-inserted coin gets
+                        # counted as income (at time of insertion, regardless of
+                        # whether it crosses a rate tier) and reported to
+                        # Telegram/Discord. Without this, a coin rescued here
+                        # would still convert to time correctly once later spent
+                        # from the bank, but would never show up in income.sh's
+                        # daily/monthly/yearly totals or send a notification.
+                        # Record and report it now, same event key coin_result.sh
+                        # uses for an ordinary below-tier top-up, so it isn't lost
+                        # and existing per-event mute settings still apply.
+                        /lmepisowifi/hotspot/income.sh add "$R_STALE_AMT" >/dev/null 2>&1
+                        _R_MSG=$(tpl_render "$TPL_COINS_INSERTED" insertcoinamt "$R_STALE_AMT" mac "$CLIENT_MAC")
+                        ( /lmepisowifi/hotspot/notify.sh "$_R_MSG" "" coins_inserted >/dev/null 2>&1 </dev/null & )
                     fi
 
                     if [ "$R_VERIFIED" -eq 1 ] && [ "$R_ACTIVE" -eq 0 ]; then
@@ -743,6 +763,12 @@ poll)
                     _bank_add "$SESSION_MAC" "$LIVE_AMOUNT"
                     printf '%s 0\n' "$LIVE_AMOUNT" > "$RESULT_PATH"
                     _unlock
+                    # Same income/notification gap as the resume-check
+                    # rescue above: this bypasses coin_result.sh, so record
+                    # and report it here or it never gets counted or seen.
+                    /lmepisowifi/hotspot/income.sh add "$LIVE_AMOUNT" >/dev/null 2>&1
+                    _L_MSG=$(tpl_render "$TPL_COINS_INSERTED" insertcoinamt "$LIVE_AMOUNT" mac "$SESSION_MAC")
+                    ( /lmepisowifi/hotspot/notify.sh "$_L_MSG" "" coins_inserted >/dev/null 2>&1 </dev/null & )
                 fi
                 rm -f "$SESSION_PATH" "$MISS_PATH" "$AMT_PATH" "$REM_PATH" "/tmp/coin_lock_${SESSION_NODE}"
                 _clear_pending "$SID"
