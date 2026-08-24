@@ -1,6 +1,6 @@
-version=1.5.29
-url=https://github.com/lmepisowifi/tmwim2-2050-g40/releases/download/v1.5.29/lmepisowifi-1.5.29.tar.gz
-sha256=69c57147a011d885ed74deb195d640aa5449058929b57e081509505d7c8a986c
-notes=Release 1.5.29
-nodemcu_version=1.2.4
-nodemcu_md5=dde5b0963adcc4ba40961c25f893b711
+version=1.5.30
+url=https://github.com/lmepisowifi/tmwim2-2050-g40/releases/download/v1.5.30/lmepisowifi-1.5.30.tar.gz
+sha256=18159885a7a91686cf0245e537125671a5e81d358553c2b16de73cdf0a9983fb
+notes=Release 1.5.30
+nodemcu_version=1.2.5
+nodemcu_md5=fd377e3e41a01f94bf5de37559b3a1bd
