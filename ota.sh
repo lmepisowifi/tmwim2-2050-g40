@@ -583,16 +583,6 @@ self_heal() {
     _SH_NEW_S="$ROOT/www2/sh/startup.sh"
     if [ -f "$_SH_OLD_S" ] && [ -f "$_SH_NEW_S" ]; then
         for _SH_NAME in LAN_SPEEDS REBOOT_SCHED WAN_REPURPOSE; do
-            _SH_LIVE_C="/tmp/ota_heal_live_${_SH_NAME}.$$"
-            awk -v beg="# --- BEGIN_${_SH_NAME} ---" -v end="# --- END_${_SH_NAME} ---" '
-                $0==beg { insec=1; next }
-                $0==end { insec=0; next }
-                insec   { print }
-            ' "$_SH_NEW_S" > "$_SH_LIVE_C"
-            # Live already has content for this marker — leave it alone.
-            if [ -s "$_SH_LIVE_C" ]; then rm -f "$_SH_LIVE_C"; continue; fi
-            rm -f "$_SH_LIVE_C"
-
             _SH_BAK_C="/tmp/ota_heal_bak_${_SH_NAME}.$$"
             awk -v beg="# --- BEGIN_${_SH_NAME} ---" -v end="# --- END_${_SH_NAME} ---" '
                 $0==beg { insec=1; next }
@@ -600,6 +590,47 @@ self_heal() {
                 insec   { print }
             ' "$_SH_OLD_S" > "$_SH_BAK_C"
             if [ ! -s "$_SH_BAK_C" ]; then rm -f "$_SH_BAK_C"; continue; fi
+
+            # Only ever use ONE SPECIFIC www2.ota_old backup as a healing
+            # source once. Without this, an empty live marker is ambiguous —
+            # it means EITHER "a pre-fix ota.sh run just stranded this
+            # setting" (needs healing) OR "the admin legitimately cleared/
+            # reverted it via the CGI since this backup was taken" (must NOT
+            # be healed). do_cron calls self_heal unconditionally every 6h,
+            # for as long as this same backup sticks around (until the NEXT
+            # OTA apply clears it) — so without a one-shot guard per backup,
+            # deleting a DHCP-client/WAN-repurpose interface (or clearing a
+            # LAN-speed/reboot-schedule setting) gets silently undone the
+            # next time self_heal happens to run while the stale backup is
+            # still on disk. $ROOT/.ota_heal_seen_<NAME> lives outside every
+            # swapped COMPONENT (untouched by the swap and by "clear stale
+            # backups"), so it survives reboots and persists exactly as long
+            # as the backup it fingerprints does. Recording that a given
+            # backup's content has already been consulted — whether or not
+            # it actually needed restoring — makes a later, legitimate
+            # emptying of the live marker stick instead of getting reverted.
+            _SH_BAK_HASH=$(sha256sum "$_SH_BAK_C" 2>/dev/null | awk '{print $1}')
+            _SH_SEEN_FILE="$ROOT/.ota_heal_seen_${_SH_NAME}"
+            if [ -n "$_SH_BAK_HASH" ] && [ "$(busybox cat "$_SH_SEEN_FILE" 2>/dev/null)" = "$_SH_BAK_HASH" ]; then
+                rm -f "$_SH_BAK_C"; continue
+            fi
+
+            _SH_LIVE_C="/tmp/ota_heal_live_${_SH_NAME}.$$"
+            awk -v beg="# --- BEGIN_${_SH_NAME} ---" -v end="# --- END_${_SH_NAME} ---" '
+                $0==beg { insec=1; next }
+                $0==end { insec=0; next }
+                insec   { print }
+            ' "$_SH_NEW_S" > "$_SH_LIVE_C"
+            # Live already has content for this marker — leave it alone, but
+            # still fingerprint this backup as consulted (see above) so a
+            # later, legitimate clearing of the setting isn't resurrected
+            # from it.
+            if [ -s "$_SH_LIVE_C" ]; then
+                rm -f "$_SH_LIVE_C" "$_SH_BAK_C"
+                [ -n "$_SH_BAK_HASH" ] && printf '%s' "$_SH_BAK_HASH" > "$_SH_SEEN_FILE"
+                continue
+            fi
+            rm -f "$_SH_LIVE_C"
 
             _SH_TMP="/tmp/ota_heal_startup_sh.$$"
             awk -v beg="# --- BEGIN_${_SH_NAME} ---" -v end="# --- END_${_SH_NAME} ---" \
@@ -615,6 +646,7 @@ self_heal() {
                 { print }
             ' "$_SH_NEW_S" > "$_SH_TMP" && mv "$_SH_TMP" "$_SH_NEW_S"
             rm -f "$_SH_BAK_C"
+            [ -n "$_SH_BAK_HASH" ] && printf '%s' "$_SH_BAK_HASH" > "$_SH_SEEN_FILE"
             chmod 755 "$_SH_NEW_S" 2>/dev/null
             log "self-heal: recovered $_SH_NAME from www2.ota_old (lost by a pre-fix OTA run)"
             notify "OTA: recovered a $_SH_NAME setting a previous update had reset — please double-check it"
