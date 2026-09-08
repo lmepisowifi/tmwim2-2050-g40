@@ -591,6 +591,8 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
     AP_BOOL="false"; [ "${AP:-1}" = "1" ] && AP_BOOL="true"
     AR="${AUTO_RESUME_ENABLED:-$(read_lmehspt_var AUTO_RESUME_ENABLED)}"
     AR_BOOL="false"; [ "${AR:-0}" = "1" ] && AR_BOOL="true"
+    RL="${RELOAD_AFTER_TIME_ADDED_ENABLED:-$(read_lmehspt_var RELOAD_AFTER_TIME_ADDED_ENABLED)}"
+    RL_BOOL="false"; [ "${RL:-0}" = "1" ] && RL_BOOL="true"
     ES="${EQUAL_SHARING_ENABLED:-$(read_lmehspt_var EQUAL_SHARING_ENABLED)}"
     ES_BOOL="false"; [ "${ES:-0}" = "1" ] && ES_BOOL="true"
     CE="${COIN_ENABLED:-$(read_lmehspt_var COIN_ENABLED)}"
@@ -644,6 +646,7 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
 \"inactivity_timeout\":\"$(esc_json "$IT")\",
 \"auto_pause_enabled\":$AP_BOOL,
 \"auto_resume_enabled\":$AR_BOOL,
+\"reload_after_time_added\":$RL_BOOL,
 \"equal_sharing_enabled\":$ES_BOOL,
 \"coin_enabled\":\"$(esc_json "$CE")\",
 \"coin_on\":$COIN_ON,
@@ -716,6 +719,7 @@ if echo "$QS" | $BB grep -q "action=config_set"; then
     apply_if "INACTIVITY_TIMEOUT"  "$(fget inactivity_timeout)"
     apply_if "AUTO_PAUSE_ENABLED"  "$(fget auto_pause_enabled)"
     apply_if "AUTO_RESUME_ENABLED" "$(fget auto_resume_enabled)"
+    apply_if "RELOAD_AFTER_TIME_ADDED_ENABLED" "$(fget reload_after_time_added)"
     apply_if "EQUAL_SHARING_ENABLED" "$(fget equal_sharing_enabled)"
     apply_if "NODEMCU_IP"          "$(fget nodemcu_ip)"
     apply_if "NODEMCU_MAC"         "$(fget nodemcu_mac)"

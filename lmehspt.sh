@@ -60,6 +60,13 @@ AUTO_PAUSE_ENABLED="1"
 # same resume=1 request the button would, the moment the device's next
 # status poll lands after it reconnects — no tap needed.
 AUTO_RESUME_ENABLED="0"
+# Off by default — see defaults.env for the full rationale. When on,
+# index.html forces a full page reload right after a coin top-up finishes
+# ("Done" closing the Insert Coin modal with time added) or a paused
+# session is resumed, instead of just re-polling status.sh in place. Some
+# devices' captive-portal UI otherwise never notices it already has
+# internet access until the page itself reloads and the OS re-probes.
+RELOAD_AFTER_TIME_ADDED_ENABLED="0"
 BOOT_MARKER="/tmp/hotspot_boot.mark"
 ACTIVITY_FILE="/tmp/hotspot_activity.txt"
 PER_USER_RATE="5mbit"
@@ -1583,6 +1590,9 @@ write_coin_config() {
         # only sources this cache file (never globals.env directly), so it
         # would then see AUTO_RESUME_ENABLED as unset and fall back to off.
         printf 'AUTO_RESUME_ENABLED="%s"\n' "${AUTO_RESUME_ENABLED:-0}"
+        # Same "without this line" reasoning as AUTO_RESUME_ENABLED above —
+        # status.sh only ever sees this var via coin_config.env.
+        printf 'RELOAD_AFTER_TIME_ADDED_ENABLED="%s"\n' "${RELOAD_AFTER_TIME_ADDED_ENABLED:-0}"
         printf 'PORTAL_IP="%s"\n'           "$PORTAL_IP"
         printf 'PORTAL_PORT="%s"\n'         "$PORTAL_PORT"
         printf 'DHCP_START="%s"\n'          "$DHCP_START"

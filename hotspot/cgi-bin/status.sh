@@ -24,6 +24,11 @@ HOTSPOT_BR="br1"
 # MAC-randomization session-continuity fix (cookie-based device fingerprint)
 [ -f /lmepisowifi/hotspot/macfix.sh ] && . /lmepisowifi/hotspot/macfix.sh
 
+# Admin-configured (see hotspot.cgi's config_set / RELOAD_AFTER_TIME_ADDED_ENABLED).
+# Surfaced on every status poll, logged-in or not, so index.html has it
+# cached before the coin-complete/resume codepaths that actually act on it.
+RELOAD_BOOL="false"; [ "${RELOAD_AFTER_TIME_ADDED_ENABLED:-0}" = "1" ] && RELOAD_BOOL="true"
+
 _unlock() { rm -f /tmp/hotspot_session.lock/pid 2>/dev/null; rmdir /tmp/hotspot_session.lock 2>/dev/null; }
 _lock() {
     local i=0
@@ -138,7 +143,7 @@ if [ -n "$SESSION" ]; then
         USED=$(( TOTAL - REMAINING ))
         [ "$USED" -lt 0 ] && USED=0
 
-        $BB echo "{\"logged_in\":true,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"remaining\":$REMAINING,\"total\":$TOTAL,\"used\":$USED,${CONN_JSON}${AVAIL_JSON}}"
+        $BB echo "{\"logged_in\":true,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"remaining\":$REMAINING,\"total\":$TOTAL,\"used\":$USED,\"reload_after_time_added\":$RELOAD_BOOL,${CONN_JSON}${AVAIL_JSON}}"
         _unlock
         exit 0
     fi
@@ -157,8 +162,8 @@ if [ -n "$PAUSED" ]; then
     # still does the actual resume, so this flag never bypasses its
     # locking/atomic-write path, just who clicks the button.
     AR_BOOL="false"; [ "${AUTO_RESUME_ENABLED:-0}" = "1" ] && AR_BOOL="true"
-    $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"has_paused\":true,\"remaining\":$REMAINING,\"total\":$TOTAL,\"auto_resume\":$AR_BOOL,${CONN_JSON}${AVAIL_JSON}}"
+    $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"has_paused\":true,\"remaining\":$REMAINING,\"total\":$TOTAL,\"auto_resume\":$AR_BOOL,\"reload_after_time_added\":$RELOAD_BOOL,${CONN_JSON}${AVAIL_JSON}}"
 else
-    $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",${CONN_JSON}${AVAIL_JSON}}"
+    $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"reload_after_time_added\":$RELOAD_BOOL,${CONN_JSON}${AVAIL_JSON}}"
 fi
 _unlock
