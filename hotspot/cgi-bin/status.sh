@@ -16,6 +16,9 @@ BB="busybox"
 SESSION_FILE="/tmp/active_sessions.txt"
 USERS_FILE="/lmepisowifi/hotspot_data/users.txt"
 COIN_BANK_FILE="/lmepisowifi/hotspot_data/coin_bank.txt"
+# See lmehspt.sh's AUTO_PAUSED_FILE comment — read-only here, used below to
+# scope auto_resume to sessions the system itself paused.
+AUTO_PAUSED_FILE="/lmepisowifi/hotspot_data/auto_paused.txt"
 HOTSPOT_BR="br1"
 
 # Live-updatable toggles (MAC_RANDOMIZATION_FIX among them) written by
@@ -161,7 +164,21 @@ if [ -n "$PAUSED" ]; then
     # button sends, on this same status poll — no tap needed. login.sh
     # still does the actual resume, so this flag never bypasses its
     # locking/atomic-write path, just who clicks the button.
-    AR_BOOL="false"; [ "${AUTO_RESUME_ENABLED:-0}" = "1" ] && AR_BOOL="true"
+    #
+    # Gated three ways so this can only ever fire for a session the SYSTEM
+    # itself paused (lmehspt.sh's inactivity watchdog) — never one the
+    # customer paused with their own Pause Time tap, or an admin paused
+    # with Kick: (1) the admin's Auto-Resume toggle, (2) Auto-Resume is
+    # tied to Auto-Pause being on too — Auto-Resume only ever makes sense
+    # for pauses Auto-Pause itself causes, and www2/hotspot.html hides the
+    # toggle whenever Auto-Pause is off to match, (3) this exact MAC is
+    # listed in AUTO_PAUSED_FILE, written only by lmehspt.sh's
+    # pause_session() and cleared by every manual-pause/resume/removal
+    # code path — see that file's AUTO_PAUSED_FILE comment.
+    AR_BOOL="false"
+    if [ "${AUTO_RESUME_ENABLED:-0}" = "1" ] && [ "${AUTO_PAUSE_ENABLED:-1}" = "1" ]; then
+        [ -f "$AUTO_PAUSED_FILE" ] && $BB grep -qx "$CLIENT_MAC" "$AUTO_PAUSED_FILE" 2>/dev/null && AR_BOOL="true"
+    fi
     $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"has_paused\":true,\"remaining\":$REMAINING,\"total\":$TOTAL,\"auto_resume\":$AR_BOOL,\"reload_after_time_added\":$RELOAD_BOOL,${CONN_JSON}${AVAIL_JSON}}"
 else
     $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"reload_after_time_added\":$RELOAD_BOOL,${CONN_JSON}${AVAIL_JSON}}"

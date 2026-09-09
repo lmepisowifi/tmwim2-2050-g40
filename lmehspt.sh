@@ -28,6 +28,14 @@ DHCP_DNS="1.1.1.1"  # space-separated DNS servers pushed to clients (udhcpd "opt
 WWW2_PORT="8080"   # busybox httpd -h /lmepisowifi/www2 -p 8080 (admin UI). /admin on the portal redirects here.
 SESSION_FILE="/tmp/active_sessions.txt"
 USERS_FILE="/lmepisowifi/hotspot_data/users.txt"
+# One MAC per line: whoever's CURRENT paused entry in USERS_FILE was paused
+# by check_inactivity()'s watchdog (system/automatic), as opposed to a
+# customer's own Pause Time tap or an admin Kick (both manual). Consulted
+# by status.sh so AUTO_RESUME_ENABLED only ever auto-resumes a session the
+# system itself paused - see pause_session()'s reason param below, and the
+# "manual pause" write sites in logout.sh / hotspot.cgi (kick, users_import)
+# that clear a MAC's line here instead of adding one.
+AUTO_PAUSED_FILE="/lmepisowifi/hotspot_data/auto_paused.txt"
 # Two alternating backup generations (refreshed every 5 min, see
 # backup_users_file) rather than one — so a crash mid-write to one
 # generation still leaves the other, already-durable, copy intact.
@@ -1387,6 +1395,15 @@ pause_session() {
     if _users_file_stage_excl "$mac"; then
         echo "$mac paused $remaining $total $(_fmt_secs "$remaining")" >> "${USERS_FILE}.tmp"
         _users_file_commit
+        # Only check_inactivity() ever calls pause_session() without a
+        # $reason, so this is the sole "the system paused this, not the
+        # customer/admin" call site - see AUTO_PAUSED_FILE's declaration.
+        if [ "$reason" = "Automatically" ]; then
+            touch "$AUTO_PAUSED_FILE"
+            $BB grep -vx "$mac" "$AUTO_PAUSED_FILE" > "${AUTO_PAUSED_FILE}.tmp" 2>/dev/null
+            echo "$mac" >> "${AUTO_PAUSED_FILE}.tmp"
+            $BB mv "${AUTO_PAUSED_FILE}.tmp" "$AUTO_PAUSED_FILE"
+        fi
     fi
     _unlock
 

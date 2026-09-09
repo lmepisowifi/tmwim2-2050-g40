@@ -66,6 +66,12 @@ HDATA="/lmepisowifi/hotspot_data"
 SESSION_DATA="/tmp/active_sessions.txt"
 USERS_FILE="$HDATA/users.txt"
 WHITELIST_FILE="$HDATA/whitelist.txt"
+# One MAC per line: whoever's CURRENT paused USERS_FILE entry was paused by
+# lmehspt.sh's inactivity watchdog (system/automatic) rather than an admin
+# Kick or a customer's own Pause Time tap (both manual) — see
+# pause_session()'s comment in lmehspt.sh for the full explanation. Kick and
+# users_import below clear a MAC's line here since both are manual pauses.
+AUTO_PAUSED_FILE="$HDATA/auto_paused.txt"
 # Below-minimum-tier coin balances banked per-MAC by coin_result.sh — see
 # that file's COIN_BANK_FILE comment for the full explanation.
 COIN_BANK_FILE="$HDATA/coin_bank.txt"
@@ -960,6 +966,10 @@ if echo "$QS" | $BB grep -q "action=kick"; then
             [ "$REM" -gt 0 ] && echo "$MAC paused $REM $K_TOT $(_fmt_secs "$REM")" >> "${USERS_FILE}.tmp"
             _users_file_commit
         fi
+        # Kick is a MANUAL pause (see the notify template's reason below) —
+        # drop any stale "system auto-paused this MAC" marker so
+        # AUTO_RESUME_ENABLED can't silently resume it.
+        [ -f "$AUTO_PAUSED_FILE" ] && { $BB grep -vx "$MAC" "$AUTO_PAUSED_FILE" > /tmp/kick_ap.tmp 2>/dev/null; $BB mv /tmp/kick_ap.tmp "$AUTO_PAUSED_FILE"; }
         PAUSED="true"
     fi
     _unlock
@@ -1206,6 +1216,7 @@ if echo "$QS" | $BB grep -q "action=remove_user"; then
     [ -f "$RM_ACTIVITY" ]         && { $BB grep -v "^$MAC " "$RM_ACTIVITY"         > /tmp/rm_a.tmp 2>/dev/null; $BB mv /tmp/rm_a.tmp "$RM_ACTIVITY"; }
     [ -f /tmp/hotspot_ip_map.txt ] && { $BB grep -v "^$MAC " /tmp/hotspot_ip_map.txt > /tmp/rm_i.tmp;           $BB mv /tmp/rm_i.tmp /tmp/hotspot_ip_map.txt; }
     [ -f "$COIN_BANK_FILE" ]       && { $BB grep -v "^$MAC " "$COIN_BANK_FILE"       > /tmp/rm_b.tmp 2>/dev/null; $BB mv /tmp/rm_b.tmp "$COIN_BANK_FILE"; }
+    [ -f "$AUTO_PAUSED_FILE" ]     && { $BB grep -vx "$MAC" "$AUTO_PAUSED_FILE"      > /tmp/rm_ap.tmp 2>/dev/null; $BB mv /tmp/rm_ap.tmp "$AUTO_PAUSED_FILE"; }
 
     ok_json "{\"ok\":true,\"mac\":\"$MAC\"}"
 fi
@@ -1333,6 +1344,15 @@ if echo "$QS" | $BB grep -q "action=users_import"; then
         done < "$IMPORT_TMP"
     } > "${USERS_FILE}.tmp"
     _users_file_commit
+    # Imported rows are admin-supplied, never system-auto-paused — strip any
+    # of these MACs out of the auto-pause marker so a stale entry from
+    # before the import can't make AUTO_RESUME_ENABLED fire on them.
+    if [ -f "$AUTO_PAUSED_FILE" ]; then
+        $BB awk -v importf="$IMPORT_TMP" '
+            BEGIN { while ((getline line < importf) > 0) { split(line, a, " "); skip[a[1]] = 1 } }
+            { if (!($1 in skip)) print }
+        ' "$AUTO_PAUSED_FILE" > /tmp/ui_ap.tmp 2>/dev/null && $BB mv /tmp/ui_ap.tmp "$AUTO_PAUSED_FILE"
+    fi
     rm -f "$IMPORT_TMP"
     _unlock
 

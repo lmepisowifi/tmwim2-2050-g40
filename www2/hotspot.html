@@ -222,8 +222,11 @@
                         <div class="field-hint">Idle time before session auto-pauses</div>
                     </div>
                 </div>
-                <!-- Auto-resume on reconnect -->
-                <div class="col-sm-6">
+                <!-- Auto-resume on reconnect (only meaningful — and only shown —
+                     while Auto-Pause Session is on, since it's the only thing
+                     that ever produces a system-paused session for it to act
+                     on; see setAutoPauseUI()) -->
+                <div class="col-sm-6" id="ar-wrap">
                     <div class="d-flex align-items-center justify-content-between">
                         <div style="font-weight:500;">Auto-Resume on Reconnect</div>
                         <div id="ar-toggle" class="wlan-toggle" onclick="toggleAutoResumeUI()" title="Automatically resume a paused session the moment the device reconnects">
@@ -552,8 +555,9 @@ function saveSessionSettings(){
 function setAutoPauseUI(on){
     var tog=document.getElementById('ap-toggle');
     var wrap=document.getElementById('ap-timeout-wrap');
-    if(on){ tog.classList.add('on'); wrap.style.display=''; }
-    else  { tog.classList.remove('on'); wrap.style.display='none'; }
+    var arWrap=document.getElementById('ar-wrap');
+    if(on){ tog.classList.add('on'); wrap.style.display=''; arWrap.style.display=''; }
+    else  { tog.classList.remove('on'); wrap.style.display='none'; arWrap.style.display='none'; }
 }
 function toggleAutoPauseUI(){
     var tog=document.getElementById('ap-toggle');
