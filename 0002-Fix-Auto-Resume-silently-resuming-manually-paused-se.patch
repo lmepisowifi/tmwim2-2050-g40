@@ -1,0 +1,291 @@
+From f10b420b205914f76f55a541466be38d87198a00 Mon Sep 17 00:00:00 2001
+From: Claude <claude@lmepisowifi.local>
+Date: Wed, 9 Sep 2026 01:36:02 +0000
+Subject: [PATCH 2/2] Fix Auto-Resume silently resuming manually-paused
+ sessions
+
+status.sh's auto_resume flag used to go true for ANY paused session
+whenever AUTO_RESUME_ENABLED was on, with no way to tell a
+system/inactivity auto-pause apart from a customer's own Pause Time
+tap or an admin Kick. Since checkStatus() in hotspot/index.html polls
+every ~1-2s and fires doResume(true) the instant auto_resume is true,
+this meant tapping Pause while Auto-Resume was on immediately resumed
+the session again on the very next poll - the Pause Time button was
+effectively broken.
+
+Root cause: the codebase already distinguishes these at the point of
+pausing (logout.sh / hotspot.cgi's Kick both tag their notification
+with reason "Manually"; lmehspt.sh's pause_session() defaults to
+"Automatically"), but that distinction was never persisted anywhere
+status.sh could read it back.
+
+Fix: a new small persistent marker, AUTO_PAUSED_FILE
+(/lmepisowifi/hotspot_data/auto_paused.txt, one MAC per line),
+following the same pattern as coin_bank.txt. Embedding the reason
+directly in the USERS_FILE row was considered and rejected - several
+call sites do fixed-field "read -r mac status remaining total fmt"
+(a 6th field gets silently absorbed into fmt), and the periodic
+users.txt sanitize pass recomputes that field wholesale, so anything
+stashed there would get wiped on the next housekeeping cycle.
+
+  - Set only in pause_session(), lmehspt.sh's sole system-auto-pause
+    call site, gated on reason="Automatically"
+  - Cleared at every manual-pause site (admin Kick, customer Pause
+    Time via logout.sh, admin bulk users_import) and every
+    resume/removal site (login.sh's resume handler, coin top-up
+    while paused via coin_result.sh, admin remove_user)
+  - status.sh's auto_resume now requires the toggle on AND this
+    specific MAC actually being in the marker file
+
+No changes needed in hotspot/index.html - checkStatus()/doResume()
+already just trust whatever auto_resume says; they were never the
+bug.
+
+Also ties Auto-Resume to Auto-Pause, since the former can now only
+ever fire on a pause the latter caused:
+  - status.sh additionally requires AUTO_PAUSE_ENABLED=1
+  - www2/hotspot.html hides the whole Auto-Resume toggle row whenever
+    Auto-Pause Session is off (setAutoPauseUI(), mirroring how it
+    already hides the inactivity-timeout field)
+---
+ hotspot/cgi-bin/coin_result.sh |  6 ++++++
+ hotspot/cgi-bin/login.sh       |  8 ++++++++
+ hotspot/cgi-bin/logout.sh      |  7 +++++++
+ hotspot/cgi-bin/status.sh      | 19 ++++++++++++++++++-
+ lmehspt.sh                     | 17 +++++++++++++++++
+ www2/cgi-bin/hotspot.cgi       | 20 ++++++++++++++++++++
+ www2/hotspot.html              | 12 ++++++++----
+ 7 files changed, 84 insertions(+), 5 deletions(-)
+
+diff --git a/hotspot/cgi-bin/coin_result.sh b/hotspot/cgi-bin/coin_result.sh
+index 01f2bfc..684164c 100755
+--- a/hotspot/cgi-bin/coin_result.sh
++++ b/hotspot/cgi-bin/coin_result.sh
+@@ -66,6 +66,10 @@ _clear_pending() { rm -f "${COIN_PENDING_DIR}/${1}" "${COIN_PENDING_DIR}/${1}.tm
+ # reconnects by macfix.sh's mf_reconcile() (MACFIX_BANK_FILE — same physical
+ # file, path duplicated there the same way USERS_FILE's path already is).
+ COIN_BANK_FILE="/lmepisowifi/hotspot_data/coin_bank.txt"
++# See lmehspt.sh's AUTO_PAUSED_FILE comment — cleared below whenever a
++# top-up stacks coin time onto a paused session, since that session is no
++# longer paused (whatever originally paused it no longer applies).
++AUTO_PAUSED_FILE="/lmepisowifi/hotspot_data/auto_paused.txt"
+ 
+ # Currently banked pesos for $1 (a MAC) — empty if none. Call inside _lock.
+ _bank_get() {
+@@ -444,6 +448,8 @@ if [ "${MINUTES:-0}" -gt 0 ]; then
+         printf '%s active %s %s %s\n' "$CLIENT_MAC" "$N_REMAIN" "$NEW_TOTAL" "$(_fmt_secs "$N_REMAIN")" >> "${USERS_FILE}.tmp"
+         _users_file_commit
+     fi
++    # No longer paused if it was — see AUTO_PAUSED_FILE's declaration above.
++    [ -f "$AUTO_PAUSED_FILE" ] && { grep -vx "$CLIENT_MAC" "$AUTO_PAUSED_FILE" > /tmp/coin_ap.tmp 2>/dev/null; mv /tmp/coin_ap.tmp "$AUTO_PAUSED_FILE"; }
+ fi
+ _unlock
+ 
+diff --git a/hotspot/cgi-bin/login.sh b/hotspot/cgi-bin/login.sh
+index 9ec6bf5..eebdd8d 100755
+--- a/hotspot/cgi-bin/login.sh
++++ b/hotspot/cgi-bin/login.sh
+@@ -16,6 +16,10 @@ BB="busybox"
+ SESSION_FILE="/tmp/active_sessions.txt"
+ USERS_FILE="/lmepisowifi/hotspot_data/users.txt"
+ VOUCHER_FILE="/lmepisowifi/hotspot_data/vouchers.txt"
++# See lmehspt.sh's AUTO_PAUSED_FILE comment — cleared below once a paused
++# session becomes active again (resume, or a voucher stacked onto one),
++# since whatever it recorded no longer describes anything currently paused.
++AUTO_PAUSED_FILE="/lmepisowifi/hotspot_data/auto_paused.txt"
+ 
+ # Customizable Telegram/Discord message templates
+ [ -f /lmepisowifi/hotspot/notify_templates.sh ] && . /lmepisowifi/hotspot/notify_templates.sh
+@@ -400,6 +404,10 @@ if _users_file_stage_excl "$CLIENT_MAC"; then
+     $BB echo "$CLIENT_MAC active $REMAINING_SECS $NEW_TOTAL $(_fmt_secs "$REMAINING_SECS")" >> "${USERS_FILE}.tmp"
+     _users_file_commit
+ fi
++# No longer paused (resumed, or a voucher just stacked onto a paused
++# balance) — drop the auto-pause marker so a later manual pause doesn't
++# inherit a stale "system paused this" flag from before.
++[ -f "$AUTO_PAUSED_FILE" ] && { $BB grep -vx "$CLIENT_MAC" "$AUTO_PAUSED_FILE" > /tmp/login_ap.tmp 2>/dev/null; $BB mv /tmp/login_ap.tmp "$AUTO_PAUSED_FILE"; }
+ 
+ if [ "$NEED_FW_RULES" = "true" ]; then
+     iptables -t nat -I HOTSPOT 1 -m mac --mac-source "$CLIENT_MAC" -j RETURN 2>/dev/null
+diff --git a/hotspot/cgi-bin/logout.sh b/hotspot/cgi-bin/logout.sh
+index 0b80dae..cc2224a 100755
+--- a/hotspot/cgi-bin/logout.sh
++++ b/hotspot/cgi-bin/logout.sh
+@@ -15,6 +15,9 @@
+ BB="busybox"
+ SESSION_FILE="/tmp/active_sessions.txt"
+ USERS_FILE="/lmepisowifi/hotspot_data/users.txt"
++# See lmehspt.sh's AUTO_PAUSED_FILE comment — this file's own pause below is
++# always MANUAL (the customer tapped Pause), so it's cleared, never set.
++AUTO_PAUSED_FILE="/lmepisowifi/hotspot_data/auto_paused.txt"
+ 
+ # Notification templates (for the "session paused" alert). Sourcing is
+ # harmless if the file is missing — tpl_render just won't be defined and
+@@ -181,6 +184,10 @@ if _users_file_stage_excl "$CLIENT_MAC"; then
+     fi
+     _users_file_commit
+ fi
++# This pause is always MANUAL (the customer tapped Pause) — drop any stale
++# "system auto-paused this MAC" marker so AUTO_RESUME_ENABLED can't
++# silently resume it (see lmehspt.sh's AUTO_PAUSED_FILE comment).
++[ -f "$AUTO_PAUSED_FILE" ] && { $BB grep -vx "$CLIENT_MAC" "$AUTO_PAUSED_FILE" > /tmp/logout_ap.tmp 2>/dev/null; $BB mv /tmp/logout_ap.tmp "$AUTO_PAUSED_FILE"; }
+ 
+ iptables -t nat -D HOTSPOT -m mac --mac-source "$CLIENT_MAC" -j RETURN 2>/dev/null
+ iptables -t filter -D HOTSPOT_FWD -m mac --mac-source "$CLIENT_MAC" -j ACCEPT 2>/dev/null
+diff --git a/hotspot/cgi-bin/status.sh b/hotspot/cgi-bin/status.sh
+index 9cfa652..f4008e2 100755
+--- a/hotspot/cgi-bin/status.sh
++++ b/hotspot/cgi-bin/status.sh
+@@ -16,6 +16,9 @@ BB="busybox"
+ SESSION_FILE="/tmp/active_sessions.txt"
+ USERS_FILE="/lmepisowifi/hotspot_data/users.txt"
+ COIN_BANK_FILE="/lmepisowifi/hotspot_data/coin_bank.txt"
++# See lmehspt.sh's AUTO_PAUSED_FILE comment — read-only here, used below to
++# scope auto_resume to sessions the system itself paused.
++AUTO_PAUSED_FILE="/lmepisowifi/hotspot_data/auto_paused.txt"
+ HOTSPOT_BR="br1"
+ 
+ # Live-updatable toggles (MAC_RANDOMIZATION_FIX among them) written by
+@@ -161,7 +164,21 @@ if [ -n "$PAUSED" ]; then
+     # button sends, on this same status poll — no tap needed. login.sh
+     # still does the actual resume, so this flag never bypasses its
+     # locking/atomic-write path, just who clicks the button.
+-    AR_BOOL="false"; [ "${AUTO_RESUME_ENABLED:-0}" = "1" ] && AR_BOOL="true"
++    #
++    # Gated three ways so this can only ever fire for a session the SYSTEM
++    # itself paused (lmehspt.sh's inactivity watchdog) — never one the
++    # customer paused with their own Pause Time tap, or an admin paused
++    # with Kick: (1) the admin's Auto-Resume toggle, (2) Auto-Resume is
++    # tied to Auto-Pause being on too — Auto-Resume only ever makes sense
++    # for pauses Auto-Pause itself causes, and www2/hotspot.html hides the
++    # toggle whenever Auto-Pause is off to match, (3) this exact MAC is
++    # listed in AUTO_PAUSED_FILE, written only by lmehspt.sh's
++    # pause_session() and cleared by every manual-pause/resume/removal
++    # code path — see that file's AUTO_PAUSED_FILE comment.
++    AR_BOOL="false"
++    if [ "${AUTO_RESUME_ENABLED:-0}" = "1" ] && [ "${AUTO_PAUSE_ENABLED:-1}" = "1" ]; then
++        [ -f "$AUTO_PAUSED_FILE" ] && $BB grep -qx "$CLIENT_MAC" "$AUTO_PAUSED_FILE" 2>/dev/null && AR_BOOL="true"
++    fi
+     $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"has_paused\":true,\"remaining\":$REMAINING,\"total\":$TOTAL,\"auto_resume\":$AR_BOOL,\"reload_after_time_added\":$RELOAD_BOOL,${CONN_JSON}${AVAIL_JSON}}"
+ else
+     $BB echo "{\"logged_in\":false,\"mac\":\"$CLIENT_MAC\",\"ip\":\"$CLIENT_IP\",\"reload_after_time_added\":$RELOAD_BOOL,${CONN_JSON}${AVAIL_JSON}}"
+diff --git a/lmehspt.sh b/lmehspt.sh
+index bbccbe3..a076cf5 100755
+--- a/lmehspt.sh
++++ b/lmehspt.sh
+@@ -28,6 +28,14 @@ DHCP_DNS="1.1.1.1"  # space-separated DNS servers pushed to clients (udhcpd "opt
+ WWW2_PORT="8080"   # busybox httpd -h /lmepisowifi/www2 -p 8080 (admin UI). /admin on the portal redirects here.
+ SESSION_FILE="/tmp/active_sessions.txt"
+ USERS_FILE="/lmepisowifi/hotspot_data/users.txt"
++# One MAC per line: whoever's CURRENT paused entry in USERS_FILE was paused
++# by check_inactivity()'s watchdog (system/automatic), as opposed to a
++# customer's own Pause Time tap or an admin Kick (both manual). Consulted
++# by status.sh so AUTO_RESUME_ENABLED only ever auto-resumes a session the
++# system itself paused - see pause_session()'s reason param below, and the
++# "manual pause" write sites in logout.sh / hotspot.cgi (kick, users_import)
++# that clear a MAC's line here instead of adding one.
++AUTO_PAUSED_FILE="/lmepisowifi/hotspot_data/auto_paused.txt"
+ # Two alternating backup generations (refreshed every 5 min, see
+ # backup_users_file) rather than one — so a crash mid-write to one
+ # generation still leaves the other, already-durable, copy intact.
+@@ -1387,6 +1395,15 @@ pause_session() {
+     if _users_file_stage_excl "$mac"; then
+         echo "$mac paused $remaining $total $(_fmt_secs "$remaining")" >> "${USERS_FILE}.tmp"
+         _users_file_commit
++        # Only check_inactivity() ever calls pause_session() without a
++        # $reason, so this is the sole "the system paused this, not the
++        # customer/admin" call site - see AUTO_PAUSED_FILE's declaration.
++        if [ "$reason" = "Automatically" ]; then
++            touch "$AUTO_PAUSED_FILE"
++            $BB grep -vx "$mac" "$AUTO_PAUSED_FILE" > "${AUTO_PAUSED_FILE}.tmp" 2>/dev/null
++            echo "$mac" >> "${AUTO_PAUSED_FILE}.tmp"
++            $BB mv "${AUTO_PAUSED_FILE}.tmp" "$AUTO_PAUSED_FILE"
++        fi
+     fi
+     _unlock
+ 
+diff --git a/www2/cgi-bin/hotspot.cgi b/www2/cgi-bin/hotspot.cgi
+index 1bf40d8..9f91217 100755
+--- a/www2/cgi-bin/hotspot.cgi
++++ b/www2/cgi-bin/hotspot.cgi
+@@ -66,6 +66,12 @@ HDATA="/lmepisowifi/hotspot_data"
+ SESSION_DATA="/tmp/active_sessions.txt"
+ USERS_FILE="$HDATA/users.txt"
+ WHITELIST_FILE="$HDATA/whitelist.txt"
++# One MAC per line: whoever's CURRENT paused USERS_FILE entry was paused by
++# lmehspt.sh's inactivity watchdog (system/automatic) rather than an admin
++# Kick or a customer's own Pause Time tap (both manual) — see
++# pause_session()'s comment in lmehspt.sh for the full explanation. Kick and
++# users_import below clear a MAC's line here since both are manual pauses.
++AUTO_PAUSED_FILE="$HDATA/auto_paused.txt"
+ # Below-minimum-tier coin balances banked per-MAC by coin_result.sh — see
+ # that file's COIN_BANK_FILE comment for the full explanation.
+ COIN_BANK_FILE="$HDATA/coin_bank.txt"
+@@ -960,6 +966,10 @@ if echo "$QS" | $BB grep -q "action=kick"; then
+             [ "$REM" -gt 0 ] && echo "$MAC paused $REM $K_TOT $(_fmt_secs "$REM")" >> "${USERS_FILE}.tmp"
+             _users_file_commit
+         fi
++        # Kick is a MANUAL pause (see the notify template's reason below) —
++        # drop any stale "system auto-paused this MAC" marker so
++        # AUTO_RESUME_ENABLED can't silently resume it.
++        [ -f "$AUTO_PAUSED_FILE" ] && { $BB grep -vx "$MAC" "$AUTO_PAUSED_FILE" > /tmp/kick_ap.tmp 2>/dev/null; $BB mv /tmp/kick_ap.tmp "$AUTO_PAUSED_FILE"; }
+         PAUSED="true"
+     fi
+     _unlock
+@@ -1206,6 +1216,7 @@ if echo "$QS" | $BB grep -q "action=remove_user"; then
+     [ -f "$RM_ACTIVITY" ]         && { $BB grep -v "^$MAC " "$RM_ACTIVITY"         > /tmp/rm_a.tmp 2>/dev/null; $BB mv /tmp/rm_a.tmp "$RM_ACTIVITY"; }
+     [ -f /tmp/hotspot_ip_map.txt ] && { $BB grep -v "^$MAC " /tmp/hotspot_ip_map.txt > /tmp/rm_i.tmp;           $BB mv /tmp/rm_i.tmp /tmp/hotspot_ip_map.txt; }
+     [ -f "$COIN_BANK_FILE" ]       && { $BB grep -v "^$MAC " "$COIN_BANK_FILE"       > /tmp/rm_b.tmp 2>/dev/null; $BB mv /tmp/rm_b.tmp "$COIN_BANK_FILE"; }
++    [ -f "$AUTO_PAUSED_FILE" ]     && { $BB grep -vx "$MAC" "$AUTO_PAUSED_FILE"      > /tmp/rm_ap.tmp 2>/dev/null; $BB mv /tmp/rm_ap.tmp "$AUTO_PAUSED_FILE"; }
+ 
+     ok_json "{\"ok\":true,\"mac\":\"$MAC\"}"
+ fi
+@@ -1333,6 +1344,15 @@ if echo "$QS" | $BB grep -q "action=users_import"; then
+         done < "$IMPORT_TMP"
+     } > "${USERS_FILE}.tmp"
+     _users_file_commit
++    # Imported rows are admin-supplied, never system-auto-paused — strip any
++    # of these MACs out of the auto-pause marker so a stale entry from
++    # before the import can't make AUTO_RESUME_ENABLED fire on them.
++    if [ -f "$AUTO_PAUSED_FILE" ]; then
++        $BB awk -v importf="$IMPORT_TMP" '
++            BEGIN { while ((getline line < importf) > 0) { split(line, a, " "); skip[a[1]] = 1 } }
++            { if (!($1 in skip)) print }
++        ' "$AUTO_PAUSED_FILE" > /tmp/ui_ap.tmp 2>/dev/null && $BB mv /tmp/ui_ap.tmp "$AUTO_PAUSED_FILE"
++    fi
+     rm -f "$IMPORT_TMP"
+     _unlock
+ 
+diff --git a/www2/hotspot.html b/www2/hotspot.html
+index 959b21a..aed38ed 100644
+--- a/www2/hotspot.html
++++ b/www2/hotspot.html
+@@ -222,8 +222,11 @@
+                         <div class="field-hint">Idle time before session auto-pauses</div>
+                     </div>
+                 </div>
+-                <!-- Auto-resume on reconnect -->
+-                <div class="col-sm-6">
++                <!-- Auto-resume on reconnect (only meaningful — and only shown —
++                     while Auto-Pause Session is on, since it's the only thing
++                     that ever produces a system-paused session for it to act
++                     on; see setAutoPauseUI()) -->
++                <div class="col-sm-6" id="ar-wrap">
+                     <div class="d-flex align-items-center justify-content-between">
+                         <div style="font-weight:500;">Auto-Resume on Reconnect</div>
+                         <div id="ar-toggle" class="wlan-toggle" onclick="toggleAutoResumeUI()" title="Automatically resume a paused session the moment the device reconnects">
+@@ -552,8 +555,9 @@ function saveSessionSettings(){
+ function setAutoPauseUI(on){
+     var tog=document.getElementById('ap-toggle');
+     var wrap=document.getElementById('ap-timeout-wrap');
+-    if(on){ tog.classList.add('on'); wrap.style.display=''; }
+-    else  { tog.classList.remove('on'); wrap.style.display='none'; }
++    var arWrap=document.getElementById('ar-wrap');
++    if(on){ tog.classList.add('on'); wrap.style.display=''; arWrap.style.display=''; }
++    else  { tog.classList.remove('on'); wrap.style.display='none'; arWrap.style.display='none'; }
+ }
+ function toggleAutoPauseUI(){
+     var tog=document.getElementById('ap-toggle');
+-- 
+2.43.0
+
