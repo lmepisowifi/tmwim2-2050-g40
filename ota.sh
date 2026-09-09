@@ -161,6 +161,14 @@ cdnify() { # cdnify <url> -> prints CDN url (or the original url unchanged)
 }
 
 # wget wrapper: HTTPS-only, retries, timeouts, writable -O target, cert handling.
+# Backgrounded + progress-polled: some ISPs black-hole (rather than refuse)
+# traffic to specific GitHub-adjacent hosts — e.g. release-assets.
+# githubusercontent.com, the Fastly-anycast host GitHub Release downloads
+# redirect through — and DNS/TCP hangs there aren't always bound cleanly by
+# -T/-t alone. This kills only on a genuine stall (output file not growing
+# for 60s), so a slow-but-working transfer on a bad link still completes.
+# sleep/kill/wait are already used elsewhere in this script, so this adds
+# no new tool dependency.
 fetch() { # fetch <url> <outfile>
     _u=$(cdnify "$1")
     _wf="--https-only -t 3 -T 30 --retry-connrefused -U lmepisowifi-ota"
@@ -169,7 +177,40 @@ fetch() { # fetch <url> <outfile>
     else
         _wf="$_wf --no-check-certificate"
     fi
-    wget $_wf -q -O "$2" "$_u"
+    mkdir -p "$(dirname "$2")" 2>/dev/null
+    : > "$2" 2>/dev/null
+    wget $_wf -q -O "$2" "$_u" &
+    _fw_pid=$!
+    # Stall watch runs as its own background process so the common case
+    # (wget finishes on its own) is a plain blocking `wait` below with no
+    # added latency — this used to poll in the foreground with a flat 5s
+    # floor on every call, which is not what we want. This process just
+    # kills wget after 60s of no growth in the output file; it never
+    # touches fetch()'s own return value.
+    ( _fw_stall=0; _fw_last=-1
+      while kill -0 "$_fw_pid" 2>/dev/null; do
+          sleep 5
+          kill -0 "$_fw_pid" 2>/dev/null || exit 0
+          _fw_now=$(wc -c < "$2" 2>/dev/null); _fw_now=${_fw_now:-0}
+          if [ "$_fw_now" = "$_fw_last" ]; then
+              _fw_stall=$((_fw_stall + 5))
+          else
+              _fw_stall=0
+          fi
+          _fw_last="$_fw_now"
+          if [ "$_fw_stall" -ge 60 ]; then
+              kill -9 "$_fw_pid" 2>/dev/null
+              log "fetch: killed stalled wget (no progress 60s) — $_u"
+              exit 0
+          fi
+      done
+    ) &
+    _fw_watch=$!
+    wait "$_fw_pid"
+    _fw_rc=$?
+    kill "$_fw_watch" 2>/dev/null
+    wait "$_fw_watch" 2>/dev/null
+    return $_fw_rc
 }
 
 # Ensure hotspot/img/favicon.ico exists, fetching the repo's default from
@@ -282,6 +323,19 @@ ensure_tailscale_www2() {
 # parse a key=value line from the manifest (strips CR)
 mval() { sed -n "s/^$1=//p" "$DL/manifest.txt" | tr -d '\r' | head -1; }
 
+# SECURITY: pin a download url to our own repo. Accepts either a GitHub
+# Release asset or a jsDelivr-served file from the same repo tree
+# (cdn.jsdelivr.net/gh/OWNER/REPO@...). Shared by do_apply() for both the
+# primary url and the optional url_mirror, so the two allowlists can't
+# drift apart.
+_url_ok() {
+    case "$1" in
+        "https://github.com/$OTA_REPO/releases/download/"*) return 0 ;;
+        "https://cdn.jsdelivr.net/gh/$OTA_REPO@"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # strictly-newer compare using dotted numeric fields: ver_gt A B  -> true if A>B
 ver_gt() {
     _a="$1"; _b="$2"
@@ -370,26 +424,37 @@ do_apply() {
         set_status "failed"; log "ERROR: cannot fetch manifest"; return 1
     fi
     _lat=$(mval version); _url=$(mval url); _sum=$(mval sha256); _notes=$(mval notes)
+    _murl=$(mval url_mirror)
     [ -n "$_want" ] && [ "$_want" != "$_lat" ] && {
         log "NOTE: requested $_want but manifest latest is $_lat — installing manifest version"
     }
     if [ -z "$_lat" ] || [ -z "$_url" ] || [ -z "$_sum" ]; then
         set_status "failed"; log "ERROR: manifest incomplete (need version/url/sha256)"; return 1
     fi
-
-    # SECURITY: pin the download to our own repo. Accept both a GitHub Release
-    # asset and a jsDelivr-served file from the same repo tree
-    # (cdn.jsdelivr.net/gh/OWNER/REPO@...), so tarballs can be moved onto the CDN
-    # later without touching this guard. The manifest sha256 is verified below
-    # regardless of source, so a tampered download is always rejected.
-    case "$_url" in
-        "https://github.com/$OTA_REPO/releases/download/"*) : ;;
-        "https://cdn.jsdelivr.net/gh/$OTA_REPO@"*) : ;;
-        *) set_status "failed"; log "ERROR: refusing url outside repo (Releases or jsDelivr): $_url"; return 1 ;;
-    esac
+    if ! _url_ok "$_url"; then
+        set_status "failed"; log "ERROR: refusing url outside repo (Releases or jsDelivr): $_url"; return 1
+    fi
 
     set_status "downloading"; log "downloading $_lat"
-    if ! fetch "$_url" "$DL/bundle.tar.gz"; then
+    # Prefer the jsDelivr mirror when the manifest publishes one (url_mirror
+    # is optional — older manifests simply don't have it, and mval() returns
+    # empty, so this block is skipped entirely and behaviour is unchanged).
+    # It's the same CDN path already relied on for manifest/favicon/
+    # module_ctl.sh, and it sidesteps ISPs that black-hole the
+    # release-assets.githubusercontent.com (Fastly) range that plain GitHub
+    # Release downloads redirect through. Any failure — 404, unwarmed cache,
+    # oversized file — falls straight back to the direct Release url below,
+    # so nothing regresses when the mirror isn't available or isn't helping.
+    _dl_ok=1
+    if [ -n "$_murl" ] && _url_ok "$_murl"; then
+        log "downloading via jsDelivr mirror"
+        if fetch "$_murl" "$DL/bundle.tar.gz"; then
+            _dl_ok=0
+        else
+            log "mirror download failed — falling back to $_url"
+        fi
+    fi
+    if [ "$_dl_ok" -ne 0 ] && ! fetch "$_url" "$DL/bundle.tar.gz"; then
         set_status "failed"; log "ERROR: download failed"; notify "OTA: download of $_lat failed"; return 1
     fi
 
