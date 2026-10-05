@@ -40,7 +40,7 @@
 #
 # Live apply: `mib set` + `mib commit` only persist the record. The vendor page
 # then runs deleteConnection()/restartWAN() inside boa; both are exported by
-# libmib.so, and tool/wanapply (source: src/wanapply/) calls them from its own
+# libmib.so, and sh/wanapply (source: src/wanapply/) calls them from its own
 # process the way the stock `cli` does. Order matches boa's modify path:
 #     wanapply stop  <idx>   old record -> tear down nas0_N / ppp / dhcp / NAT
 #     mib set ... ; mib commit
@@ -48,7 +48,7 @@
 # `start` runs detached; the page polls ?action=list ("applying") until done.
 # restartWAN() flushes the whole netfilter state (iptables -F, ebtables -F, nat
 # built-in chains), so reassert_rules() puts back the rules this project owns.
-# If tool/wanapply is missing or `wanapply check` fails, the old behaviour is
+# If sh/wanapply is missing or `wanapply check` fails, the old behaviour is
 # kept: the record is saved and takes effect after a reboot.
 # A rolling copy of /config/config.xml is kept at
 # /config/config.xml.wanprofile.bak before each save; it can be restored from
@@ -444,18 +444,31 @@ alloc_ppp() {
     return 1
 }
 
-# next_wan_mac — ELAN_MAC_ADDR + (WAN_MAC_BASE + vc), colon-separated
+# next_wan_mac <vc> — 12 hex digits (no colons), same form boa stores in MacAddr.
+# Source: ELAN_MAC_ADDR (fallback HW_NIC0_ADDR). Last 3 bytes += WAN_MAC_BASE+vc.
 next_wan_mac() {
     _vc=$1
-    _raw=$(mib get ELAN_MAC_ADDR 2>/dev/null | $BB sed -n 's/.*=[[:space:]]*//p' | $BB head -1 | $BB tr -d ' \r\n:-' | $BB tr 'a-f' 'A-F')
-    [ "${#_raw}" -eq 12 ] || { printf '00:00:00:00:00:00'; return; }
-    # last three bytes as integer, add offset
-    _hi=$(printf '%s' "$_raw" | $BB cut -c1-6)
-    _lo=$(printf '%s' "$_raw" | $BB cut -c7-12)
-    _n=$(printf '%d' "0x$_lo")
+    _hex=
+    for _key in ELAN_MAC_ADDR HW_NIC0_ADDR HW_ELAN_MAC_ADDR; do
+        _line=$(mib get "$_key" 2>/dev/null | $BB head -1)
+        _cand=$(printf '%s' "$_line" | $BB sed 's/^[^=]*=[[:space:]]*//' | $BB tr -d ' \t\r\n:-' | $BB tr 'a-f' 'A-F')
+        if [ "${#_cand}" -eq 12 ]; then _hex=$_cand; break; fi
+    done
+    if [ "${#_hex}" -ne 12 ]; then
+        # last resort: take MAC of br0 / eth0
+        _cand=$(cat /sys/class/net/br0/address 2>/dev/null || cat /sys/class/net/eth0/address 2>/dev/null || true)
+        _cand=$(printf '%s' "$_cand" | $BB tr -d ' \t\r\n:-' | $BB tr 'a-f' 'A-F')
+        [ "${#_cand}" -eq 12 ] && _hex=$_cand
+    fi
+    if [ "${#_hex}" -ne 12 ]; then
+        printf '000000000000'
+        return
+    fi
+    _hi=$(printf '%s' "$_hex" | $BB cut -c1-6)
+    _lo=$(printf '%s' "$_hex" | $BB cut -c7-12)
+    _n=$(printf '%d' "0x$_lo" 2>/dev/null) || _n=0
     _n=$((_n + WAN_MAC_BASE + _vc))
-    _lo=$(printf '%06X' $((_n & 0xffffff)))
-    printf '%s' "$_hi$_lo" | $BB sed 's/\(..\)/\1:/g; s/:$//'
+    printf '%s%06X' "$_hi" $((_n & 0xffffff))
 }
 
 # ================================================================
@@ -520,6 +533,12 @@ if [ "$ACTION" = "create" ]; then
     # TO_IFINDEX(MEDIA_ETH, ppp, vc)
     NEW_IFINDEX=$(( (MEDIA_ETH << 16) | (PPP << 8) | VC ))
     NEW_MAC=$(next_wan_mac "$VC")
+    case "$NEW_MAC" in
+        ''|000000000000|900000000000)
+            # 90:00:00:00:00:00 style means ELAN parse failed earlier builds
+            err_json "bad_mac" "could not derive a WAN MAC from ELAN_MAC_ADDR (got '$NEW_MAC')"
+            ;;
+    esac
 
     # Defaults
     NEW_ENABLE=$(fget enable); [ -z "$NEW_ENABLE" ] && NEW_ENABLE=1
@@ -603,6 +622,21 @@ if [ "$ACTION" = "create" ]; then
     [ "$NEW_VLAN" = "1" ] && set_or_fail vprio "$NEW_VPRIO"
     set_or_fail applicationtype "$NEW_APP"
     set_or_fail WanName        "$NEW_NAME"
+    ITFG=$(fget itfgroup)
+    case "$ITFG" in ''|*[!0-9]*) ITFG=0 ;; esac
+    ITFG=$(( ITFG & 16383 ))
+    set_or_fail itfGroup "$ITFG"
+
+
+    # Match boa multi_wan defaults that restartWAN/startConnection expect
+    # IpProtocol: 1 = IPv4 (0 leaves the stack unconfigured on some builds)
+    set_or_fail IpProtocol 1
+    # BridgeType: boa IPoE uses 2; bridge mode uses 0
+    if [ "$NEW_CMODE" = "0" ]; then
+        set_or_fail BridgeType 0
+    else
+        set_or_fail BridgeType 2
+    fi
 
     if [ "$NEW_CMODE" = "1" ]; then
         set_or_fail ChannelAddrType "$NEW_ADDRTYPE"
@@ -618,8 +652,22 @@ if [ "$ACTION" = "create" ]; then
             DNS1=$(fget dns1); DNS2=$(fget dns2)
             [ -n "$DNS1" ] && is_ipv4 "$DNS1" && set_or_fail DNSV4IPAddr1 "$DNS1"
             [ -n "$DNS2" ] && is_ipv4 "$DNS2" && set_or_fail DNSV4IPAddr2 "$DNS2"
+            set_or_fail DNSMode 0
+        else
+            # DHCP IPoE — boa sets DNSMode=1 (obtain automatically)
             set_or_fail DNSMode 1
+            set_or_fail LocalIPAddr  0.0.0.0
+            set_or_fail RemoteIPAddr 0.0.0.0
+            set_or_fail SubnetMask   0.0.0.0
         fi
+    fi
+
+    if [ "$NEW_CMODE" = "0" ]; then
+        # pure bridge: no NAPT / dgw / DHCP client
+        set_or_fail NAPT 0
+        set_or_fail DefaultGW 0
+        set_or_fail ChannelAddrType 0
+        set_or_fail DNSMode 0
     fi
 
     if [ "$NEW_CMODE" = "2" ]; then
@@ -635,6 +683,24 @@ if [ "$ACTION" = "create" ]; then
     if ! mib commit >/dev/null 2>&1; then
         mib del "$CHAIN.$NEW_IDX" >/dev/null 2>&1
         err_json "commit_failed" "mib commit failed; create rolled back"
+    fi
+    # Exclusive port membership: clear ITFG bits from other rows
+    if [ "${ITFG:-0}" -ne 0 ]; then
+        _t=$(chain_total); case "$_t" in ''|*[!0-9]*) _t=0 ;; esac
+        _j=0
+        while [ "$_j" -lt "$_t" ]; do
+            if [ "$_j" -ne "$NEW_IDX" ]; then
+                _od=$(chain_dump "$_j")
+                _og=$(fld "$_od" itfGroup)
+                case "$_og" in ''|*[!0-9]*) _og=0 ;; esac
+                _ng=$(( _og & ~ITFG ))
+                if [ "$_ng" -ne "$_og" ]; then
+                    mib set "$CHAIN.$_j.itfGroup" "$_ng" >/dev/null 2>&1 || true
+                fi
+            fi
+            _j=$((_j+1))
+        done
+        mib commit >/dev/null 2>&1 || true
     fi
     sync
 
@@ -730,6 +796,21 @@ V=$(fget app)
 if [ -n "$V" ]; then
     is_uint "$V" 1 15 || err_json "bad_app" "pick at least one service type"
     addp applicationtype $(( (CUR_APP & ~15) | V ))
+fi
+
+# ── port binding (itfGroup bitmask) ───────────────────────────────────────────
+# Bits: 0-3 LAN1-4, 4 wlan0, 5-8 wlan0-vap0..3, 9 wlan1, 10-13 wlan1-vap0..3
+V=$(fget itfgroup)
+if [ -n "$V" ]; then
+    case "$V" in ''|*[!0-9]*) err_json "bad_itfgroup" "itfgroup must be a non-negative integer" ;; esac
+    # clamp to 14 bits
+    V=$(( V & 16383 ))
+    addp itfGroup "$V"
+    # A physical port belongs to at most one profile: clear these bits elsewhere.
+    # Queued as direct mib sets after the main PAIRS loop so we don't require
+    # them to be in this profile's DUMP "has" check.
+    ITFGROUP_NEW=$V
+    ITFGROUP_CLEAR=1
 fi
 
 # ── NAPT / QoS / IGMP / MLD ──────────────────────────────────────────────────
@@ -894,6 +975,24 @@ if [ -n "$FAILED" ]; then
     done < "$UNDO"
     [ "$STOPPED" = "1" ] && start_detached "$IDX"   # bring the old profile back up
     err_json "set_failed" "the device rejected $FAILED; nothing was saved"
+fi
+
+# Clear bound ports from other ATM_VC_TBL rows (exclusive membership)
+if [ "${ITFGROUP_CLEAR:-0}" = "1" ] && [ -n "${ITFGROUP_NEW:-}" ]; then
+    _t=$(chain_total); case "$_t" in ''|*[!0-9]*) _t=0 ;; esac
+    _j=0
+    while [ "$_j" -lt "$_t" ]; do
+        if [ "$_j" -ne "$IDX" ]; then
+            _od=$(chain_dump "$_j")
+            _og=$(fld "$_od" itfGroup)
+            case "$_og" in ''|*[!0-9]*) _og=0 ;; esac
+            _ng=$(( _og & ~ITFGROUP_NEW ))
+            if [ "$_ng" -ne "$_og" ]; then
+                mib set "$CHAIN.$_j.itfGroup" "$_ng" >/dev/null 2>&1 || true
+            fi
+        fi
+        _j=$((_j+1))
+    done
 fi
 
 if ! mib commit >/dev/null 2>&1; then
