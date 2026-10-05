@@ -1,14 +1,14 @@
 # modules.txt — installable www2 modules (written by release CI)
 id=hotspot
 name=Hotspot / Piso-Wifi
-version=1.5.62
-url=https://github.com/lmepisowifi/tmwim2-2050-g40/releases/download/v1.5.62/lmepisowifi-hotspot-1.5.62.tar.gz
-sha256=6ea445bf890c7ea555d734c242749882f8d69537f634bf0e660b1efb9d76d556
+version=1.5.63
+url=https://github.com/lmepisowifi/tmwim2-2050-g40/releases/download/v1.5.63/lmepisowifi-hotspot-1.5.63.tar.gz
+sha256=96bd7253dc55bc3a933a9dd5e629ab7e31882fb9e3cf99d92607a2beaadeec8d
 description=Captive portal, coin acceptor (NodeMCU), vouchers, WiFi rates, DHCP settings and QoS.
 
 id=tailscale
 name=Tailscale VPN
-version=1.5.62
-url=https://github.com/lmepisowifi/tmwim2-2050-g40/releases/download/v1.5.62/lmepisowifi-tailscale-1.5.62.tar.gz
-sha256=cf951f60e8b24c3408c99bc1bee7bb0aba5bcee03f10493efc9a2b41fbb31a02
+version=1.5.63
+url=https://github.com/lmepisowifi/tmwim2-2050-g40/releases/download/v1.5.63/lmepisowifi-tailscale-1.5.63.tar.gz
+sha256=936fb00b80a1aeab6c3c186b4452364ad53227d49d4f0f51d669f272fe0c69c5
 description=Tailscale VPN in userspace mode — advertise subnet routes and Tailscale SSH; configure on the www2 Tailscale page.
