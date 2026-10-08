@@ -234,10 +234,10 @@ static void report_deps(void)
 }
 
 /* "check": also show the MBSSIB chains, if this libmib exports the lookups.
- * Informational only - chain names are per radio (WLAN0_/WLAN1_MBSSIB_TBL). */
+ * Informational only - chain names are per radio (5 GHz = WLAN_MBSSIB_TBL, 2.4 GHz = WLAN1_MBSSIB_TBL). */
 static void report_chains(void)
 {
-    static const char *const names[] = { "WLAN0_MBSSIB_TBL", "WLAN1_MBSSIB_TBL", NULL };
+    static const char *const names[] = { "WLAN_MBSSIB_TBL", "WLAN1_MBSSIB_TBL", NULL };
     int i;
 
     if (!p_info_name || !p_total) {

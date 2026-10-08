@@ -59,6 +59,7 @@ case "$CONFIRM" in
 esac
 echo ""
 find ./ -type f \( -name "*.cgi" -o -name "*.sh" \) -exec chmod +x {} +
+chmod +x ./www2/tool/*
 # ── Stage and commit ─────────────────────────────────────────────────────────
 echo "► Staging all changes..."
 git add .
