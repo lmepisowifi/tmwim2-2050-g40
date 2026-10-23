@@ -40,7 +40,7 @@ your Corresponding Source available to your users (AGPLv3 §5, §13).
 - Hotspot feature is free to use, compared to other router based wifi hotspot system firmwares that use openwrt.
 
 # GPLv2 dump status:
-- The vendor Wuhan Yangtze Optical Technology Co., Ltd. (YOTC) isn't responding.
+- The vendor Wuhan Yangtze Optical Technology Co., Ltd. (YOTC) isn't responding, so most compiled/newer binaries will come from the Prolink GPLv2 dump.
   
 ****
 # Donate:
