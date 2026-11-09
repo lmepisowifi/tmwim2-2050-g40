@@ -131,17 +131,32 @@ REVERT_ROLLBACK_TP=/tmp/txpower_rollback
 REVERT_START=/tmp/ssid_revert_start
 REVERT_TIMEOUT=90
 
-# ---- MAC filter revert state files ----
-MAC_REVERT_PENDING=/tmp/macfilter_revert_pending
-MAC_REVERT_MODE=/tmp/macfilter_revert_mode
-MAC_REVERT_START=/tmp/macfilter_revert_start
-MAC_REVERT_TIMEOUT=90
-
 # ---- DHCP server revert state files ----
 DHCP_REVERT_PENDING=/tmp/dhcp_revert_pending
 DHCP_REVERT_MODE=/tmp/dhcp_revert_mode
 DHCP_REVERT_START=/tmp/dhcp_revert_start
+DHCP_REVERT_RELAY=/tmp/dhcp_revert_relay
 DHCP_REVERT_TIMEOUT=90
+DHCP_CONTROL=/lmepisowifi/www2/sh/dhcp_control.sh
+
+# ---- DHCP mode helpers (server / relay / br0 client) ----
+# DHCP_MODE uses the stock boa values: 0 off, 1 relay, 2 server, 3 br0 client.
+# LAN_DHCP is the legacy "server enabled" flag; this UI keeps it 1 only for
+# server mode, as dhcp_enable always did.
+dhcp_set_mode_mibs() {
+    mib set DHCP_MODE "$1"
+    if [ "$1" = "2" ]; then
+        mib set LAN_DHCP 1
+    else
+        mib set LAN_DHCP 0
+    fi
+}
+
+dhcp_valid_ipv4() {
+    [ "$(printf '%s' "$1" | busybox awk -F. '
+        NF==4 { ok=1; for(i=1;i<=4;i++) if($i!~/^[0-9]+$/||$i+0>255) ok=0; print ok; exit }
+        { print 0 }')" = "1" ]
+}
 
 # ---- WLAN helper functions ----
 get_ssid() {
@@ -211,57 +226,138 @@ get_channel_list() {
     fi
 }
 
-# ---- MAC filter helper functions ----
+# ---- Site survey helpers (shared by sitesurvey_load / sitesurvey_scan) ----
 
-# Returns current mode (0/1/2) for WLAN1
-get_mac_mode() {
-    mib get WLAN1_MACAC_ENABLED \
+# ss_mib KEY -> value of `mib get KEY`
+ss_mib() {
+    mib get "$1" 2>/dev/null \
         | busybox grep "=" \
         | busybox cut -d'=' -f2- \
+        | busybox tr -d '\r\n' \
+        | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# ss_proc FILE LABEL -> value after "LABEL:" on the first matching line
+ss_proc() {
+    [ -f "$1" ] || return
+    busybox grep -m1 "^[[:space:]]*$2:" "$1" 2>/dev/null \
+        | busybox sed "s/^[[:space:]]*$2:[[:space:]]*//" \
         | busybox tr -d '\r\n'
 }
 
-# Emits a JSON array of {index, mac} objects from WLAN1_AC_TBL
-# MAC is formatted as uppercase colon-separated XX:XX:XX:XX:XX:XX
-get_mac_entries_json() {
-    RAW=$(mib get WLAN1_AC_TBL 2>/dev/null)
-    # Each record looks like:
-    #   WLAN1_AC_TBL.N:
-    #   wlanIdx = 1
-    #   MacAddr = aabbccddeeff
-    printf '['
-    FIRST=1
-    IDX=""
-    MAC_RAW=""
-    WLAN_IDX=""
-    echo "$RAW" | while IFS= read -r LINE; do
-        # New record header
-        HEADER=$(echo "$LINE" | busybox grep -E '^WLAN1_AC_TBL\.[0-9]+:')
-        if [ -n "$HEADER" ]; then
-            # Flush previous record if it belonged to wlan1 (wlanIdx=1)
-            if [ -n "$IDX" ] && [ "$WLAN_IDX" = "1" ] && [ -n "$MAC_RAW" ]; then
-                FORMATTED=$(echo "$MAC_RAW" | busybox tr 'a-z' 'A-Z' | busybox sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/')
-                if [ "$FIRST" = "1" ]; then
-                    FIRST=0
-                else
-                    printf ','
-                fi
-                printf '{"index":%s,"mac":"%s"}' "$IDX" "$FORMATTED"
-            fi
-            IDX=$(echo "$HEADER" | busybox sed 's/WLAN1_AC_TBL\.\([0-9]*\):.*/\1/')
-            MAC_RAW=""
-            WLAN_IDX=""
-            continue
-        fi
-        VAL=$(echo "$LINE" | busybox sed 's/^[[:space:]]*//')
-        W=$(echo "$VAL" | busybox sed -n 's/wlanIdx[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p')
-        [ -n "$W" ] && WLAN_IDX="$W"
-        M=$(echo "$VAL" | busybox sed -n 's/MacAddr[[:space:]]*=[[:space:]]*\([0-9a-fA-F]*\).*/\1/p')
-        [ -n "$M" ] && MAC_RAW="$M"
-    done
-    # Flush last record
-    # (The subshell from 'while … | while' means variables don't persist — handled below)
-    printf ']'
+# ss_host_json IFACE -> JSON for OUR OWN radio as it is running right now:
+# SSID (main AP, idx 0), operating channel, bandwidth and 40 MHz side-band.
+# The channel/bandwidth come from the driver, not the MIB, so this is correct
+# in auto-channel mode too (the MIB channel is 0 there):
+#   /proc/<if>/mib_rf   "dot11channel"  - channel ACS settled on
+#   /proc/<if>/mib_11n  "currBW(op)"    - operating width (20M/40M/80M/160M)
+#   /proc/<if>/mib_11n  "2ndchoffset"   - above | below | dontcare
+# A site survey never lists our own BSS, hence this separate block.
+ss_host_json() {
+    _h_if="$1"
+    case "$_h_if" in
+        wlan0) _h_tbl="WLAN_MBSSIB_TBL";  _h_ack="AUTO_CHANNEL" ;;
+        *)     _h_tbl="WLAN1_MBSSIB_TBL"; _h_ack="WLAN1_AUTO_CHANNEL" ;;
+    esac
+    _h_auto=$(ss_mib "$_h_ack"); [ "$_h_auto" = "1" ] && _h_auto=true || _h_auto=false
+    _h_ssid=$(ss_mib "${_h_tbl}.0.ssid" \
+        | busybox tr -d '\001-\037\177' \
+        | busybox sed 's/\\/\\\\/g; s/"/\\"/g')
+    _h_dis=$(ss_mib "${_h_tbl}.0.wlanDisabled"); [ -z "$_h_dis" ] && _h_dis=1
+    _h_ch=$(ss_proc "/proc/${_h_if}/mib_rf" "dot11channel")
+    case "$_h_ch" in ''|*[!0-9]*) _h_ch=0 ;; esac
+    _h_bw=$(ss_proc "/proc/${_h_if}/mib_11n" "currBW(op)")
+    _h_bw=${_h_bw%%[!0-9]*}                 # "40M" -> 40, "80+80M" -> 80
+    case "$_h_bw" in ''|*[!0-9]*|0) _h_bw=20 ;; esac
+    _h_2nd=$(ss_proc "/proc/${_h_if}/mib_11n" "2ndchoffset")
+    case "$_h_2nd" in above|below) ;; *) _h_2nd="" ;; esac
+    _h_en=false
+    [ "$_h_dis" = "0" ] && [ -d "/proc/${_h_if}" ] && _h_en=true
+    printf '{"enabled":%s,"auto":%s,"ssid":"%s","channel":%s,"bandwidth":%s,"offset":"%s"}' \
+        "$_h_en" "$_h_auto" "$_h_ssid" "$_h_ch" "$_h_bw" "$_h_2nd"
+}
+
+# ss_parse IFACE RAW -> {"iface":..,"aps":[..],"channels":[..]} from SS_Result text
+ss_parse() {
+    printf '%s\n' "$2" | busybox awk -v iface="$1" '
+BEGIN {
+    in_ap = 0; ap_str = ""; ch_str = ""
+    hwaddr = ""; ap_ch = 0; ssid = ""; rssi = 0; enc = ""; net = ""; bw = ""
+}
+function clean(s) {
+    gsub(/[\r\n]+$/, "", s); gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s)
+    return s
+}
+function escape_json(s,   out, i, c) {
+    # SSID text comes from OTHER access routers (not ours): any byte is
+    # possible. Raw control characters (tab, 0x01..0x1f, DEL) are illegal inside
+    # a JSON string and made JSON.parse fail, blanking the survey for the admin
+    # -- turn them into spaces first.
+    gsub(/[\001-\037\177]/, " ", s)
+    # Escape char-by-char. gsub(/\\/, "\\\\") is NOT portable: awks differ in how
+    # they read backslashes in a gsub replacement, and some turn "\\\\" into a
+    # single "\", leaving a lone backslash in the JSON and breaking JSON.parse
+    # for the whole survey when a neighbour SSID contains one.
+    out = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if      (c == "\\") out = out "\\\\"
+        else if (c == "\"") out = out "\\\""
+        else                out = out c
+    }
+    return out
+}
+function flush_ap() {
+    if (hwaddr == "") return
+    if (ap_str != "") ap_str = ap_str ","
+    ap_str = ap_str sprintf("{\"mac\":\"%s\",\"channel\":%d,\"ssid\":\"%s\",\"rssi\":%d,\"encryption\":\"%s\",\"network\":\"%s\",\"bandwidth\":\"%s\"}",
+        clean(hwaddr), ap_ch, escape_json(clean(ssid)), rssi,
+        escape_json(clean(enc)), escape_json(clean(net)), escape_json(clean(bw)))
+    hwaddr = ""; ap_ch = 0; ssid = ""; rssi = 0; enc = ""; net = ""; bw = ""
+}
+/^[ \t]*={4,}/ {
+    flush_ap(); in_ap = 1; next
+}
+/channel utilization/ {
+    flush_ap(); in_ap = 0; next
+}
+in_ap && /^[ \t]*HwAddr:/     { sub(/^[ \t]*HwAddr:[ \t]*/,     ""); hwaddr = $0 }
+in_ap && /^[ \t]*Channel:/    { sub(/^[ \t]*Channel:[ \t]*/,    ""); ap_ch  = $0 + 0 }
+in_ap && /^[ \t]*SSID:/       { sub(/^[ \t]*SSID:[ \t]*/,       ""); ssid   = $0 }
+in_ap && /^[ \t]*RSSI:/       { sub(/^[ \t]*RSSI:[ \t]*/,       ""); rssi   = $0 + 0 }
+in_ap && /^[ \t]*Encryption:/ { sub(/^[ \t]*Encryption:[ \t]*/, ""); enc    = $0 }
+in_ap && /^[ \t]*Network:/    { sub(/^[ \t]*Network:[ \t]*/,    ""); net    = $0 }
+in_ap && /^[ \t]*Bandwidth:/  { sub(/^[ \t]*Bandwidth:[ \t]*/,  ""); bw     = $0 }
+!in_ap && /Channel:[ \t]*[0-9]+/ && /ch_load/ {
+    gsub(/[ \t]+/, "", $0)
+    split($0, arr, ",")
+    c=0; l=0; f=0; i=0; n=0
+    for (idx in arr) {
+        split(arr[idx], kv, ":")
+        if (kv[1] == "Channel")        c = kv[2] + 0
+        if (kv[1] == "ch_load")        l = kv[2] + 0
+        if (kv[1] == "free_time")      f = kv[2] + 0
+        if (kv[1] == "interence_time") i = kv[2] + 0
+        if (kv[1] == "noise_level")    n = kv[2] + 0
+    }
+    if (c > 0) {
+        if (ch_str != "") ch_str = ch_str ","
+        ch_str = ch_str sprintf("{\"ch\":%d,\"load\":%d,\"free\":%d,\"inter\":%d,\"noise\":%d}", c, l, f, i, n)
+    }
+}
+END {
+    flush_ap()
+    printf "{\"iface\":\"%s\",\"aps\":[%s],\"channels\":[%s]}", iface, ap_str, ch_str
+}
+'
+}
+
+# ss_finish IFACE RESULT -> RESULT (or an empty one) with the live "host" block spliced in
+ss_finish() {
+    _f_res="$2"
+    [ -z "$_f_res" ] && _f_res="{\"iface\":\"$1\",\"aps\":[],\"channels\":[]}"
+    _f_cb='}'
+    printf '%s,"host":%s}' "${_f_res%$_f_cb}" "$(ss_host_json "$1")"
 }
 
 # ==========================================
@@ -511,8 +607,24 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
         DHCP_DNS3=$(mib get DHCPS_DNS3 2>/dev/null \
             | busybox grep "=" | busybox cut -d'=' -f2- | busybox tr -d '\r\n')
 
+        # "enabled" now means the DHCP *server* is the active mode; relay and
+        # br0-client mode have their own values below. Unset/unknown = server,
+        # matching dhcp_control.sh.
+        case "$DHCP_MODE_VAL" in
+            0|1|3) DHCP_MODE_NUM="$DHCP_MODE_VAL" ;;
+            *)     DHCP_MODE_NUM=2 ;;
+        esac
         DHCP_ENABLED=false
-        [ -n "$DHCP_MODE_VAL" ] && [ "$DHCP_MODE_VAL" != "0" ] && DHCP_ENABLED=true
+        [ "$DHCP_MODE_NUM" = "2" ] && DHCP_ENABLED=true
+
+        DHCP_RELAY_SRV=$(mib get DHCPS 2>/dev/null \
+            | busybox grep "=" | busybox cut -d'=' -f2- | busybox tr -d '\r\n' | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ "$DHCP_RELAY_SRV" = "0.0.0.0" ] && DHCP_RELAY_SRV=""
+
+        # What br0 actually has right now (in client mode this is the lease).
+        BR0_TXT=$(/bin/ifconfig br0 2>/dev/null)
+        BR0_IP=$(printf '%s' "$BR0_TXT" | busybox grep -o 'inet \(addr:\)\?[0-9.]*' | busybox grep -o '[0-9.]*' | busybox head -n 1)
+        BR0_MASK=$(printf '%s' "$BR0_TXT" | busybox grep -o '\(Mask:\|netmask \)[0-9.]*' | busybox grep -o '[0-9.]*' | busybox head -n 1)
 
         [ -z "$DHCP_LEASE" ]  && DHCP_LEASE="86400"
         [ -z "$DHCP_MASK" ]   && DHCP_MASK="255.255.255.0"
@@ -535,16 +647,17 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
 
         printf "Status: 200 OK\r\n"
         printf "Content-Type: application/json\r\n\r\n"
-        printf '{"enabled":%s,"pool_start":"%s","pool_end":"%s","mask":"%s","gateway":"%s","lease":%s,"domain":"%s","dns_opt":%s,"dns1":"%s","dns2":"%s","dns3":"%s","pending":%s,"remaining":%d}' \
+        printf '{"enabled":%s,"pool_start":"%s","pool_end":"%s","mask":"%s","gateway":"%s","lease":%s,"domain":"%s","dns_opt":%s,"dns1":"%s","dns2":"%s","dns3":"%s","pending":%s,"remaining":%d,"mode":%d,"relay_server":"%s","br0_ip":"%s","br0_mask":"%s"}' \
             "$DHCP_ENABLED" "$DHCP_POOL_START" "$DHCP_POOL_END" "$DHCP_MASK" "$DHCP_GW" \
             "$DHCP_LEASE" "$ESC_DOMAIN" "${DHCP_DNS_OPT:-0}" "$DHCP_DNS1" "$DHCP_DNS2" "$DHCP_DNS3" \
-            "$DHCP_PENDING" "$DHCP_REMAINING"
+            "$DHCP_PENDING" "$DHCP_REMAINING" \
+            "$DHCP_MODE_NUM" "$DHCP_RELAY_SRV" "$BR0_IP" "$BR0_MASK"
         exit 0
     fi
 
     # --- action=dhcp_confirm: client acknowledged, cancel the DHCP enable/disable revert ---
     if echo "$QUERY_STRING" | busybox grep -q "action=dhcp_confirm"; then
-        rm -f "$DHCP_REVERT_PENDING" "$DHCP_REVERT_MODE" "$DHCP_REVERT_START"
+        rm -f "$DHCP_REVERT_PENDING" "$DHCP_REVERT_MODE" "$DHCP_REVERT_START" "$DHCP_REVERT_RELAY"
         printf "Status: 200 OK\r\n"
         printf "Content-Type: text/plain\r\n\r\n"
         printf "confirmed"
@@ -587,6 +700,161 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
         printf "Content-Type: application/json\r\n\r\n"
         printf '{"gpon_sn":"%s","loid":"%s","loid_passwd":"%s","ploam_passwd":"%s","pon_mode":%s,"pon_auto":%s}' \
             "$ESC_SN" "$ESC_LOID" "$ESC_LPWD" "$ESC_PLOAM" "$G_PON_MODE" "$G_PON_AUTO"
+        exit 0
+    fi
+
+    # --- action=omci_cfg_get: current values of the editable OMCI MIB settings ---
+    if echo "$QUERY_STRING" | busybox grep -q "action=omci_cfg_get"; then
+        _omci_mib() {
+            mib get "$1" 2>/dev/null \
+                | busybox grep "=" \
+                | busybox cut -d'=' -f2- \
+                | busybox tr -d '\r\n' | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+        }
+        _omci_jstr() {
+            busybox head -c 6144 \
+                | busybox tr -d '\000-\010\013-\037' \
+                | busybox tr '\t' ' ' \
+                | busybox sed 's/\\/\\\\/g; s/"/\\"/g' \
+                | busybox sed ':a;N;$!ba;s/\n/\\n/g'
+        }
+        # name key -> "name":{"ok":<key exists on this build>,"v":"<value>"}
+        _omci_fld() {
+            _R=$(mib get "$2" 2>/dev/null | busybox grep "=" | busybox head -n1)
+            if [ -n "$_R" ]; then
+                _V=$(printf '%s' "$_R" | busybox cut -d'=' -f2- | busybox tr -d '\r\n' \
+                    | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | _omci_jstr)
+                printf '"%s":{"ok":true,"v":"%s"}' "$1" "$_V"
+            else
+                printf '"%s":{"ok":false,"v":""}' "$1"
+            fi
+        }
+
+        OMCI_RUNNING=false
+        busybox pidof omci_app >/dev/null 2>&1 && OMCI_RUNNING=true
+        G_PON_MODE=$(_omci_mib PON_MODE)
+        G_PON_AUTO=$(_omci_mib PON_MODE_AUTO_CHECK_ENABLE)
+        [ -z "$G_PON_MODE" ] && G_PON_MODE=1
+        [ -z "$G_PON_AUTO" ] && G_PON_AUTO=1
+
+        OC_FIELDS=""
+        OC_SEP=""
+        while read -r _N _K; do
+            OC_FIELDS="${OC_FIELDS}${OC_SEP}$(_omci_fld "$_N" "$_K")"
+            OC_SEP=","
+        done <<'EOF_OMCI_FIELDS'
+dbg_level OMCI_DBGLVL
+logfile OMCI_LOGFILE
+logfile_mask OMCI_LOGFILE_MASK
+dual_mgmt DUAL_MGMT_MODE
+veip_slot OMCI_VEIP_SLOT_ID
+sw_ver1 OMCI_SW_VER1
+sw_ver2 OMCI_SW_VER2
+vpc OMCI_VENDOR_PRODUCT_CODE
+tm_opt OMCI_TM_OPT
+custom_bdp OMCI_CUSTOM_BDP
+custom_rdp OMCI_CUSTOM_RDP
+custom_mcast OMCI_CUSTOM_MCAST
+custom_me OMCI_CUSTOM_ME
+vlan_cfg_type VLAN_CFG_TYPE
+vlan_manu_mode VLAN_MANU_MODE
+vlan_manu_vid VLAN_MANU_TAG_VID
+vlan_manu_pri VLAN_MANU_TAG_PRI
+EOF_OMCI_FIELDS
+
+        printf "Status: 200 OK\r\n"
+        printf "Content-Type: application/json\r\n\r\n"
+        printf '{"pon_mode":%s,"pon_auto":%s,"omci_running":%s,%s}' \
+            "$G_PON_MODE" "$G_PON_AUTO" "$OMCI_RUNNING" "$OC_FIELDS"
+        exit 0
+    fi
+
+    # --- action=omci_info: read-only OMCI information (omci_app state, ONU state,
+    #     OLT-G / ONT-G / ONT2-G / software-image MEs, OMCI launch config) ---
+    if echo "$QUERY_STRING" | busybox grep -q "action=omci_info"; then
+        # Same trimmed "mib get" parse used everywhere else in this file
+        _omci_mib() {
+            mib get "$1" 2>/dev/null \
+                | busybox grep "=" \
+                | busybox cut -d'=' -f2- \
+                | busybox tr -d '\r\n' | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+        }
+        # stdin -> JSON-safe string body (no surrounding quotes): drops control
+        # chars, folds tabs, escapes \ and ", joins lines with a literal \n
+        _omci_jstr() {
+            busybox head -c 6144 \
+                | busybox tr -d '\000-\010\013-\037' \
+                | busybox tr '\t' ' ' \
+                | busybox sed 's/\\/\\\\/g; s/"/\\"/g' \
+                | busybox sed ':a;N;$!ba;s/\n/\\n/g'
+        }
+
+        # omcicli talks to omci_app over a local socket, so only call it while
+        # omci_app is alive, and bound each call when busybox has `timeout`.
+        OMCI_RUNNING=false
+        busybox pidof omci_app >/dev/null 2>&1 && OMCI_RUNNING=true
+        OMCI_CLI_OK=false
+        command -v omcicli >/dev/null 2>&1 && OMCI_CLI_OK=true
+
+        OMCI_TMO=""
+        if busybox timeout 1 true 2>/dev/null; then
+            OMCI_TMO="busybox timeout 3"
+        fi
+
+        _omci_cli() {
+            if [ "$OMCI_RUNNING" = "true" ] && [ "$OMCI_CLI_OK" = "true" ]; then
+                $OMCI_TMO omcicli "$@" 2>&1
+            fi
+        }
+
+        # ONU state (O1..O7) from the GPON driver
+        OMCI_ONU_RAW=$(diag gpon get onu-state 2>/dev/null | busybox tr -d '\r')
+        OMCI_ONU=$(printf '%s' "$OMCI_ONU_RAW" | busybox sed -n 's/.*\(O[1-7][0-9]*\).*/\1/p' | busybox head -n1)
+
+        # OMCI launch configuration (same keys/decoding as /etc/runomci.sh)
+        OC_DEVTYPE=$(_omci_mib DEVICE_TYPE)
+        case "$OC_DEVTYPE" in
+            0) OC_DEVTYPE_TXT="bridge" ;;
+            1) OC_DEVTYPE_TXT="router" ;;
+            2) OC_DEVTYPE_TXT="hybrid" ;;
+            *) OC_DEVTYPE_TXT="" ;;
+        esac
+        OC_DUAL=$(_omci_mib DUAL_MGMT_MODE)
+        case "$OC_DUAL" in
+            0) OC_DUAL_TXT="disable" ;;
+            1) OC_DUAL_TXT="enable_wq" ;;
+            2) OC_DUAL_TXT="enable_bc_mc" ;;
+            3) OC_DUAL_TXT="enable_wq_bc_mc" ;;
+            *) OC_DUAL_TXT="" ;;
+        esac
+        OC_VEIP=$(_omci_mib OMCI_VEIP_SLOT_ID)
+        OC_DBG=$(_omci_mib OMCI_DBGLVL)
+
+        # omcicli "get" series
+        OC_LOIDAUTH=$(_omci_cli get loidauth | _omci_jstr)
+        OC_AUTHUP=$(_omci_cli get authuptime | _omci_jstr)
+
+        # ME dumps: OLT-G 131, ONT-G 256, ONT2-G 257, Software image 7
+        OC_OLTG=$(_omci_cli mib get 131 | _omci_jstr)
+        OC_ONTG=$(_omci_cli mib get 256 | _omci_jstr)
+        OC_ONT2G=$(_omci_cli mib get 257 | _omci_jstr)
+        OC_SWIMG=$(_omci_cli mib get 7 | _omci_jstr)
+
+        ESC_ONU_RAW=$(printf '%s' "$OMCI_ONU_RAW" | _omci_jstr)
+        ESC_OC_VEIP=$(printf '%s' "$OC_VEIP" | _omci_jstr)
+        ESC_OC_DBG=$(printf '%s' "$OC_DBG" | _omci_jstr)
+
+        G_PON_MODE=$(_omci_mib PON_MODE)
+        G_PON_AUTO=$(_omci_mib PON_MODE_AUTO_CHECK_ENABLE)
+        [ -z "$G_PON_MODE" ] && G_PON_MODE=1
+        [ -z "$G_PON_AUTO" ] && G_PON_AUTO=1
+
+        printf "Status: 200 OK\r\n"
+        printf "Content-Type: application/json\r\n\r\n"
+        printf '{"pon_mode":%s,"pon_auto":%s,"omci_running":%s,"omcicli":%s,"onu_state":"%s","onu_state_raw":"%s","device_type":"%s","dual_mgmt":"%s","veip_slot":"%s","dbg_level":"%s","loid_auth":"%s","auth_uptime":"%s","olt_g":"%s","ont_g":"%s","ont2_g":"%s","sw_image":"%s"}' \
+            "$G_PON_MODE" "$G_PON_AUTO" "$OMCI_RUNNING" "$OMCI_CLI_OK" "$OMCI_ONU" "$ESC_ONU_RAW" \
+            "$OC_DEVTYPE_TXT" "$OC_DUAL_TXT" "$ESC_OC_VEIP" "$ESC_OC_DBG" \
+            "$OC_LOIDAUTH" "$OC_AUTHUP" "$OC_OLTG" "$OC_ONTG" "$OC_ONT2G" "$OC_SWIMG"
         exit 0
     fi
 
@@ -771,88 +1039,6 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
         exit 0
     fi
 
-    # --- action=macfilter_status: return mode + entry list as JSON ---
-    if echo "$QUERY_STRING" | busybox grep -q "action=macfilter_status"; then
-        CURRENT_MODE=$(get_mac_mode)
-        [ -z "$CURRENT_MODE" ] && CURRENT_MODE=0
-
-        # Parse WLAN1_AC_TBL into a JSON array.
-        # Because busybox sh pipelines run in subshells, we accumulate output
-        # into a temp file to avoid the variable-scope trap.
-        TMP_ENTRIES=/tmp/mac_entries_$$.json
-        printf '[' > "$TMP_ENTRIES"
-        FIRST_ENTRY=1
-
-        mib get WLAN1_AC_TBL 2>/dev/null | while IFS= read -r LINE; do
-            HEADER=$(echo "$LINE" | busybox grep -oE '^WLAN1_AC_TBL\.[0-9]+:')
-            if [ -n "$HEADER" ]; then
-                # Write a sentinel so the next iteration can detect a new record
-                printf '\037%s' "$(echo "$HEADER" | busybox tr -d ':')" >> "$TMP_ENTRIES"
-            fi
-            W=$(echo "$LINE" | busybox sed -n 's/.*wlanIdx[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p')
-            [ -n "$W" ] && printf '\036WIDX=%s' "$W" >> "$TMP_ENTRIES"
-            M=$(echo "$LINE" | busybox sed -n 's/.*MacAddr[[:space:]]*=[[:space:]]*\([0-9a-fA-F]*\).*/\1/p')
-            [ -n "$M" ] && printf '\036MAC=%s' "$M" >> "$TMP_ENTRIES"
-        done
-
-        # Now post-process the temp file with awk to produce clean JSON
-        JSON_ENTRIES=$(
-            busybox awk '
-            BEGIN { RS="\037"; FS="\036"; first=1 }
-            NR==1 { next }   # skip the leading [ before first sentinel
-            {
-                idx=""; widx=""; mac=""
-                for (i=1;i<=NF;i++) {
-                    if ($i ~ /^WLAN1_AC_TBL\./) {
-                        idx = substr($i, index($i,".")+1)
-                    } else if ($i ~ /^WIDX=/) {
-                        widx = substr($i, 6)
-                    } else if ($i ~ /^MAC=/) {
-                        mac = substr($i, 5)
-                    }
-                }
-                # Only include entries belonging to wlan1 (wlanIdx=1)
-                # and skip all-zero placeholder MACs
-                if (widx == "1" && mac != "" && mac != "000000000000") {
-                    # Format MAC as XX:XX:XX:XX:XX:XX uppercase
-                    m = toupper(mac)
-                    formatted = substr(m,1,2)":"substr(m,3,2)":"substr(m,5,2)":"substr(m,7,2)":"substr(m,9,2)":"substr(m,11,2)
-                    if (!first) printf ","
-                    printf "{\"index\":%s,\"mac\":\"%s\"}", idx, formatted
-                    first=0
-                }
-            }
-            ' "$TMP_ENTRIES"
-        )
-        rm -f "$TMP_ENTRIES"
-
-        MAC_PENDING=false
-        MAC_REMAINING=0
-        if [ -f "$MAC_REVERT_PENDING" ] && [ -f "$MAC_REVERT_START" ]; then
-            MAC_START=$(cat "$MAC_REVERT_START")
-            MAC_NOW=$(date +%s)
-            MAC_ELAPSED=$((MAC_NOW - MAC_START))
-            MAC_REMAINING=$((MAC_REVERT_TIMEOUT - MAC_ELAPSED))
-            [ "$MAC_REMAINING" -lt 0 ] && MAC_REMAINING=0
-            MAC_PENDING=true
-        fi
-
-        printf "Status: 200 OK\r\n"
-        printf "Content-Type: application/json\r\n\r\n"
-        printf '{"mode":%s,"entries":[%s],"pending":%s,"remaining":%d}' \
-            "$CURRENT_MODE" "$JSON_ENTRIES" "$MAC_PENDING" "$MAC_REMAINING"
-        exit 0
-    fi
-
-    # --- action=macfilter_confirm: cancel the mode revert ---
-    if echo "$QUERY_STRING" | busybox grep -q "action=macfilter_confirm"; then
-        rm -f "$MAC_REVERT_PENDING" "$MAC_REVERT_MODE" "$MAC_REVERT_START"
-        printf "Status: 200 OK\r\n"
-        printf "Content-Type: text/plain\r\n\r\n"
-        printf "confirmed"
-        exit 0
-    fi
-
     # --- action=sitesurvey_load: read existing /proc SS_Result, no scan trigger ---
     if echo "$QUERY_STRING" | busybox grep -q "action=sitesurvey_load"; then
         IFACE=$(echo "$QUERY_STRING" | busybox sed -n 's/.*iface=\([^&]*\).*/\1/p' | busybox tr -d '\r\n')
@@ -870,70 +1056,8 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
             busybox sleep 1
             TRIES=$((TRIES + 1))
         done
-        RESULT=$(printf '%s\n' "$RAW" | busybox awk -v iface="$IFACE" '
-BEGIN {
-    in_ap = 0; ap_str = ""; ch_str = ""
-    hwaddr = ""; ap_ch = 0; ssid = ""; rssi = 0; enc = ""; net = ""; bw = ""
-}
-function clean(s) {
-    gsub(/[\r\n]+$/, "", s); gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s)
-    return s
-}
-function escape_json(s) {
-    # SSID text comes from OTHER access routers (not ours): any byte is
-    # possible. Raw control characters (tab, 0x01..0x1f, DEL) are illegal inside
-    # a JSON string and made JSON.parse fail, blanking the survey for the admin
-    # -- turn them into spaces first.
-    gsub(/[\001-\037\177]/, " ", s)
-    gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s)
-    return s
-}
-function flush_ap() {
-    if (hwaddr == "") return
-    if (ap_str != "") ap_str = ap_str ","
-    ap_str = ap_str sprintf("{\"mac\":\"%s\",\"channel\":%d,\"ssid\":\"%s\",\"rssi\":%d,\"encryption\":\"%s\",\"network\":\"%s\",\"bandwidth\":\"%s\"}",
-        clean(hwaddr), ap_ch, escape_json(clean(ssid)), rssi,
-        escape_json(clean(enc)), escape_json(clean(net)), escape_json(clean(bw)))
-    hwaddr = ""; ap_ch = 0; ssid = ""; rssi = 0; enc = ""; net = ""; bw = ""
-}
-/^[ \t]*={4,}/ {
-    flush_ap(); in_ap = 1; next
-}
-/channel utilization/ {
-    flush_ap(); in_ap = 0; next
-}
-in_ap && /^[ \t]*HwAddr:/     { sub(/^[ \t]*HwAddr:[ \t]*/,     ""); hwaddr = $0 }
-in_ap && /^[ \t]*Channel:/    { sub(/^[ \t]*Channel:[ \t]*/,    ""); ap_ch  = $0 + 0 }
-in_ap && /^[ \t]*SSID:/       { sub(/^[ \t]*SSID:[ \t]*/,       ""); ssid   = $0 }
-in_ap && /^[ \t]*RSSI:/       { sub(/^[ \t]*RSSI:[ \t]*/,       ""); rssi   = $0 + 0 }
-in_ap && /^[ \t]*Encryption:/ { sub(/^[ \t]*Encryption:[ \t]*/, ""); enc    = $0 }
-in_ap && /^[ \t]*Network:/    { sub(/^[ \t]*Network:[ \t]*/,    ""); net    = $0 }
-in_ap && /^[ \t]*Bandwidth:/  { sub(/^[ \t]*Bandwidth:[ \t]*/,  ""); bw     = $0 }
-!in_ap && /Channel:[ \t]*[0-9]+/ && /ch_load/ {
-    gsub(/[ \t]+/, "", $0)
-    split($0, arr, ",")
-    c=0; l=0; f=0; i=0; n=0
-    for (idx in arr) {
-        split(arr[idx], kv, ":")
-        if (kv[1] == "Channel")        c = kv[2] + 0
-        if (kv[1] == "ch_load")        l = kv[2] + 0
-        if (kv[1] == "free_time")      f = kv[2] + 0
-        if (kv[1] == "interence_time") i = kv[2] + 0
-        if (kv[1] == "noise_level")    n = kv[2] + 0
-    }
-    if (c > 0) {
-        if (ch_str != "") ch_str = ch_str ","
-        ch_str = ch_str sprintf("{\"ch\":%d,\"load\":%d,\"free\":%d,\"inter\":%d,\"noise\":%d}", c, l, f, i, n)
-    }
-}
-END {
-    flush_ap()
-    printf "{\"iface\":\"%s\",\"aps\":[%s],\"channels\":[%s]}", iface, ap_str, ch_str
-}
-')
-        if [ -z "$RESULT" ]; then
-            RESULT="{\"iface\":\"$IFACE\",\"aps\":[],\"channels\":[]}"
-        fi
+        RESULT=$(ss_parse "$IFACE" "$RAW")
+        RESULT=$(ss_finish "$IFACE" "$RESULT")
         printf "Status: 200 OK\r\n"
         printf "Content-Type: application/json\r\n\r\n"
         printf '%s' "$RESULT"
@@ -947,7 +1071,7 @@ END {
             wlan0|wlan1) ;;
             *) IFACE="wlan1" ;;
         esac
-        iwpriv "$IFACE" at_ss /dev/null 2>&1
+        iwpriv "$IFACE" at_ss >/dev/null 2>&1
         # Poll until the kernel removes the "waitting" sentinel (scan complete)
         # or until 20s timeout, whichever comes first
         TRIES=0
@@ -959,70 +1083,8 @@ END {
             busybox sleep 1
             TRIES=$((TRIES + 1))
         done
-        RESULT=$(printf '%s\n' "$RAW" | busybox awk -v iface="$IFACE" '
-BEGIN {
-    in_ap = 0; ap_str = ""; ch_str = ""
-    hwaddr = ""; ap_ch = 0; ssid = ""; rssi = 0; enc = ""; net = ""; bw = ""
-}
-function clean(s) {
-    gsub(/[\r\n]+$/, "", s); gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s)
-    return s
-}
-function escape_json(s) {
-    # SSID text comes from OTHER access routers (not ours): any byte is
-    # possible. Raw control characters (tab, 0x01..0x1f, DEL) are illegal inside
-    # a JSON string and made JSON.parse fail, blanking the survey for the admin
-    # -- turn them into spaces first.
-    gsub(/[\001-\037\177]/, " ", s)
-    gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s)
-    return s
-}
-function flush_ap() {
-    if (hwaddr == "") return
-    if (ap_str != "") ap_str = ap_str ","
-    ap_str = ap_str sprintf("{\"mac\":\"%s\",\"channel\":%d,\"ssid\":\"%s\",\"rssi\":%d,\"encryption\":\"%s\",\"network\":\"%s\",\"bandwidth\":\"%s\"}",
-        clean(hwaddr), ap_ch, escape_json(clean(ssid)), rssi,
-        escape_json(clean(enc)), escape_json(clean(net)), escape_json(clean(bw)))
-    hwaddr = ""; ap_ch = 0; ssid = ""; rssi = 0; enc = ""; net = ""; bw = ""
-}
-/^[ \t]*={4,}/ {
-    flush_ap(); in_ap = 1; next
-}
-/channel utilization/ {
-    flush_ap(); in_ap = 0; next
-}
-in_ap && /^[ \t]*HwAddr:/     { sub(/^[ \t]*HwAddr:[ \t]*/,     ""); hwaddr = $0 }
-in_ap && /^[ \t]*Channel:/    { sub(/^[ \t]*Channel:[ \t]*/,    ""); ap_ch  = $0 + 0 }
-in_ap && /^[ \t]*SSID:/       { sub(/^[ \t]*SSID:[ \t]*/,       ""); ssid   = $0 }
-in_ap && /^[ \t]*RSSI:/       { sub(/^[ \t]*RSSI:[ \t]*/,       ""); rssi   = $0 + 0 }
-in_ap && /^[ \t]*Encryption:/ { sub(/^[ \t]*Encryption:[ \t]*/, ""); enc    = $0 }
-in_ap && /^[ \t]*Network:/    { sub(/^[ \t]*Network:[ \t]*/,    ""); net    = $0 }
-in_ap && /^[ \t]*Bandwidth:/  { sub(/^[ \t]*Bandwidth:[ \t]*/,  ""); bw     = $0 }
-!in_ap && /Channel:[ \t]*[0-9]+/ && /ch_load/ {
-    gsub(/[ \t]+/, "", $0)
-    split($0, arr, ",")
-    c=0; l=0; f=0; i=0; n=0
-    for (idx in arr) {
-        split(arr[idx], kv, ":")
-        if (kv[1] == "Channel")        c = kv[2] + 0
-        if (kv[1] == "ch_load")        l = kv[2] + 0
-        if (kv[1] == "free_time")      f = kv[2] + 0
-        if (kv[1] == "interence_time") i = kv[2] + 0
-        if (kv[1] == "noise_level")    n = kv[2] + 0
-    }
-    if (c > 0) {
-        if (ch_str != "") ch_str = ch_str ","
-        ch_str = ch_str sprintf("{\"ch\":%d,\"load\":%d,\"free\":%d,\"inter\":%d,\"noise\":%d}", c, l, f, i, n)
-    }
-}
-END {
-    flush_ap()
-    printf "{\"iface\":\"%s\",\"aps\":[%s],\"channels\":[%s]}", iface, ap_str, ch_str
-}
-')
-        if [ -z "$RESULT" ]; then
-            RESULT="{\"iface\":\"$IFACE\",\"aps\":[],\"channels\":[]}"
-        fi
+        RESULT=$(ss_parse "$IFACE" "$RAW")
+        RESULT=$(ss_finish "$IFACE" "$RESULT")
         printf "Status: 200 OK\r\n"
         printf "Content-Type: application/json\r\n\r\n"
         printf '%s' "$RESULT"
@@ -1383,9 +1445,13 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         [ "$NEW_WAN_PHY_PORT" != "$CUR_WAN_PHY_PORT" ] && mib set WAN_PHY_PORT "$NEW_WAN_PHY_PORT"
         mib commit
 
-        # Determine whether a reboot is needed (PON mode, auto-detect or WAN port changed)
+        # Determine whether a reboot is needed.
+        # Only reboot when the effective PON mode or WAN port actually changes,
+        # or when auto-detect is being switched ON (detection only starts at boot).
+        # Switching auto-detect OFF while keeping the same manual mode and port
+        # changes nothing at runtime, so it must not reboot the device.
         PON_CHANGED=0
-        if [ "$FORM_PON_AUTO" != "$CUR_PON_AUTO" ]; then
+        if [ "$FORM_PON_AUTO" = "1" ] && [ "$CUR_PON_AUTO" != "1" ]; then
             PON_CHANGED=1
         elif [ "$FORM_PON_AUTO" = "0" ] && [ "$FORM_PON_MODE" != "$CUR_PON_MODE" ]; then
             PON_CHANGED=1
@@ -1483,6 +1549,15 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
 
     # --- action=lan_ip_save: apply LAN IP address and subnet mask ---
     if echo "$QUERY_STRING" | busybox grep -q "action=lan_ip_save"; then
+        # br0 client mode: the address comes from the upstream DHCP server, so a
+        # static one must not be applied (stock boa hides this form in that mode).
+        CUR_DHCP_MODE=$(mib get DHCP_MODE 2>/dev/null | busybox cut -d'=' -f2- | busybox tr -d '\r\n ')
+        if [ "$CUR_DHCP_MODE" = "3" ]; then
+            printf "Status: 400 Bad Request\r\n"
+            printf "Content-Type: text/plain\r\n\r\n"
+            printf "LAN IP is assigned by DHCP while DHCP mode is Client"
+            exit 0
+        fi
         FORM_IP=$(echo "$POST_DATA" | busybox sed 's/&/\n/g' \
             | busybox grep '^ip=' | busybox cut -d'=' -f2-)
         FORM_IP=$(busybox httpd -d "$FORM_IP" | busybox tr -d '\r\n')
@@ -1672,7 +1747,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         exit 0
     fi
 
-    # --- action=dhcp_enable: enable/disable DHCP server, mirrors macfilter_mode's revert-timer shape ---
+    # --- action=dhcp_enable: enable/disable DHCP server, rolled back by a revert timer unless confirmed ---
     if echo "$QUERY_STRING" | busybox grep -q "action=dhcp_enable"; then
         FORM_MODE=$(echo "$POST_DATA" \
             | busybox sed -n 's/.*mode=\([^&]*\).*/\1/p' \
@@ -1697,40 +1772,134 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         touch "$DHCP_REVERT_PENDING"
         date +%s > "$DHCP_REVERT_START"
 
+        # The server toggle means "server" (2) or "off" (0). dhcp_control.sh
+        # restart applies whatever DHCP_MODE now says — including stopping a
+        # relay / br0 client left over from a mode set elsewhere.
         if [ "$FORM_MODE" = "0" ]; then
-            mib set DHCP_MODE 0
-            mib set LAN_DHCP 0
-            mib commit
-            sh /lmepisowifi/www2/sh/dhcp_control.sh stop
+            dhcp_set_mode_mibs 0
         else
-            mib set DHCP_MODE 2
-            mib set LAN_DHCP 1
-            mib commit
-            sh /lmepisowifi/www2/sh/dhcp_control.sh restart
+            dhcp_set_mode_mibs 2
         fi
+        mib commit
+        sh "$DHCP_CONTROL" restart >/dev/null 2>&1
 
-        # Background revert timer (same shape as macfilter_mode's)
+        # Background revert timer
         (
             sleep $DHCP_REVERT_TIMEOUT
             if [ -f "$DHCP_REVERT_PENDING" ]; then
                 RB_MODE=$(cat "$DHCP_REVERT_MODE")
-                mib set DHCP_MODE "$RB_MODE"
-                if [ "$RB_MODE" = "0" ]; then
-                    mib set LAN_DHCP 0
-                    mib commit
-                    sh /lmepisowifi/www2/sh/dhcp_control.sh stop
-                else
-                    mib set LAN_DHCP 1
-                    mib commit
-                    sh /lmepisowifi/www2/sh/dhcp_control.sh restart
-                fi
-                rm -f "$DHCP_REVERT_PENDING" "$DHCP_REVERT_MODE" "$DHCP_REVERT_START"
+                dhcp_set_mode_mibs "$RB_MODE"
+                mib commit
+                sh "$DHCP_CONTROL" restart
+                rm -f "$DHCP_REVERT_PENDING" "$DHCP_REVERT_MODE" "$DHCP_REVERT_START" "$DHCP_REVERT_RELAY"
             fi
-        ) &
+        ) >/dev/null 2>&1 </dev/null &
 
         printf "Status: 200 OK\r\n"
         printf "Content-Type: text/plain\r\n\r\n"
         printf "OK"
+        exit 0
+    fi
+
+    # --- action=dhcp_mode_save: choose off / server / relay / br0 client, like stock boa's "DHCP Mode" page ---
+    #   mode=0|1|2|3  (stock DHCP_TYPE_T: 0 off, 1 relay, 2 server, 3 client)
+    #   relay_server=<ipv4>   required for mode=1 (stored in the DHCPS MIB, the same one stock uses)
+    # Same safety net as dhcp_enable: the previous mode is restored after
+    # DHCP_REVERT_TIMEOUT unless the page confirms it can still be reached.
+    if echo "$QUERY_STRING" | busybox grep -q "action=dhcp_mode_save"; then
+        FORM_MODE=$(echo "$POST_DATA" | busybox sed 's/&/\n/g' \
+            | busybox grep '^mode=' | busybox cut -d'=' -f2-)
+        FORM_MODE=$(busybox httpd -d "$FORM_MODE" | busybox tr -d '\r\n')
+        FORM_RELAY=$(echo "$POST_DATA" | busybox sed 's/&/\n/g' \
+            | busybox grep '^relay_server=' | busybox cut -d'=' -f2-)
+        FORM_RELAY=$(busybox httpd -d "$FORM_RELAY" | busybox tr -d '\r\n')
+
+        case "$FORM_MODE" in
+            0|1|2|3) ;;
+            *)
+                printf "Status: 400 Bad Request\r\n"
+                printf "Content-Type: text/plain\r\n\r\n"
+                printf "Invalid DHCP mode"
+                exit 0
+                ;;
+        esac
+
+        LAN_IP_NOW=$(mib get LAN_IP_ADDR 2>/dev/null \
+            | busybox grep "=" | busybox cut -d'=' -f2- | busybox tr -d '\r\n' | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        if [ "$FORM_MODE" = "1" ]; then
+            if ! dhcp_valid_ipv4 "$FORM_RELAY" || [ "$FORM_RELAY" = "0.0.0.0" ] || [ "$FORM_RELAY" = "255.255.255.255" ]; then
+                printf "Status: 400 Bad Request\r\n"
+                printf "Content-Type: text/plain\r\n\r\n"
+                printf "Invalid relay server address"
+                exit 0
+            fi
+            if [ "$FORM_RELAY" = "$LAN_IP_NOW" ]; then
+                printf "Status: 400 Bad Request\r\n"
+                printf "Content-Type: text/plain\r\n\r\n"
+                printf "Relay server cannot be this router's own LAN IP"
+                exit 0
+            fi
+        fi
+
+        OLD_MODE=$(mib get DHCP_MODE 2>/dev/null \
+            | busybox grep "=" | busybox cut -d'=' -f2- | busybox tr -d '\r\n' | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        case "$OLD_MODE" in 0|1|3) ;; *) OLD_MODE=2 ;; esac
+        OLD_RELAY=$(mib get DHCPS 2>/dev/null \
+            | busybox grep "=" | busybox cut -d'=' -f2- | busybox tr -d '\r\n' | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        # Save rollback state (mode, plus the relay server if this request changes it)
+        rm -f "$DHCP_REVERT_PENDING" "$DHCP_REVERT_MODE" "$DHCP_REVERT_START" "$DHCP_REVERT_RELAY"
+        echo "$OLD_MODE" > "$DHCP_REVERT_MODE"
+        [ "$FORM_MODE" = "1" ] && [ -n "$OLD_RELAY" ] && echo "$OLD_RELAY" > "$DHCP_REVERT_RELAY"
+        touch "$DHCP_REVERT_PENDING"
+        date +%s > "$DHCP_REVERT_START"
+
+        [ "$FORM_MODE" = "1" ] && mib set DHCPS "$FORM_RELAY"
+        dhcp_set_mode_mibs "$FORM_MODE"
+        mib commit
+
+        if [ "$OLD_MODE" = "3" ] || [ "$FORM_MODE" = "3" ]; then
+            # br0's address changes, so the connection serving this very request
+            # is about to go away. Answer first, apply a moment later; the revert
+            # timer below is what protects against ending up unreachable.
+            ASYNC=true
+            ( sleep 2; sh "$DHCP_CONTROL" restart ) >/dev/null 2>&1 </dev/null &
+        else
+            ASYNC=false
+            if ! sh "$DHCP_CONTROL" restart >/dev/null 2>&1; then
+                # Relay/server would not start: put everything back right now
+                # instead of leaving a dead mode behind for the revert timer.
+                [ -f "$DHCP_REVERT_RELAY" ] && mib set DHCPS "$OLD_RELAY"
+                dhcp_set_mode_mibs "$OLD_MODE"
+                mib commit
+                sh "$DHCP_CONTROL" restart >/dev/null 2>&1
+                rm -f "$DHCP_REVERT_PENDING" "$DHCP_REVERT_MODE" "$DHCP_REVERT_START" "$DHCP_REVERT_RELAY"
+                printf "Status: 500 Internal Server Error\r\n"
+                printf "Content-Type: text/plain\r\n\r\n"
+                printf "Could not start the new DHCP mode; the previous mode was restored"
+                exit 0
+            fi
+        fi
+
+        # Background revert timer (same shape as dhcp_enable's)
+        (
+            sleep $DHCP_REVERT_TIMEOUT
+            if [ -f "$DHCP_REVERT_PENDING" ]; then
+                RB_MODE=$(cat "$DHCP_REVERT_MODE")
+                [ -f "$DHCP_REVERT_RELAY" ] && mib set DHCPS "$(cat "$DHCP_REVERT_RELAY")"
+                dhcp_set_mode_mibs "$RB_MODE"
+                mib commit
+                sh "$DHCP_CONTROL" restart
+                rm -f "$DHCP_REVERT_PENDING" "$DHCP_REVERT_MODE" "$DHCP_REVERT_START" "$DHCP_REVERT_RELAY"
+            fi
+        ) >/dev/null 2>&1 </dev/null &
+
+        # lan_ip is where this device will be reachable if it ends up on its
+        # configured static address (i.e. any mode except client).
+        printf "Status: 200 OK\r\n"
+        printf "Content-Type: application/json\r\n\r\n"
+        printf '{"async":%s,"lan_ip":"%s"}' "$ASYNC" "$LAN_IP_NOW"
         exit 0
     fi
 
@@ -1835,6 +2004,153 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         exit 0
     fi
 
+
+    # --- action=omci_cfg_set: apply editable OMCI MIB settings ---
+    # Only fields present in the POST body are touched. Everything is validated
+    # first (nothing is written if any field is bad), only changed values are
+    # written, then omci_app is restarted the same way gpon_settings does. A
+    # change to nothing but the debug level is applied live with omcicli.
+    if echo "$QUERY_STRING" | busybox grep -q "action=omci_cfg_set"; then
+        _omci_mib() {
+            mib get "$1" 2>/dev/null \
+                | busybox grep "=" \
+                | busybox cut -d'=' -f2- \
+                | busybox tr -d '\r\n' | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+        }
+        _omci_has() { mib get "$1" 2>/dev/null | busybox grep -q "="; }
+        _omci_chk_int() {
+            case "$1" in ''|*[!0-9]*) return 1 ;; esac
+            [ "${#1}" -le 10 ] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+        }
+        _omci_valid() {   # name value
+            case "$1" in
+                dbg_level)      _omci_chk_int "$2" 0 4 ;;
+                logfile)        case "$2" in 0|1|2|3|7|8) return 0 ;; *) return 1 ;; esac ;;
+                logfile_mask)   _omci_chk_int "$2" 0 4294967295 ;;
+                dual_mgmt)      _omci_chk_int "$2" 0 3 ;;
+                veip_slot)      _omci_chk_int "$2" 0 255 ;;
+                sw_ver1|sw_ver2)
+                    [ -n "$2" ] && [ "${#2}" -le 14 ] \
+                        && ! printf '%s' "$2" | busybox grep -q '[^A-Za-z0-9._+/ -]' ;;
+                vpc)            _omci_chk_int "$2" 0 65535 ;;
+                tm_opt)         _omci_chk_int "$2" 0 2 ;;
+                custom_bdp|custom_rdp|custom_mcast|custom_me)
+                                _omci_chk_int "$2" 0 4294967295 ;;
+                vlan_cfg_type)  _omci_chk_int "$2" 0 1 ;;
+                vlan_manu_mode) _omci_chk_int "$2" 0 3 ;;
+                vlan_manu_vid)  _omci_chk_int "$2" 0 4094 || [ "$2" = "65535" ] ;;
+                vlan_manu_pri)  _omci_chk_int "$2" 0 7 || [ "$2" = "255" ] ;;
+                *)              return 1 ;;
+            esac
+        }
+        _omci_lvl_word() {   # same mapping as /etc/runomci.sh get_omci_dbg_level
+            case "$1" in 0|1) echo err ;; 2) echo warn ;; 3) echo info ;; 4) echo dbg ;; *) echo off ;; esac
+        }
+
+        OC_MAP="dbg_level:OMCI_DBGLVL logfile:OMCI_LOGFILE logfile_mask:OMCI_LOGFILE_MASK dual_mgmt:DUAL_MGMT_MODE veip_slot:OMCI_VEIP_SLOT_ID sw_ver1:OMCI_SW_VER1 sw_ver2:OMCI_SW_VER2 vpc:OMCI_VENDOR_PRODUCT_CODE tm_opt:OMCI_TM_OPT custom_bdp:OMCI_CUSTOM_BDP custom_rdp:OMCI_CUSTOM_RDP custom_mcast:OMCI_CUSTOM_MCAST custom_me:OMCI_CUSTOM_ME vlan_cfg_type:VLAN_CFG_TYPE vlan_manu_mode:VLAN_MANU_MODE vlan_manu_vid:VLAN_MANU_TAG_VID vlan_manu_pri:VLAN_MANU_TAG_PRI"
+
+        # Phase 1: parse + validate every submitted field, remember the changed ones
+        OC_CHANGES=""      # "KEY=value" lines, one per change
+        OC_CHANGED_N=0
+        OC_ONLY_DBG=1
+        OC_NEW_DBG=""
+        for _P in $OC_MAP; do
+            _N="${_P%%:*}"
+            _K="${_P#*:}"
+            echo "$POST_DATA" | busybox sed 's/&/\n/g' | busybox grep -q "^${_N}=" || continue
+            _VAL=$(echo "$POST_DATA" | busybox sed 's/&/\n/g' | busybox grep "^${_N}=" \
+                | busybox head -n1 | busybox cut -d'=' -f2-)
+            _VAL=$(busybox httpd -d "$_VAL" | busybox tr -d '\r\n')
+            case "$_N" in
+                sw_ver1|sw_ver2) ;;
+                *) # numeric: drop leading zeros so it compares/stores canonically
+                   case "$_VAL" in *[!0-9]*) ;; *)
+                       _VAL=$(printf '%s' "$_VAL" | busybox sed 's/^0*//')
+                       [ -z "$_VAL" ] && _VAL=0 ;;
+                   esac ;;
+            esac
+            if ! _omci_valid "$_N" "$_VAL"; then
+                printf "Status: 400 Bad Request\r\n"
+                printf "Content-Type: text/plain\r\n\r\n"
+                printf "Invalid value for %s" "$_N"
+                exit 0
+            fi
+            # Skip settings this firmware build doesn't have
+            _omci_has "$_K" || continue
+            _CUR=$(_omci_mib "$_K")
+            [ "$_VAL" = "$_CUR" ] && continue
+            OC_CHANGES="${OC_CHANGES}${_K}=${_VAL}
+"
+            OC_CHANGED_N=$((OC_CHANGED_N + 1))
+            if [ "$_N" = "dbg_level" ]; then
+                OC_NEW_DBG="$_VAL"
+            else
+                OC_ONLY_DBG=0
+            fi
+        done
+
+        if [ "$OC_CHANGED_N" -eq 0 ]; then
+            printf "Status: 200 OK\r\n"
+            printf "Content-Type: text/plain\r\n\r\n"
+            printf "OK:nochange"
+            exit 0
+        fi
+
+        # Phase 2: write + commit
+        printf '%s' "$OC_CHANGES" | while IFS='=' read -r _K _V; do
+            [ -n "$_K" ] && mib set "$_K" "$_V"
+        done
+        mib commit
+
+        OMCI_WAS_RUNNING=0
+        busybox pidof omci_app >/dev/null 2>&1 && OMCI_WAS_RUNNING=1
+
+        if [ "$OMCI_WAS_RUNNING" = "0" ]; then
+            # omci_app isn't up: values are saved and picked up by the next start
+            printf "Status: 200 OK\r\n"
+            printf "Content-Type: text/plain\r\n\r\n"
+            printf "OK:saved"
+            exit 0
+        fi
+
+        if [ "$OC_ONLY_DBG" = "1" ] && command -v omcicli >/dev/null 2>&1; then
+            # Debug level only: apply live, no omci_app restart
+            _W=$(_omci_lvl_word "$OC_NEW_DBG")
+            printf "Status: 200 OK\r\n"
+            printf "Content-Type: text/plain\r\n\r\n"
+            printf "OK:live"
+            ( omcicli set log "$_W" "$_W" >/dev/null 2>&1 ) &
+            exit 0
+        fi
+
+        if busybox pidof igmpd >/dev/null; then
+            NEED_IGMP_RESTART=1
+        else
+            NEED_IGMP_RESTART=0
+        fi
+
+        # Respond first, then restart omci_app (same sequence as gpon_settings)
+        printf "Status: 200 OK\r\n"
+        printf "Content-Type: text/plain\r\n\r\n"
+        printf "OK:restart"
+        (
+            if [ "$NEED_IGMP_RESTART" = "1" ]; then
+                busybox killall igmpd 2>/dev/null
+                sleep 1
+                busybox killall -9 igmpd 2>/dev/null
+            fi
+            busybox killall omci_app 2>/dev/null
+            sleep 1
+            /etc/runomci.sh 2>/dev/null
+            if [ "$NEED_IGMP_RESTART" = "1" ]; then
+                sleep 2
+                if ! busybox pidof igmpd >/dev/null; then
+                    /etc/runigmp.sh 2>/dev/null
+                fi
+            fi
+        ) &
+        exit 0
+    fi
 
     # --- action=epon_settings: apply EPON LOID, LOID password and LLID/MAC mapping ---
     if echo "$QUERY_STRING" | busybox grep -q "action=epon_settings"; then
@@ -1948,156 +2264,6 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             fi
         ) >/dev/null 2>&1 &
 
-        exit 0
-    fi
-
-    # --- action=macfilter_mode: set WLAN1_MACAC_ENABLED with revert ---
-    if echo "$QUERY_STRING" | busybox grep -q "action=macfilter_mode"; then
-        FORM_MODE=$(echo "$POST_DATA" \
-            | busybox sed -n 's/.*mode=\([^&]*\).*/\1/p' \
-            | busybox tr -d '\r\n')
-        case "$FORM_MODE" in
-            0|1|2) ;;
-            *)
-                printf "Status: 400 Bad Request\r\n"
-                printf "Content-Type: text/plain\r\n\r\n"
-                printf "Invalid mode value"
-                exit 0
-                ;;
-        esac
-
-        OLD_MODE=$(get_mac_mode)
-        [ -z "$OLD_MODE" ] && OLD_MODE=0
-
-        # Save rollback state
-        rm -f "$MAC_REVERT_PENDING" "$MAC_REVERT_MODE" "$MAC_REVERT_START"
-        echo "$OLD_MODE" > "$MAC_REVERT_MODE"
-        touch "$MAC_REVERT_PENDING"
-        date +%s > "$MAC_REVERT_START"
-
-        mib set WLAN1_MACAC_ENABLED "$FORM_MODE"
-        mib commit
-        wlan_apply restart
-
-        # Background revert timer
-        (
-            sleep $MAC_REVERT_TIMEOUT
-            if [ -f "$MAC_REVERT_PENDING" ]; then
-                RB_MODE=$(cat "$MAC_REVERT_MODE")
-                mib set WLAN1_MACAC_ENABLED "$RB_MODE"
-                mib commit
-                wlan_apply restart
-                rm -f "$MAC_REVERT_PENDING" "$MAC_REVERT_MODE" "$MAC_REVERT_START"
-            fi
-        ) &
-
-        printf "Status: 200 OK\r\n"
-        printf "Content-Type: text/plain\r\n\r\n"
-        printf "OK"
-        exit 0
-    fi
-
-    # --- action=macfilter_add: add a new MAC to WLAN1_AC_TBL ---
-    if echo "$QUERY_STRING" | busybox grep -q "action=macfilter_add"; then
-        FORM_MAC=$(echo "$POST_DATA" \
-            | busybox sed -n 's/.*mac=\([^&]*\).*/\1/p' \
-            | busybox tr -d '\r\n' \
-            | busybox tr 'A-Z' 'a-z')
-
-        # Validate: exactly 12 hex chars (wire format, no colons)
-        case "$FORM_MAC" in
-            ''|*[!0-9a-f]*)
-                printf "Status: 400 Bad Request\r\n"
-                printf "Content-Type: text/plain\r\n\r\n"
-                printf "Invalid MAC address"
-                exit 0
-                ;;
-        esac
-        if [ ${#FORM_MAC} -ne 12 ]; then
-            printf "Status: 400 Bad Request\r\n"
-            printf "Content-Type: text/plain\r\n\r\n"
-            printf "Invalid MAC address length"
-            exit 0
-        fi
-
-        # Reject all-zero MAC
-        if [ "$FORM_MAC" = "000000000000" ]; then
-            printf "Status: 400 Bad Request\r\n"
-            printf "Content-Type: text/plain\r\n\r\n"
-            printf "Invalid MAC address"
-            exit 0
-        fi
-
-        # Duplicate check: scan existing wlanIdx=1 entries
-        EXISTING=$(mib get WLAN1_AC_TBL 2>/dev/null)
-        if echo "$EXISTING" | busybox grep -iq "MacAddr[[:space:]]*=[[:space:]]*$FORM_MAC"; then
-            printf "Status: 409 Conflict\r\n"
-            printf "Content-Type: text/plain\r\n\r\n"
-            printf "MAC already exists"
-            exit 0
-        fi
-
-        # Add new record: mib add returns new NUM, new index = NUM-1
-        ADD_OUT=$(mib add WLAN1_AC_TBL 2>&1)
-        NEW_NUM=$(echo "$ADD_OUT" | busybox sed -n 's/.*NUM=\([0-9]*\).*/\1/p' | busybox tr -d '\r\n')
-        if [ -z "$NEW_NUM" ]; then
-            printf "Status: 500 Internal Server Error\r\n"
-            printf "Content-Type: text/plain\r\n\r\n"
-            printf "Failed to allocate table entry"
-            exit 0
-        fi
-        NEW_IDX=$((NEW_NUM - 1))
-
-        mib set "WLAN1_AC_TBL.${NEW_IDX}.wlanIdx" 1
-        mib set "WLAN1_AC_TBL.${NEW_IDX}.MacAddr" "$FORM_MAC"
-        mib commit
-        wlan_apply restart
-
-        printf "Status: 200 OK\r\n"
-        printf "Content-Type: text/plain\r\n\r\n"
-        printf "OK"
-        exit 0
-    fi
-
-    # --- action=macfilter_del: delete a MAC entry by table index ---
-    if echo "$QUERY_STRING" | busybox grep -q "action=macfilter_del"; then
-        FORM_IDX=$(echo "$POST_DATA" \
-            | busybox sed -n 's/.*index=\([^&]*\).*/\1/p' \
-            | busybox tr -d '\r\n')
-
-        # Validate: non-negative integer
-        case "$FORM_IDX" in
-            ''|*[!0-9]*)
-                printf "Status: 400 Bad Request\r\n"
-                printf "Content-Type: text/plain\r\n\r\n"
-                printf "Invalid index"
-                exit 0
-                ;;
-        esac
-
-        # Verify the entry exists and belongs to wlan1
-        ENTRY=$(mib get "WLAN1_AC_TBL.${FORM_IDX}" 2>/dev/null)
-        if [ -z "$ENTRY" ]; then
-            printf "Status: 404 Not Found\r\n"
-            printf "Content-Type: text/plain\r\n\r\n"
-            printf "Entry not found"
-            exit 0
-        fi
-        ENTRY_WIDX=$(echo "$ENTRY" | busybox sed -n 's/.*wlanIdx[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' | busybox tr -d '\r\n')
-        if [ "$ENTRY_WIDX" != "1" ]; then
-            printf "Status: 403 Forbidden\r\n"
-            printf "Content-Type: text/plain\r\n\r\n"
-            printf "Entry does not belong to WLAN1"
-            exit 0
-        fi
-
-        mib del "WLAN1_AC_TBL.${FORM_IDX}"
-        mib commit
-        wlan_apply restart
-
-        printf "Status: 200 OK\r\n"
-        printf "Content-Type: text/plain\r\n\r\n"
-        printf "OK"
         exit 0
     fi
 

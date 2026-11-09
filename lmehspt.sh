@@ -97,17 +97,45 @@ QOS_VIP_TARGET_MS="40"
 QOS_BULK_TARGET_MS="80"
 # Queue discipline under every per-user Band 1 / Band 2 HTB class (see
 # _qos_add_leaf()). Set from www2 > Hotspot > Bandwidth & QoS.
-#   auto     - fq_codel when this kernel can use it, otherwise sfq (default)
+#   auto     - cake when it can be used (already in the kernel, else insmod'ed
+#              from QOS_CAKE_KO), else fq_codel when it can use it, else sfq
+#              (default)
+#   cake     - always cake. If it cannot be used the leaves are left on the
+#              kernel's plain FIFO (NO fq_codel / sfq substitution) and the
+#              admin page says so - forcing means forcing.
 #   fq_codel - always fq_codel. If it cannot be used the leaves are left on the
 #              kernel's plain FIFO (NO sfq substitution) and the admin page
 #              says so - forcing means forcing.
 #   sfq      - always sfq (how it worked before this option existed)
 # fq_codel is a loadable module on this platform; qos_qdisc_resolve() insmods
 # QOS_FQ_CODEL_KO on demand. The unauthenticated-client buckets (990:, 299:)
-# deliberately stay on sfq: they rely on its tiny hard limit and the "flow
-# hash" per-IP emulation, not on AQM.
+# stay on sfq (tiny hard limit + "flow hash" per-IP emulation, not AQM) UNLESS
+# cake is the active qdisc: then they become cake too, because triple-isolate
+# already does the per-host fairness that emulation was faking.
 QOS_QDISC="auto"
+# CHANGED: "auto" skips cake (fq_codel, else sfq) while this is 0. Lives in
+# lmehspt.sh, which every OTA replaces wholesale, so it holds until the next
+# update ships a lmehspt.sh without it (or with 1). An admin-forced "cake" is
+# NOT affected. Set 1 to give auto its old cake-first order back.
+QOS_AUTO_CAKE="0"
 QOS_FQ_CODEL_KO="/lmepisowifi/sch/sch_fq_codel.ko"
+# Options for cake when it is the active leaf qdisc (auto or forced cake). cake sits
+# UNDER the HTB classes, which do all the rate shaping, so it runs "unlimited"
+# and only does queue management. triple-isolate = per-flow fairness inside
+# per-host fairness; nat = resolve the real inside address via conntrack (WAN
+# egress is post-MASQUERADE, so without it every client looks like the WAN IP).
+# Retune here, e.g. append "besteffort".
+QOS_CAKE_ARGS="unlimited triple-isolate nat"
+# cake is a loadable module on this platform too: qos_qdisc_resolve() insmods
+# QOS_CAKE_KO if the kernel does not already have cake. The firmware's own tc
+# may predate cake (it then fails to parse "cake" or its options even with the
+# module loaded), so a newer tc is bundled next to the module. It is used ONLY
+# for the cake qdisc adds - and only when the system tc cannot do them; every
+# other tc call keeps using the system tc.
+QOS_CAKE_KO="/lmepisowifi/sch/sch_cake.ko"
+QOS_CAKE_TC_BUNDLED="/lmepisowifi/sch/tc"
+# The tc that cake qdisc adds run through; set by _qos_cake_ready().
+QOS_CAKE_TC="tc"
 # Anti-tether's TTL pieces are loadable modules here too. setup_anti_tether()
 # insmods them on demand (see _at_ko_ready) and, if that fails for ANY reason,
 # drops to the next tier - the original mark+choke / tc / TOS chain.
@@ -204,6 +232,14 @@ VOUCHER_COOLDOWN="60"
 # already-paused session untouched. On by default (matches the system's
 # original always-available behavior).
 VOUCHER_ENABLED="1"
+# Free WiFi one-tap access - see defaults.env for the full rationale. Read by
+# login.sh (the claim) and status.sh (button visibility) via coin_config.env.
+FREE_WIFI_ENABLED="0"
+FREE_WIFI_MINUTES="10"
+FREE_WIFI_COOLDOWN="1440"
+FREE_WIFI_REQUIRE_INTERNET="1"
+FREE_WIFI_EXPIRY_MODE="none"
+FREE_WIFI_EXPIRY_MINUTES="60"
 # Flag file: present = internet reachable as of the last check, absent = not
 # reachable. Written by the watchdog loop's internet-check tick; read by
 # coin.sh and login.sh. A plain existence check keeps those per-request reads
@@ -711,54 +747,112 @@ wanprofile_default_iface() {
     return 0
 }
 
-wait_for_wlan_ready() {
-    local max_wait=90 waited=0
+# ── SDK startup gate ─────────────────────────────────────────────────────────
+# The Realtek SDK's `startup` program ("startup&", launched from
+# /etc/init.d/rc22 or rc32 — i.e. BEFORE rc35, where this project's boot
+# scripts are invoked) is what applies the MIB at boot. It runs strictly in
+# sequence: LAN ports (eth0.N.0) -> WAN -> each radio (iwpriv set_mib for
+# SSID/auth/crypto, `ifconfig wlanX up`, then `brctl addif br0 wlanX`) ->
+# everything else (firewall, daemons, IPv6, ...), and its main() ends with
+# pthread_exit(), so the process is gone exactly when ALL of that is done.
+# Because the SDK itself is what puts the LAN ports and radios into br0, moving
+# anything between bridges while it is still running races it: it can
+# re-enslave a port we just moved, or we move a radio that is about to be
+# configured. That is why we wait on the process itself — not on a proxy such
+# as "is X in br0 yet", "has monitord started" or "has wlan0-vap0 appeared",
+# each of which turns true well before the setup is really finished.
+#
+# If `startup` is not running (already finished, or never present) this is a
+# no-op, so a runtime hotspot restart never waits.
+#
+# NOTE: www2/sh/repurposeaswan.sh carries its own copy of this gate (it is a
+# standalone daemon and cannot source this file) — keep the two in sync.
+SDK_STARTUP_WAIT_MAX=300   # hard cap in seconds; we proceed anyway after this
+SDK_STARTUP_WAITED=0       # seconds the last wait_for_sdk_startup() spent waiting
 
+sdk_startup_running() {
+    $BB pidof startup >/dev/null 2>&1
+}
+
+# Returns 0 once `startup` is not running (it already was, or it finished while
+# we waited); 1 if it was still running when the cap expired — we then proceed
+# anyway rather than leave the hotspot dead behind a hung SDK.
+wait_for_sdk_startup() {
+    SDK_STARTUP_WAITED=0
+    sdk_startup_running || return 0
+    logger -t lmehspt "SDK startup (MIB + interface setup) still running - waiting before touching bridge membership" 2>/dev/null
+    while sdk_startup_running; do
+        if [ "$SDK_STARTUP_WAITED" -ge "$SDK_STARTUP_WAIT_MAX" ]; then
+            logger -t lmehspt "SDK startup still running after ${SDK_STARTUP_WAIT_MAX}s - continuing anyway" 2>/dev/null
+            return 1
+        fi
+        sleep 1
+        SDK_STARTUP_WAITED=$((SDK_STARTUP_WAITED + 1))
+    done
+    logger -t lmehspt "SDK startup finished after ${SDK_STARTUP_WAITED}s" 2>/dev/null
+    return 0
+}
+
+# True while <iface> is a real, administratively-UP netdev that has not been
+# enslaved yet: i.e. the SDK is somewhere between `ifconfig X up` and
+# `brctl addif br0 X`. Deliberately NOT "awaiting": an interface already in br0
+# or in the hotspot bridge, one that is down (a disabled radio/SSID never joins
+# br0), one that does not exist, and a port repurposeaswan.sh has taken out of
+# br0 as a routed WAN.
+iface_awaiting_bridge() {
+    local _if="$1" _fl
+    [ -d "/sys/class/net/$_if" ] || return 1
+    [ -d "/sys/class/net/br0/brif/$_if" ] && return 1
+    [ -d "/sys/class/net/$HOTSPOT_BR/brif/$_if" ] && return 1
+    read -r _fl < "/sys/class/net/$_if/flags" 2>/dev/null || return 1
+    [ $((_fl & 1)) -eq 1 ] || return 1      # IFF_UP
+    $BB grep -qx "$_if" /tmp/repurpose_active 2>/dev/null && return 1
+    return 0
+}
+
+wait_for_wlan_ready() {
+    local max_wait waited=0 pending=0 _if
+
+    # 1. Wait for the SDK to finish applying the MIB and setting up every
+    #    interface. Everything below (and everything after this function —
+    #    cleanup_old_hotspot / setup_network move ports between br0 and the
+    #    hotspot bridge) only runs once that is true.
+    if wait_for_sdk_startup; then
+        max_wait=20
+    else
+        max_wait=90     # SDK hung past the cap: give stragglers longer
+    fi
+
+    # 2. Read the vendor-WAN port claim only now: PON_MODE / WAN_PHY_PORT are
+    #    MIB values that decide which port is left out of the hotspot bridge.
     refresh_wan_claim force
 
     # No interfaces configured (or every one is the vendor's RJ45 WAN port) —
     # nothing to wait for.
     [ -z "$(hotspot_ifaces)" ] && return
 
-    # Wait for every interface in HOTSPOT_INTERFACES to be added to br0
-    # by the vendor init — not just wlan*. eth0.2.0 (and any other eth
-    # VLAN sub-if) joins br0 within ~12s of boot, well before wlan even
-    # starts its MIB setup, so including it here costs nothing (it's
-    # already satisfied on the very first check); it just means this
-    # loop stays correct if HOTSPOT_INTERFACES ever changes shape,
-    # instead of hardcoding a wlan-only assumption.
-    #
-    # The wlan side is still the real gate: the full iwpriv set_mib
-    # sequence (SSID, auth, crypto) for wlanX always completes before
-    # brctl addif br0 wlanX on all Realtek SDK builds, regardless of
-    # where in rc35 monitord happens to be launched.
-    #
-    # Do NOT use monitord: on (PGN6401V) it launches at
-    # the START of rc35 (~10s), 13+ seconds before WLAN MIB is written.
-    # Do NOT use wlan0-vap0 existence: that's just MAC setup in rc32.
-    while [ "$waited" -lt "$max_wait" ]; do
-        local all_ready=1 uptime_now _if
-        uptime_now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"
-
-        for _if in $(hotspot_ifaces); do
-            [ -d "/sys/class/net/br0/brif/$_if" ] && continue
-
-            # System has been up over 60s and this interface still isn't
-            # in br0 — this is no longer a mid-boot timing race (that
-            # window is well within 60s on both firmwares), so assume
-            # it's already ready rather than waiting out the rest of
-            # max_wait.
-            if [ -n "$uptime_now" ] && [ "$uptime_now" -gt 60 ]; then
-                continue
-            fi
-
-            all_ready=0
+    # 3. Belt and braces, only if we actually had to wait on the SDK (so its
+    #    interface setup JUST ended): confirm each hotspot interface that came
+    #    up has landed in a bridge, bounded so a port that never joins can't
+    #    stall boot. When startup was already done before we looked there is
+    #    nothing to race, so this is skipped.
+    if [ "$SDK_STARTUP_WAITED" -gt 0 ]; then
+        while [ "$waited" -lt "$max_wait" ]; do
+            pending=0
+            for _if in $(hotspot_ifaces); do
+                if iface_awaiting_bridge "$_if"; then
+                    pending=1
+                    break
+                fi
+            done
+            [ "$pending" -eq 0 ] && break
+            sleep 1
+            waited=$((waited + 1))
         done
-
-        [ "$all_ready" -eq 1 ] && break
-        sleep 1
-        waited=$((waited + 1))
-    done
+        if [ "$pending" -eq 1 ]; then
+            logger -t lmehspt "hotspot interface(s) still not in br0 ${max_wait}s after SDK startup ended - continuing" 2>/dev/null
+        fi
+    fi
 
     # Settle: VAP MIBs and ebtables portmapping rules finish shortly
     # after the radios join br0 (~1-2s on both firmwares).
@@ -771,7 +865,6 @@ wait_for_wlan_ready() {
         ip route add default via "$(resolve_br0_gateway)" dev br0 2>/dev/null
     fi
 }
-
 
 # ── Extra NodeMCU coin-acceptor firewall isolation ─────────────────────────
 # Applies the same "unreachable except via the router's own proxy scripts"
@@ -1300,7 +1393,7 @@ _qos_sfq_limit() {
 }
 
 # ------------------------------------------------------------------
-# Leaf qdisc selection - QOS_QDISC = auto | fq_codel | sfq
+# Leaf qdisc selection - QOS_QDISC = auto | cake | fq_codel | sfq
 # ------------------------------------------------------------------
 _QOS_FQ_WHY=""
 
@@ -1351,29 +1444,129 @@ _qos_fq_codel_ready() {
     return 1
 }
 
+_QOS_CAKE_WHY=""
+
+# Can a cake qdisc with the exact option string the leaves use be created right
+# now, using the tc binary $1? Same attach-to-lo-and-remove trick as
+# _qos_fq_codel_probe(). It fails for either reason: the kernel has no cake, or
+# that tc cannot parse "cake" / its options.
+_qos_cake_probe() {
+    # $QOS_CAKE_ARGS is deliberately unquoted: it is several tc words.
+    "$1" qdisc add dev lo root cake $QOS_CAKE_ARGS 2>/dev/null || return 1
+    "$1" qdisc del dev lo root 2>/dev/null
+    return 0
+}
+
+# Find a tc that can create cake, trying the system tc first and the bundled
+# one second, and record it in $QOS_CAKE_TC. 0 if one works, else 1.
+_qos_cake_pick_tc() {
+    if _qos_cake_probe tc; then
+        QOS_CAKE_TC="tc"
+        return 0
+    fi
+    if [ -f "$QOS_CAKE_TC_BUNDLED" ]; then
+        # OTA/tar extraction normally keeps the mode, but don't depend on it.
+        [ -x "$QOS_CAKE_TC_BUNDLED" ] || chmod +x "$QOS_CAKE_TC_BUNDLED" 2>/dev/null
+        if _qos_cake_probe "$QOS_CAKE_TC_BUNDLED"; then
+            QOS_CAKE_TC="$QOS_CAKE_TC_BUNDLED"
+            return 0
+        fi
+    fi
+    QOS_CAKE_TC="tc"
+    return 1
+}
+
+# 0 if cake is usable right now (with $QOS_CAKE_TC set to the tc that can drive
+# it), else 1 with the reason in $_QOS_CAKE_WHY. Same shape as
+# _qos_fq_codel_ready(): checks BEFORE insmod, so a kernel with cake built in,
+# or a module that is already loaded, never touches the .ko; and one insmod,
+# never retried.
+#   1. cake already in the kernel + system tc can drive it  -> system tc
+#   2. cake already in the kernel + only the bundled tc can  -> bundled tc
+#   3. cake not in the kernel -> insmod QOS_CAKE_KO, then 1/2 again
+_qos_cake_ready() {
+    local err="" ins nofile=0
+    _QOS_CAKE_WHY=""
+    if _qos_cake_pick_tc; then
+        [ "$QOS_CAKE_TC" = "tc" ] || logger -t lmehspt "qos: system tc cannot drive cake - using $QOS_CAKE_TC" 2>/dev/null
+        return 0
+    fi
+    # A module that is already loaded is not insmod'ed again (it would only
+    # fail with "File exists"); then the only thing left to blame is tc.
+    if ! $BB grep -q '^sch_cake ' /proc/modules 2>/dev/null; then
+        if [ -f "$QOS_CAKE_KO" ]; then
+            # Same insmod choice as _qos_fq_codel_ready(): a failing insmod must
+            # not be retried through busybox (that only repeats the same error).
+            if command -v insmod >/dev/null 2>&1; then ins="insmod"; else ins="$BB insmod"; fi
+            err=$($ins "$QOS_CAKE_KO" 2>&1)
+            if _qos_cake_pick_tc; then
+                logger -t lmehspt "qos: loaded $QOS_CAKE_KO" 2>/dev/null
+                [ "$QOS_CAKE_TC" = "tc" ] || logger -t lmehspt "qos: system tc cannot drive cake - using $QOS_CAKE_TC" 2>/dev/null
+                return 0
+            fi
+        else
+            nofile=1
+        fi
+    fi
+    # Still no. If sch_cake is in the kernel the module is fine and it is a tc /
+    # option problem; otherwise the kernel can't have it.
+    if $BB grep -q '^sch_cake ' /proc/modules 2>/dev/null; then
+        _QOS_CAKE_WHY="sch_cake is loaded but no tc can create it with the configured options (QOS_CAKE_ARGS invalid, or $QOS_CAKE_TC_BUNDLED missing/unusable)"
+    elif [ "$nofile" = "1" ]; then
+        _QOS_CAKE_WHY="cake unavailable - $QOS_CAKE_KO not found"
+    else
+        # Keep just the reason ("Invalid module format", "No such file"...), the
+        # same sanitising as fq_codel's: it ends up in the status file / JSON.
+        err=$(printf '%s\n' "$err" | $BB head -n 1 | $BB sed 's/^.*: //' | $BB tr -d '\r"|\\$\140' | $BB cut -c1-80)
+        _QOS_CAKE_WHY="kernel has no cake${err:+ - insmod: $err}"
+    fi
+    return 1
+}
+
 # Decide which qdisc add_user_qos() will use and publish it for the admin page.
 # Runs at the top of setup_qos(), i.e. at boot and on every QoS rebuild, so a
 # change of the dropdown takes effect on the next Save & Apply.
-#   QOS_QDISC_EFFECTIVE = fq_codel | sfq | none (forced fq_codel, unusable)
+#   QOS_QDISC_EFFECTIVE = cake | fq_codel | sfq | none (forced cake / fq_codel, unusable)
+# A forced cake / fq_codel / sfq is honoured as is: a forced cake or fq_codel that
+# cannot be used is NOT replaced by another qdisc (the leaves stay plain FIFO and
+# the admin page says why). Only auto falls back: cake -> fq_codel -> sfq.
 qos_qdisc_resolve() {
     local want="${QOS_QDISC:-auto}" note="" tmp="${QOS_QDISC_STATUS}.tmp"
+    _QOS_CAKE_WHY=""
     case "$want" in
-        auto|fq_codel|sfq) ;;
+        auto|cake|fq_codel|sfq) ;;
         *) note="unknown QOS_QDISC value, treated as auto"; want=auto ;;
     esac
     case "$want" in
         sfq)
             QOS_QDISC_EFFECTIVE="sfq" ;;
+        cake)
+            if _qos_cake_ready; then
+                # No note - the admin page renders any note as a warning.
+                QOS_QDISC_EFFECTIVE="cake"
+            else
+                QOS_QDISC_EFFECTIVE="none"
+                note="cake is forced but unusable ($_QOS_CAKE_WHY) - client queues are plain FIFO; choose Auto, fq_codel or sfq"
+                logger -t lmehspt "qos: $note" 2>/dev/null
+            fi ;;
         *)
-            if _qos_fq_codel_ready; then
+            if [ "$want" = "auto" ] && [ "${QOS_AUTO_CAKE:-0}" = "1" ] && _qos_cake_ready; then
+                # cake replaces fq_codel/sfq (not stacked on them). No note -
+                # the admin page renders any note as a warning.
+                QOS_QDISC_EFFECTIVE="cake"
+            elif _qos_fq_codel_ready; then
                 QOS_QDISC_EFFECTIVE="fq_codel"
+                if [ -n "$_QOS_CAKE_WHY" ]; then
+                    note="$_QOS_CAKE_WHY - using fq_codel"
+                    logger -t lmehspt "qos: $note" 2>/dev/null
+                fi
             elif [ "$want" = "fq_codel" ]; then
                 QOS_QDISC_EFFECTIVE="none"
                 note="fq_codel is forced but unusable ($_QOS_FQ_WHY) - client queues are plain FIFO; choose Auto or sfq"
                 logger -t lmehspt "qos: $note" 2>/dev/null
             else
                 QOS_QDISC_EFFECTIVE="sfq"
-                note="fq_codel unavailable, using sfq ($_QOS_FQ_WHY)"
+                note="fq_codel unavailable, using sfq ($_QOS_FQ_WHY)${_QOS_CAKE_WHY:+; $_QOS_CAKE_WHY}"
                 logger -t lmehspt "qos: $note" 2>/dev/null
             fi ;;
     esac
@@ -1406,10 +1599,23 @@ _qos_fq_codel_args() {
 }
 
 # Attach one leaf queue.  $1 dev  $2 parent  $3 handle  $4 sfq limit  $5 fq_codel options
+# (cake needs neither: it takes $QOS_CAKE_ARGS and does its own sizing.)
 _qos_add_leaf() {
     [ -n "$QOS_QDISC_EFFECTIVE" ] || qos_qdisc_resolve
     case "$QOS_QDISC_EFFECTIVE" in
         none) return 0 ;;
+        cake)
+            # $QOS_CAKE_ARGS is deliberately unquoted: it is several tc words.
+            "$QOS_CAKE_TC" qdisc add dev "$1" parent "$2" handle "$3" cake $QOS_CAKE_ARGS 2>/dev/null && return 0
+            # Forced cake never substitutes another qdisc.
+            if [ "${QOS_QDISC:-auto}" = "cake" ]; then
+                logger -t lmehspt "qos: cake add failed on $1 parent $2 - forced, no fallback" 2>/dev/null
+                return 1
+            fi
+            # Auto mode: a per-queue failure (e.g. out of memory) degrades to
+            # sfq like fq_codel's does.
+            logger -t lmehspt "qos: cake add failed on $1 parent $2 - using sfq for this queue" 2>/dev/null
+            ;;
         fq_codel)
             # $5 is deliberately unquoted: it is several tc words.
             tc qdisc add dev "$1" parent "$2" handle "$3" fq_codel $5 2>/dev/null && return 0
@@ -1525,6 +1731,7 @@ add_user_qos() {
     # instead of ballooning on slower (e.g. LTE) links. When fq_codel is the
     # active qdisc (QOS_QDISC, resolved by qos_qdisc_resolve() in setup_qos)
     # its options are scaled to the same rate instead - see _qos_fq_codel_args().
+    # cake needs neither: it uses QOS_CAKE_ARGS and sizes itself (see _qos_add_leaf()).
     [ -n "$QOS_QDISC_EFFECTIVE" ] || qos_qdisc_resolve
     local _vip_fq="" _bulk_fq=""
     _vip_limit=$(_qos_sfq_limit "$_rate_kbit" "${QOS_VIP_TARGET_MS:-40}" 32)
@@ -1637,7 +1844,9 @@ restore_qos_sessions() {
         [ -z "$ip" ] && continue
         cid=$(ip_to_cid "$ip")
         [ -z "$cid" ] && continue
-        tc class show dev $WAN_INT classid 1:$cid 2>/dev/null | $BB grep -q ":" && continue
+        # "parent 1:" scopes the kernel-side dump to the root HTB (see the note
+        # in check_inactivity); the classid match is unchanged.
+        tc class show dev $WAN_INT parent 1: classid 1:$cid 2>/dev/null | $BB grep -q ":" && continue
         add_user_qos "$mac"
     done < "$SESSION_FILE"
     # A newly (re)created class above changes how many sessions are online,
@@ -1870,12 +2079,34 @@ teardown_anti_tether() {
     # Remove the choke class
     tc class  del dev "$wan_if" classid 1:666 2>/dev/null
 }
+# Leaf under the shared unauthenticated-client class.  $1 dev  $2 parent
+# $3 handle  $4 flow-hash key (src for upload, dst for download)
+#   cake active -> cake: triple-isolate gives every unauth client its own fair
+#                  share (and nat sees past the WAN-side MASQUERADE), so the
+#                  PCQ emulation below is not needed. NO flow-hash filter is
+#                  attached: a tc filter on cake overrides cake's own flow
+#                  hashing and would collapse each host into a single flow.
+#   otherwise   -> SFQ with a low packet limit (12) to drop early and trigger
+#                  TCP backoff, plus PCQ emulation: a flow classifier forcing
+#                  SFQ to hash strictly by $4 (per-IP, not per-connection).
+# If cake cannot be attached it falls through to the SFQ path (also when cake is
+# forced: this is the shared unauthenticated bucket, not a client queue, and it
+# must never be left unshaped).
+_qos_add_unauth_leaf() {
+    if [ "$QOS_QDISC_EFFECTIVE" = "cake" ] && \
+       "$QOS_CAKE_TC" qdisc add dev "$1" parent "$2" handle "$3" cake $QOS_CAKE_ARGS 2>/dev/null; then
+        return 0
+    fi
+    tc qdisc add dev "$1" parent "$2" handle "$3" sfq perturb 10 limit 12
+    tc filter add dev "$1" parent "$3" protocol ip prio 1 flow hash keys "$4" perturb 10 divisor 1024 2>/dev/null
+}
+
 setup_qos() {
     # Normalise rate strings (handles bare m/k/g and mbps/kbps suffixes)
     GLOBAL_RATE=$(_norm_rate "$GLOBAL_RATE")
     UNAUTH_RATE=$(_norm_rate "$UNAUTH_RATE")
 
-    # Pick the per-user leaf qdisc (fq_codel / sfq) for this rebuild. Done
+    # Pick the per-user leaf qdisc (cake / fq_codel / sfq) for this rebuild. Done
     # before the trees are torn down: it may insmod the module and probes on lo,
     # neither of which touches the hotspot interfaces.
     qos_qdisc_resolve
@@ -1893,10 +2124,8 @@ setup_qos() {
     
     # Default unauth class with precise quantum
     tc class add dev $WAN_INT parent 1:1 classid 1:99 htb rate $UNAUTH_RATE  ceil $GLOBAL_RATE burst 4k quantum 1500
-    # SFQ with a low packet limit (12) to drop early and trigger TCP backoff
-    tc qdisc add dev $WAN_INT parent 1:99 handle 990: sfq perturb 10 limit 12
-    # PCQ Emulation: force unauth upload SFQ to hash strictly by source IP
-    tc filter add dev $WAN_INT parent 990: protocol ip prio 1 flow hash keys src perturb 10 divisor 1024 2>/dev/null
+    # cake (when active) or SFQ with a low packet limit (12) - see _qos_add_unauth_leaf()
+    _qos_add_unauth_leaf $WAN_INT 1:99 990: src
 
     # ------------------------------------------------------------
     # DOWNLOAD (LAN Bridge) CONFIGURATION
@@ -1907,10 +2136,8 @@ setup_qos() {
     
     # Default unauth class with precise quantum
     tc class add dev $HOTSPOT_BR parent 2:1 classid 2:99 htb rate $UNAUTH_RATE  ceil $GLOBAL_RATE burst 4k quantum 1500
-    # SFQ with low packet limit (12)
-    tc qdisc add dev $HOTSPOT_BR parent 2:99 handle 299: sfq perturb 10 limit 12
-    # PCQ Emulation: force unauth download SFQ to hash strictly by destination IP
-    tc filter add dev $HOTSPOT_BR parent 299: protocol ip prio 1 flow hash keys dst perturb 10 divisor 1024 2>/dev/null
+    # cake (when active) or SFQ with low packet limit (12)
+    _qos_add_unauth_leaf $HOTSPOT_BR 2:99 299: dst
 
     # Apply anti-tethering filters after QoS resets
     case "${ANTI_TETHER:-0}" in 1|yes|true) setup_anti_tether ;; esac
@@ -1997,6 +2224,14 @@ pause_session() {
 }
 
 check_inactivity() {
+    # The crash seen here with cake leaves (SIGSEGV in tc, then "Kernel panic -
+    # Aiee, killing interrupt handler!") was an issue in cake, not tc: on
+    # kernels < 4.8 sch_cake's ->dump_stats() / ->dump_class_stats() returned
+    # with the root qdisc lock held (BH disabled) when the netlink dump skb ran
+    # out of room inside cake's own attribute writes. Fixed in sch/sch_cake.ko.
+    # The dump below is ALSO scoped to the root HTB ("parent 2:") so it never
+    # walks the per-flow classes of every cake leaf - that is what made it hit
+    # the bug so often (and it is far cheaper).
     [ "${AUTO_PAUSE_ENABLED:-1}" = "1" ] || return
     [ -z "$INACTIVITY_TIMEOUT" ] && return
     [ "$INACTIVITY_TIMEOUT" -le 0 ] 2>/dev/null && return
@@ -2032,7 +2267,11 @@ check_inactivity() {
         if [ -n "$client_ip" ]; then
             cid=$(ip_to_cid "$client_ip")
             if [ -n "$cid" ]; then
-                dl_pkts=$(tc -s class show dev $HOTSPOT_BR classid 2:$cid 2>/dev/null \
+                # "parent 2:" is the only filter the KERNEL applies (it picks
+                # which qdisc to walk); "classid" is filtered by tc afterwards.
+                # Without it the kernel dumps every class of every qdisc on
+                # the bridge, including each active flow of every cake leaf.
+                dl_pkts=$(tc -s class show dev $HOTSPOT_BR parent 2: classid 2:$cid 2>/dev/null \
                     | $BB awk '/^[[:space:]]*Sent/{print $4+0; exit}')
             fi
             [ -z "$dl_pkts" ] && dl_pkts=0
@@ -2137,6 +2376,16 @@ write_coin_config() {
         printf 'VOUCHER_STRIKE_THRESHOLD="%s"\n' "${VOUCHER_STRIKE_THRESHOLD:-3}"
         printf 'VOUCHER_COOLDOWN="%s"\n'    "${VOUCHER_COOLDOWN:-60}"
         printf 'VOUCHER_ENABLED="%s"\n'     "${VOUCHER_ENABLED:-1}"
+        # Same "without this line" reasoning as VOUCHER_STRIKE_* above: login.sh
+        # and status.sh only ever see these via this cache file, so leaving
+        # them out would reset the admin's Free WiFi settings (back to off)
+        # on every write_coin_config() call - hotspot restart, boot, etc.
+        printf 'FREE_WIFI_ENABLED="%s"\n'   "${FREE_WIFI_ENABLED:-0}"
+        printf 'FREE_WIFI_MINUTES="%s"\n'   "${FREE_WIFI_MINUTES:-10}"
+        printf 'FREE_WIFI_COOLDOWN="%s"\n'  "${FREE_WIFI_COOLDOWN:-1440}"
+        printf 'FREE_WIFI_REQUIRE_INTERNET="%s"\n' "${FREE_WIFI_REQUIRE_INTERNET:-1}"
+        printf 'FREE_WIFI_EXPIRY_MODE="%s"\n'    "${FREE_WIFI_EXPIRY_MODE:-none}"
+        printf 'FREE_WIFI_EXPIRY_MINUTES="%s"\n' "${FREE_WIFI_EXPIRY_MINUTES:-60}"
         printf 'INTERNET_UP_FILE="%s"\n'    "${INTERNET_UP_FILE:-/tmp/internet_up}"
         printf 'HOTSPOT_BR="%s"\n'          "$HOTSPOT_BR"
         printf 'SESSION_FILE="%s"\n'        "$SESSION_FILE"
@@ -2472,6 +2721,7 @@ fi
     # because the 404 is turned into a 302 before any error page is considered.
 cat > httpd.conf <<'EOF'
 404to302:cgi-bin/redirect.sh
+CacheControl:no-cache
 EOF
 
 

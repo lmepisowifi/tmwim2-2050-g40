@@ -30,6 +30,8 @@ AUTO_PAUSED_FILE="/lmepisowifi/hotspot_data/auto_paused.txt"
 [ -f /lmepisowifi/hotspot/macfix.sh ] && . /lmepisowifi/hotspot/macfix.sh
 # WiFi Rates expiry/validity bucket tracking - see ratevalidity.sh.
 [ -f /lmepisowifi/hotspot/ratevalidity.sh ] && . /lmepisowifi/hotspot/ratevalidity.sh
+# Free WiFi one-tap claim + per-device cooldown tracking - see freewifi.sh.
+[ -f /lmepisowifi/hotspot/freewifi.sh ] && . /lmepisowifi/hotspot/freewifi.sh
 
 _unlock() { rm -f /tmp/hotspot_session.lock/pid 2>/dev/null; rmdir /tmp/hotspot_session.lock 2>/dev/null; }
 _lock() {
@@ -219,6 +221,14 @@ RESUME=$(
     | $BB tr -dc '0-9'
 )
 
+FREE=$(
+    $BB echo "$POST_DATA" \
+    | $BB tr '&' '\n' \
+    | $BB grep '^free=' \
+    | $BB cut -d '=' -f 2- \
+    | $BB tr -dc '0-9'
+)
+
 if [ -z "$CLIENT_MAC" ] || [ "$CLIENT_MAC" = "00:00:00:00:00:00" ]; then
     echo '{"ok":false,"error":"no_mac"}'
     exit 0
@@ -286,6 +296,67 @@ if [ -n "$RESUME" ] && [ "$RESUME" = "1" ]; then
     fi
     NEW_EXPIRY=$(( NOW + DURATION ))
     NEW_TOTAL=$TOTAL
+elif [ "$FREE" = "1" ]; then
+    # --- Free WiFi: one-tap claim of FREE_WIFI_MINUTES, once per cooldown ---
+    # Master switch (off by default - this hands out internet for nothing,
+    # so the admin opts in under www2 > Hotspot > Free WiFi). Also fails
+    # closed if freewifi.sh didn't load, rather than granting time with no
+    # cooldown tracking behind it.
+    if [ "${FREE_WIFI_ENABLED:-0}" != "1" ] || ! command -v fw_record >/dev/null 2>&1; then
+        echo '{"ok":false,"error":"free_disabled"}'
+        exit 0
+    fi
+
+    # Someone already online (paid, voucher, or an earlier free claim) has
+    # nothing to claim - refuse instead of silently stacking free time onto
+    # a live session. A *paused* balance is fine: it falls through to the
+    # shared stacking code below exactly like a voucher redeemed onto one.
+    if [ -n "$EXISTING" ]; then
+        _FEXP=$($BB echo "$EXISTING" | $BB awk '{print $2}')
+        if [ "${_FEXP:-0}" -gt "$NOW" ] 2>/dev/null; then
+            echo '{"ok":false,"error":"already_online"}'
+            exit 0
+        fi
+    fi
+
+    # Don't burn a customer's claim (and start their cooldown) while the
+    # router can't actually reach the internet. Same /tmp/internet_up flag
+    # the coin/voucher gates use. On by default; FREE_WIFI_REQUIRE_INTERNET=0
+    # for WANs where the watchdog's ICMP check can't pass but HTTP works.
+    if [ "${FREE_WIFI_REQUIRE_INTERNET:-1}" = "1" ] && [ ! -f "${INTERNET_UP_FILE:-/tmp/internet_up}" ]; then
+        echo '{"ok":false,"error":"no_internet"}'
+        exit 0
+    fi
+
+    # The cooldown is wall-clock based (it has to survive a reboot), so
+    # refuse until NTP has set the clock rather than stamp a 1970 time.
+    if ! fw_clock_ok; then
+        echo '{"ok":false,"error":"clock_not_ready"}'
+        exit 0
+    fi
+
+    fw_wait "$CLIENT_MAC"
+    if [ "${FW_WAIT:-0}" -ne 0 ]; then
+        echo "{\"ok\":false,\"error\":\"free_wait\",\"wait\":${FW_WAIT}}"
+        exit 0
+    fi
+
+    _FMIN=$(_fw_num "${FREE_WIFI_MINUTES:-10}" 10)
+    [ "$_FMIN" -ge 1 ] || _FMIN=10
+
+    # Stamp the claim BEFORE granting (same fail-closed order as burning a
+    # voucher): if the record can't be written, no time is handed out.
+    if ! fw_record "$CLIENT_MAC"; then
+        echo '{"ok":false,"error":"try_again"}'
+        exit 0
+    fi
+    DURATION=$(( _FMIN * 60 ))
+    # Optional expiry on the free time (FREE_WIFI_EXPIRY_MODE, see
+    # freewifi.sh). Remembered here and applied once the session below is
+    # actually written - same ordering coin_result.sh uses for rv_grant.
+    _FREE_GRANTED=1
+    _FREE_SECS=$DURATION
+    _FVAL=$(fw_validity_mins)
 else
     # Master switch: voucher input entirely disabled by the admin. Checked
     # before anything else in this branch (strikes, internet gate, code
@@ -468,6 +539,15 @@ fi
 # balance) — drop the auto-pause marker so a later manual pause doesn't
 # inherit a stale "system paused this" flag from before.
 [ -f "$AUTO_PAUSED_FILE" ] && { $BB grep -vx "$CLIENT_MAC" "$AUTO_PAUSED_FILE" > /tmp/login_ap.tmp 2>/dev/null; $BB mv /tmp/login_ap.tmp "$AUTO_PAUSED_FILE"; }
+
+# Free WiFi with an expiry set: merge this claim's time into the customer's
+# rate-validity bucket (ratevalidity.sh) so it forfeits if left paused past
+# the deadline, and stacks onto any still-valid bucket (the new window is
+# added on top of the existing deadline) exactly like a rate with a "Valid:"
+# does. Nothing to do for "no expiry" - the claim then behaves as before.
+if [ "${_FREE_GRANTED:-0}" = "1" ] && [ "${_FVAL:-0}" -gt 0 ] && command -v rv_grant >/dev/null 2>&1; then
+    rv_grant "$CLIENT_MAC" "$_FREE_SECS" "$(( _FVAL * 60 ))" "$NOW"
+fi
 
 if [ "$NEED_FW_RULES" = "true" ]; then
     iptables -t nat -I HOTSPOT 1 -m mac --mac-source "$CLIENT_MAC" -j RETURN 2>/dev/null

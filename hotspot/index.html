@@ -559,6 +559,28 @@
       color: var(--btn-rates-hover-color) !important;
     }
 
+    /* Green Free WiFi button. Colours fall back to built-in greens so every
+       theme (including third-party ones written before this button existed)
+       gets a sensible look; a theme can override via --btn-free-*. */
+    .btn-free {
+      background: var(--btn-free-bg, rgba(34, 197, 94, 0.14)) !important;
+      border: 1px solid var(--btn-free-border, #22c55e) !important;
+      color: var(--btn-free-color, #22c55e) !important;
+    }
+    .btn-free:hover {
+      background: var(--btn-free-hover-bg, #22c55e) !important;
+      border-color: var(--btn-free-hover-border, #22c55e) !important;
+      color: var(--btn-free-hover-color, #ffffff) !important;
+    }
+    .btn-free:disabled { opacity: 0.6; cursor: wait; }
+    .free-hint {
+      display: none;
+      margin-top: 8px;
+      font-size: 0.85rem;
+      text-align: center;
+      opacity: 0.75;
+    }
+
     /* Red styled Pause & Resume Buttons */
     #btn-resume, #btn-pause {
       background: var(--btn-danger-bg) !important;
@@ -813,6 +835,49 @@
   </style>
 
   <!--
+    Portal theme (www2 > Hotspot > Portal > Theme).
+    A theme is one extra stylesheet layered over the built-in styles above and
+    under the operator's Custom CSS below, so it can restyle (and re-lay out)
+    the same markup and the portal's behaviour never changes with the theme.
+    portal_theme.sh serves the saved theme's CSS, or nothing for the stock
+    look. It is a plain, parser-inserted <link> on purpose: the stylesheet is
+    guaranteed to be applied before the first screen is shown, so there is no
+    flash of the wrong theme.
+
+      /?theme=<id>   try another theme without saving it (e.g. on your phone)
+      /?notheme=1    safe mode: skip the theme entirely (stock look)
+
+    A theme is not the dark/light switch: that is <html data-theme>, a colour
+    mode every theme supports. This one is <html data-lme-theme>, set by the
+    script at the end of <body> once portal_config.sh has answered.
+  -->
+  <link id="theme-css" rel="stylesheet" href="/cgi-bin/portal_theme.sh">
+  <script>
+  (function () {
+    var l       = document.getElementById('theme-css');
+    var qs      = window.location.search;
+    var m       = /[?&]theme=([a-z0-9_-]{1,32})(&|$)/.exec(qs);
+    var preview = /[?&]cssprev=1(&|$)/.test(qs) && window.parent !== window;
+    window.__lmeTheme = { link: l, id: m ? m[1] : '' };
+    if (!l) return;
+
+    var off = /[?&]notheme=1(&|$)/.test(qs);
+    // A visit that already tripped the safety check keeps the stock look
+    if (!off && !preview) { try { off = window.sessionStorage.getItem('lme_theme_bad') === '1'; } catch (e) {} }
+    if (off) {
+      if (l.parentNode) l.parentNode.removeChild(l);
+      window.__lmeTheme.link = null;
+      window.__lmeTheme.id = '';
+      return;
+    }
+    if (m) {
+      l.href = '/cgi-bin/portal_theme.sh?id=' + m[1];
+      document.documentElement.setAttribute('data-lme-theme', m[1]);
+    }
+  })();
+  </script>
+
+  <!--
     Operator custom CSS (www2 > Hotspot > Portal > Custom CSS).
     It is added as its OWN <link>, after every built-in style, so (a) it wins
     the cascade at equal specificity and (b) a mistake inside it can only ever
@@ -978,10 +1043,13 @@
 
         <!-- Flexbox container perfectly spaces visible buttons by 8px without interfering margins -->
         <div class="d-flex flex-column gap-2">
+          <button class="btn btn-free" id="btn-free-login" onclick="doFreeWifi()" style="display:none;">Free WiFi</button>
           <button class="btn btn-coin" id="btn-coin-login" onclick="startCoinFlow(false)" style="display:none;">Insert Coin</button>
           <button class="btn btn-primary" id="btn-resume" onclick="doResume()" style="display:none;">Resume Time</button>
           <button class="btn btn-rates" id="btn-rates-login" onclick="openRatesModal()" style="display:none;">WiFi Rates</button>
         </div>
+
+        <div class="free-hint" id="free-hint"></div>
 
         <div class="add-panel" id="login-panel" style="display:block;">
           <label class="form-label" for="login-code">Voucher Code</label>
@@ -1760,6 +1828,9 @@ function checkStatus() {
         updateExpiryNotice('status-expiry-notice', d.expiring_remaining, d.expiring_deadline_secs);
       } else {
         renderDeviceInfo(d, 'l');
+        // Free WiFi button/hint (status.sh only sends free_* while the admin
+        // has it on). Returns true when this device can claim right now.
+        var freeAvail = updateFreeUI(d);
 
         // Auto-Resume switch (admin-configured): skip the paused screen
         // entirely and fire the same resume=1 request the button below
@@ -1778,7 +1849,7 @@ function checkStatus() {
           loginTitle.textContent = 'Time Paused';
           loginSub.textContent   = 'You can click the Resume Time Button to continue surfing.';
           
-          document.getElementById('resume-progress-wrap').style.display = 'flex';
+          document.getElementById('resume-progress-wrap').style.display = '';
           updateExpiryNotice('resume-expiry-notice', d.expiring_remaining, d.expiring_deadline_secs);
           
           var resumeStr = fmtCountdown(d.remaining);
@@ -1799,7 +1870,9 @@ function checkStatus() {
           document.getElementById('btn-resume').style.display = 'block';
         } else {
           loginTitle.textContent = 'Disconnected';
-          loginSub.textContent   = 'Insert Coins or Enter a voucher code to get online.';
+          loginSub.textContent   = freeAvail
+            ? 'Tap Free WiFi, insert coins or enter a voucher code to get online.'
+            : 'Insert Coins or Enter a voucher code to get online.';
           
           document.getElementById('resume-progress-wrap').style.display = 'none';
           document.getElementById('btn-resume').style.display = 'none';
@@ -1810,6 +1883,117 @@ function checkStatus() {
     .catch(function() { 
       setTimeout(checkStatus, 1500); 
     });
+}
+
+/* ────────────────────────────────────────────────────────────────
+   Free WiFi — one-tap free session (see freewifi.sh / login.sh free=1)
+──────────────────────────────────────────────────────────────── */
+var _freeBusy = false;
+var _freeRecheckID = null;
+
+function fmtFreeLen(mins) {
+  mins = Math.max(1, parseInt(mins, 10) || 0);
+  var h = Math.floor(mins / 60), m = mins % 60;
+  if (h > 0 && m > 0) return h + ' hr ' + m + ' min';
+  if (h > 0)          return h + (h === 1 ? ' hr' : ' hrs');
+  return m + ' min';
+}
+
+function fmtFreeWait(secs) {
+  var d = Math.floor(secs / 86400);
+  var h = Math.floor((secs % 86400) / 3600);
+  var m = Math.ceil((secs % 3600) / 60);
+  if (m === 60) { m = 0; h += 1; }
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return Math.max(1, m) + 'm';
+}
+
+// Shows the Free WiFi button when this device may claim, or a one-line hint
+// while it is waiting out its cooldown. Returns true only when it may claim.
+function updateFreeUI(d) {
+  var btn  = document.getElementById('btn-free-login');
+  var hint = document.getElementById('free-hint');
+  if (!btn || !hint) return false;
+  if (_freeRecheckID) { clearTimeout(_freeRecheckID); _freeRecheckID = null; }
+  btn.style.display  = 'none';
+  hint.style.display = 'none';
+  var mins = parseInt(d.free_minutes, 10);
+  if (!(mins > 0)) return false;               // admin has Free WiFi off
+
+  var wait = parseInt(d.free_wait, 10) || 0;
+  if (wait === 0) {
+    btn.textContent   = 'Free WiFi (' + fmtFreeLen(mins) + ')';
+    btn.style.display = 'block';
+    // Admin set an expiry on free time (status.sh free_valid, minutes): say
+    // so up front, since leftover time is forfeited if it isn't resumed in time.
+    var valid = parseInt(d.free_valid, 10) || 0;
+    if (valid > 0) {
+      hint.textContent   = 'Free time must be used within ' + fmtFreeLen(valid) +
+                           ' of claiming \u2014 anything left after that expires.';
+      hint.style.display = 'block';
+    }
+    return true;
+  }
+  if (wait < 0) {
+    hint.textContent = 'Free WiFi has already been used on this device.';
+  } else {
+    hint.textContent = 'Free WiFi is available again in ' + fmtFreeWait(wait) + '.';
+    // Re-check when the wait is over so the button comes back by itself.
+    // Capped: setTimeout overflows past ~24 days.
+    _freeRecheckID = setTimeout(checkStatus, Math.min(wait + 2, 2000000) * 1000);
+  }
+  hint.style.display = 'block';
+  return false;
+}
+
+function doFreeWifi() {
+  if (_freeBusy) return;
+  _freeBusy = true;
+  var btn = document.getElementById('btn-free-login');
+  if (btn) btn.disabled = true;
+
+  fetch('/cgi-bin/login.sh', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'free=1'
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    _freeBusy = false;
+    if (btn) btn.disabled = false;
+    if (d.ok) {
+      show('v-status');
+      // Same captive-portal-compatibility reload as a coin/resume success.
+      if (_reloadAfterTimeAdded) { location.reload(); return; }
+      checkStatus();
+      toastr.success('\u2714\ufe0f Connected! ' + fmtCountdown(d.remaining) + ' of free WiFi.');
+    } else {
+      var msgs = {
+        no_mac:          "Can't detect your device MAC yet \u2014 wait a few seconds and try again.",
+        free_disabled:   'Free WiFi is not available right now.',
+        already_online:  'You are already online.',
+        no_internet:     'No internet connection right now \u2014 Free WiFi is temporarily unavailable.',
+        clock_not_ready: 'The router is still starting up \u2014 please try again in a minute.',
+        try_again:       'Something went wrong \u2014 please try again.',
+        cooldown:        'Too many attempts. Please wait a moment.'
+      };
+      if (d.error === 'free_wait') {
+        toastr.error(d.wait < 0
+          ? 'Free WiFi has already been used on this device.'
+          : 'You can claim Free WiFi again in ' + fmtFreeWait(d.wait) + '.');
+      } else {
+        toastr.error(msgs[d.error] || 'Something went wrong \u2014 please try again.');
+      }
+      // Refresh so the button/hint (or the connected view) matches the server.
+      if (d.error !== 'cooldown') checkStatus();
+    }
+  })
+  .catch(function() {
+    _freeBusy = false;
+    if (btn) btn.disabled = false;
+    toastr.error('Connection error. Please try again.');
+  });
 }
 
 function doResume(auto) {
@@ -2738,7 +2922,14 @@ checkCoinEnabled();
 
     // Tab title / favicon always mirror the header (see _syncTabFromHeader above)
     _syncTabFromHeader();
-    
+
+    // Which portal theme is on screen, as <html data-lme-theme="..."> so an
+    // operator's Custom CSS can target one theme (html[data-lme-theme="banner-classic"] ...).
+    // A /?theme=<id> visit already set it; otherwise it is the saved theme, and
+    // "default" when the theme was switched off (safe mode / safety check).
+    var _lt = window.__lmeTheme || {};
+    if (!_lt.id) document.documentElement.setAttribute('data-lme-theme', (_lt.link && c.theme) ? c.theme : 'default');
+
     // 3. Carousel Logic
     var promos = c.promos || [];
     if(promos.length > 0){
@@ -2807,24 +2998,28 @@ checkCoinEnabled();
 
 <script>
 /* ────────────────────────────────────────────────────────────────────────────
-   Custom-CSS safety net  (+ hooks for the www2 "Custom CSS" live preview)
+   Custom-CSS / theme safety net
+   (+ hooks for the www2 "Theme" and "Custom CSS" live previews)
 
-   Does nothing unless an operator stylesheet (#custom-css, see <head>) is in
-   use. It protects the ways a customer gets online and back out of a window:
+   Does nothing unless an operator stylesheet (#custom-css) or a portal theme
+   (#theme-css) is in use, see <head>. It protects the ways a customer gets
+   online and back out of a window:
      · the card and the panel being shown
      · the voucher box + its Submit button, Insert Coin, Resume Time
      · the enabled buttons of an open coin / rates window (Done, Cancel, ×)
    Everything else (Pause, WiFi Rates, colours, fonts, layout…) is the
-   operator's call. If the custom CSS hides, shrinks, covers, pushes
-   off-screen or blanks one of the protected controls — on two checks in a
-   row — the stylesheet is dropped for this visit and the stock look is used.
+   operator's call. If the styling hides, shrinks, covers, pushes off-screen
+   or blanks one of the protected controls — on two checks in a row — the
+   operator's custom CSS is dropped for this visit (it is the likeliest
+   culprit). If the problem is still there two checks later, the theme is
+   dropped as well and the stock look is used.
    Nothing is written to the server, and www2 (port 8080) never loads this
-   stylesheet, so the operator can always get back in to fix it.
+   stylesheet or theme, so the operator can always get back in to fix it.
    ──────────────────────────────────────────────────────────────────────────── */
 (function () {
-  var C = window.__lmeCss;
-  if (!C || !C.link) return;
-  var preview = C.preview, hold = false, cur = 'live', strikes = 0, lastSig = '', timer = null;
+  var C = window.__lmeCss || {}, T = window.__lmeTheme || {};
+  if (!C.link && !T.link) return;
+  var preview = !!C.preview, hold = false, cur = 'live', strikes = 0, lastSig = '', timer = null;
   var realShow = window.show;
 
   function say(msg) { try { window.parent.postMessage(msg, '*'); } catch (e) {} }
@@ -2939,12 +3134,29 @@ checkCoinEnabled();
     return out;
   }
 
-  /* ── customer devices: drop the stylesheet if it breaks something, twice in a row ── */
+  /* ── customer devices: drop the styling if it breaks something, twice in a row ── */
+  function drop(link, flag) {
+    try { link.disabled = true; if (link.parentNode) link.parentNode.removeChild(link); } catch (e) {}
+    try { window.sessionStorage.setItem(flag, '1'); } catch (e) {}
+  }
   function trip(issues) {
+    var why = issues.join('; '), rules = -1;
+    try { if (C.link && C.link.sheet) rules = C.link.sheet.cssRules.length; } catch (e) {}
+    if (C.link && C.link.parentNode && rules !== 0) {
+      // 1st: the operator's own CSS (when there is any: an empty stylesheet
+      // can't be the cause, so then the theme goes straight away). Keep
+      // watching: if the screen is still broken without it, the theme goes next.
+      drop(C.link, 'lme_css_bad');
+      strikes = 0; lastSig = '';
+      try { console.warn('Custom portal CSS switched off for this visit: ' + why); } catch (e) {}
+      return;
+    }
     clearInterval(timer);
-    try { C.link.disabled = true; if (C.link.parentNode) C.link.parentNode.removeChild(C.link); } catch (e) {}
-    try { window.sessionStorage.setItem('lme_css_bad', '1'); } catch (e) {}
-    try { console.warn('Custom portal CSS switched off for this visit: ' + issues.join('; ')); } catch (e) {}
+    if (T.link && T.link.parentNode) {
+      drop(T.link, 'lme_theme_bad');
+      document.documentElement.setAttribute('data-lme-theme', 'default');
+      try { console.warn('Portal theme switched off for this visit: ' + why); } catch (e) {}
+    }
   }
   function run() {
     var issues = collect(), sig = issues.join('|');
@@ -2954,14 +3166,15 @@ checkCoinEnabled();
     if (strikes >= 2) trip(issues);
   }
   function start() {
-    if (!preview) {
-      // An empty operator stylesheet (the common case) has nothing to guard
-      try { var rules = C.link.sheet && C.link.sheet.cssRules; if (rules && rules.length === 0) return; } catch (e) {}
+    if (!preview && !T.link) {
+      // An empty operator stylesheet and no theme (the stock setup) has nothing to guard
+      try { var rules = C.link && C.link.sheet && C.link.sheet.cssRules; if (rules && rules.length === 0) return; } catch (e) {}
     }
     setTimeout(run, 1200);
     timer = setInterval(run, 2000);
   }
-  if (C.link.sheet) start(); else C.link.addEventListener('load', start);
+  var L = C.link || T.link;
+  if (L.sheet) start(); else L.addEventListener('load', start);
 
   /* ── admin live preview (only inside the www2 iframe, only obeys its parent) ── */
   if (!preview) return;
@@ -2992,16 +3205,34 @@ checkCoinEnabled();
       setTimeout(function () { results[st] = collect(); next(); }, 900);
     })();
   }
+  // Swap the portal theme in place (the Theme picker's preview). Note the
+  // naming: 'theme' below is the dark/light colour mode, 'portalTheme' is this.
+  function setPortalTheme(id) {
+    id = String(id || '').replace(/[^a-z0-9_-]/g, '').slice(0, 32);
+    if (!id) return;
+    var l = T.link;
+    if (!l) {
+      l = document.createElement('link');
+      l.rel = 'stylesheet'; l.id = 'theme-css';
+      l.addEventListener('load', function () { setTimeout(run, 400); });
+      document.head.insertBefore(l, (C.link && C.link.parentNode === document.head) ? C.link : null);
+      T.link = l;
+    }
+    l.href = '/cgi-bin/portal_theme.sh?id=' + id + '&_=' + new Date().getTime();
+    document.documentElement.setAttribute('data-lme-theme', id);
+  }
   window.addEventListener('message', function (e) {
     var d = e.data;
     if (e.source !== window.parent || !d || d.lmePreview !== true) return;
     if (d.cmd === 'state') setState(String(d.state));
     else if (d.cmd === 'audit') audit();
     else if (d.cmd === 'theme') document.documentElement.setAttribute('data-theme', d.theme === 'light' ? 'light' : 'dark');
-    else if (d.cmd === 'reload') C.link.href = '/cgi-bin/portal_css.sh?draft=1&_=' + new Date().getTime();
+    else if (d.cmd === 'portalTheme') setPortalTheme(d.id);
+    else if (d.cmd === 'reload' && C.link) C.link.href = '/cgi-bin/portal_css.sh?draft=1&_=' + new Date().getTime();
   });
-  // Every time the stylesheet is (re)loaded, re-check the current screen
-  C.link.addEventListener('load', function () { setTimeout(run, 400); });
+  // Every time a stylesheet is (re)loaded, re-check the current screen
+  if (C.link) C.link.addEventListener('load', function () { setTimeout(run, 400); });
+  if (T.link) T.link.addEventListener('load', function () { setTimeout(run, 400); });
   say({ lmeCssReady: true });
 })();
 </script>

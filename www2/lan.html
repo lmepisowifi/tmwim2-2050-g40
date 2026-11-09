@@ -14,6 +14,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="/js/theme.js?v=1.0.0"></script>
     <link href="/css/bootstrap.min.css?v=1.0.0" rel="stylesheet">
     <link href="/css/style.css?v=1.0.0" rel="stylesheet">
     <link href="/css/toastr.min.css?v=1.0.0" rel="stylesheet">
@@ -23,20 +24,20 @@
             width: 50px;
             height: 28px;
             border-radius: 14px;
-            background: #555;
+            background: var(--lme-toggle-off, #555);
             position: relative;
             cursor: pointer;
             transition: background 0.25s;
             flex-shrink: 0;
         }
-        .lan-toggle.on { background: #ffffff; }
+        .lan-toggle.on { background: var(--lme-toggle-on, #ffffff); }
         .lan-toggle.disabled-ui { opacity: 0.45; pointer-events: none; }
         .lan-toggle-knob {
             position: absolute;
             width: 20px;
             height: 20px;
             border-radius: 50%;
-            background: #fff;
+            background: var(--lme-toggle-knob, #fff);
             top: 4px;
             left: 4px;
             transition: left 0.25s, background 0.25s, box-shadow 0.25s;
@@ -44,7 +45,7 @@
         }
         .lan-toggle.on .lan-toggle-knob {
             left: 26px;
-            background: #555;
+            background: var(--lme-toggle-knob-on, #555);
             box-shadow: 0 1px 4px rgba(0,0,0,0.3);
         }
     </style>
@@ -90,87 +91,115 @@
                 </div>
             </div>
 
-            <!-- DHCP Server card -->
+            <!-- DHCP card: the mode (server / relay / br0 client / disabled, like stock boa's DHCP Mode
+                 page) plus the server settings, which are hidden while DHCP is disabled -->
             <div class="col-md-10">
                 <div class="card">
-                    <div class="card-header d-flex align-items-center justify-content-between">
-                        <span>DHCP Server</span>
-                        <div id="dhcp-toggle" class="lan-toggle" onclick="toggleDhcp()"
-                             role="switch" aria-checked="false" title="Enable / Disable DHCP server">
-                            <div class="lan-toggle-knob"></div>
-                        </div>
-                    </div>
+                    <div class="card-header">DHCP</div>
                     <div class="card-body">
                         <div class="row g-3">
                             <div class="col-md-6">
-                                <label for="dhcp-pool-start" class="form-label">Pool Start</label>
-                                <input type="text" class="form-control" id="dhcp-pool-start"
+                                <label for="dhcp-mode" class="form-label">Mode</label>
+                                <select class="form-select" id="dhcp-mode" onchange="onDhcpModeChange()">
+                                    <option value="2">DHCP Server</option>
+                                    <option value="1">DHCP Relay</option>
+                                    <option value="3">DHCP Client (br0)</option>
+                                    <option value="0">Disabled</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6" id="dhcp-relay-wrap" style="display:none">
+                                <label for="dhcp-relay-server" class="form-label">Relay Server</label>
+                                <input type="text" class="form-control" id="dhcp-relay-server"
                                        maxlength="15" autocomplete="off"
-                                       placeholder="e.g. 192.168.1.100">
-                                <div class="invalid-feedback" id="dhcp-pool-start-err" style="display:none"></div>
+                                       placeholder="upstream DHCP server, e.g. 10.0.0.1">
+                                <div class="invalid-feedback" id="dhcp-relay-server-err" style="display:none"></div>
                             </div>
-                            <div class="col-md-6">
-                                <label for="dhcp-pool-end" class="form-label">Pool End</label>
-                                <input type="text" class="form-control" id="dhcp-pool-end"
-                                       maxlength="15" autocomplete="off"
-                                       placeholder="e.g. 192.168.1.200">
-                                <div class="invalid-feedback" id="dhcp-pool-end-err" style="display:none"></div>
+                            <div class="col-12">
+                                <div class="form-text" id="dhcp-mode-hint"></div>
                             </div>
-                            <div class="col-md-6">
-                                <label for="dhcp-mask" class="form-label">Subnet Mask</label>
-                                <input type="text" class="form-control" id="dhcp-mask"
-                                       maxlength="15" autocomplete="off"
-                                       placeholder="e.g. 255.255.255.0">
-                                <div class="invalid-feedback" id="dhcp-mask-err" style="display:none"></div>
-                            </div>
-                            <div class="col-md-6">
-                                <label for="dhcp-gateway" class="form-label">Gateway</label>
-                                <input type="text" class="form-control" id="dhcp-gateway"
-                                       maxlength="15" autocomplete="off"
-                                       placeholder="e.g. 192.168.1.1">
-                                <div class="invalid-feedback" id="dhcp-gateway-err" style="display:none"></div>
-                            </div>
-                            <div class="col-md-6">
-                                <label for="dhcp-lease" class="form-label">Lease Time (seconds)</label>
-                                <input type="number" class="form-control" id="dhcp-lease"
-                                       min="1" autocomplete="off" placeholder="e.g. 86400">
-                                <div class="invalid-feedback" id="dhcp-lease-err" style="display:none"></div>
-                            </div>
-                            <div class="col-md-6">
-                                <label for="dhcp-domain" class="form-label">Domain</label>
-                                <input type="text" class="form-control" id="dhcp-domain"
-                                       maxlength="63" autocomplete="off" placeholder="e.g. bbrouter">
-                                <div class="invalid-feedback" id="dhcp-domain-err" style="display:none"></div>
-                            </div>
-                            <div class="col-md-12">
-                                <div class="form-check">
-                                    <input class="form-check-input" type="checkbox" id="dhcp-dns-opt">
-                                    <label class="form-check-label" for="dhcp-dns-opt">
-                                        Use custom DNS servers (unchecked: hand out this router's own IP)
-                                    </label>
-                                </div>
-                            </div>
-                            <div class="col-md-4">
-                                <label for="dhcp-dns1" class="form-label">DNS 1</label>
-                                <input type="text" class="form-control" id="dhcp-dns1"
-                                       maxlength="15" autocomplete="off" placeholder="optional">
-                                <div class="invalid-feedback" id="dhcp-dns1-err" style="display:none"></div>
-                            </div>
-                            <div class="col-md-4">
-                                <label for="dhcp-dns2" class="form-label">DNS 2</label>
-                                <input type="text" class="form-control" id="dhcp-dns2"
-                                       maxlength="15" autocomplete="off" placeholder="optional">
-                                <div class="invalid-feedback" id="dhcp-dns2-err" style="display:none"></div>
-                            </div>
-                            <div class="col-md-4">
-                                <label for="dhcp-dns3" class="form-label">DNS 3</label>
-                                <input type="text" class="form-control" id="dhcp-dns3"
-                                       maxlength="15" autocomplete="off" placeholder="optional">
-                                <div class="invalid-feedback" id="dhcp-dns3-err" style="display:none"></div>
+                            <div class="col-12" id="dhcp-br0-wrap" style="display:none">
+                                <span class="text-secondary">Current br0 address:</span>
+                                <strong id="dhcp-br0-addr">&mdash;</strong>
                             </div>
                         </div>
                         <button type="button" class="btn btn-primary w-100 mt-3"
-                                id="dhcp-save-btn" onclick="saveDhcp()">Save</button>
+                                id="dhcp-mode-save-btn" onclick="saveDhcpMode()">Apply</button>
+
+                        <div id="dhcp-server-section" style="display:none">
+                            <hr class="my-3" style="border-color:var(--border-color);">
+                            <div class="fw-semibold mb-3">DHCP Server settings <span id="dhcp-server-inactive" class="text-secondary"
+                                  style="font-size:0.85em; font-weight:400; display:none">(inactive in this mode)</span></div>
+                            <div class="row g-3">
+                                <div class="col-md-6">
+                                    <label for="dhcp-pool-start" class="form-label">Pool Start</label>
+                                    <input type="text" class="form-control" id="dhcp-pool-start"
+                                           maxlength="15" autocomplete="off"
+                                           placeholder="e.g. 192.168.1.100">
+                                    <div class="invalid-feedback" id="dhcp-pool-start-err" style="display:none"></div>
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="dhcp-pool-end" class="form-label">Pool End</label>
+                                    <input type="text" class="form-control" id="dhcp-pool-end"
+                                           maxlength="15" autocomplete="off"
+                                           placeholder="e.g. 192.168.1.200">
+                                    <div class="invalid-feedback" id="dhcp-pool-end-err" style="display:none"></div>
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="dhcp-mask" class="form-label">Subnet Mask</label>
+                                    <input type="text" class="form-control" id="dhcp-mask"
+                                           maxlength="15" autocomplete="off"
+                                           placeholder="e.g. 255.255.255.0">
+                                    <div class="invalid-feedback" id="dhcp-mask-err" style="display:none"></div>
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="dhcp-gateway" class="form-label">Gateway</label>
+                                    <input type="text" class="form-control" id="dhcp-gateway"
+                                           maxlength="15" autocomplete="off"
+                                           placeholder="e.g. 192.168.1.1">
+                                    <div class="invalid-feedback" id="dhcp-gateway-err" style="display:none"></div>
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="dhcp-lease" class="form-label">Lease Time (seconds)</label>
+                                    <input type="number" class="form-control" id="dhcp-lease"
+                                           min="1" autocomplete="off" placeholder="e.g. 86400">
+                                    <div class="invalid-feedback" id="dhcp-lease-err" style="display:none"></div>
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="dhcp-domain" class="form-label">Domain</label>
+                                    <input type="text" class="form-control" id="dhcp-domain"
+                                           maxlength="63" autocomplete="off" placeholder="e.g. bbrouter">
+                                    <div class="invalid-feedback" id="dhcp-domain-err" style="display:none"></div>
+                                </div>
+                                <div class="col-md-12">
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox" id="dhcp-dns-opt" onchange="syncDhcpDnsFields()">
+                                        <label class="form-check-label" for="dhcp-dns-opt">
+                                            Use custom DNS servers (unchecked: hand out this router's own IP)
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="col-md-4 dhcp-dns-col" style="display:none">
+                                    <label for="dhcp-dns1" class="form-label">DNS 1</label>
+                                    <input type="text" class="form-control" id="dhcp-dns1"
+                                           maxlength="15" autocomplete="off" placeholder="optional">
+                                    <div class="invalid-feedback" id="dhcp-dns1-err" style="display:none"></div>
+                                </div>
+                                <div class="col-md-4 dhcp-dns-col" style="display:none">
+                                    <label for="dhcp-dns2" class="form-label">DNS 2</label>
+                                    <input type="text" class="form-control" id="dhcp-dns2"
+                                           maxlength="15" autocomplete="off" placeholder="optional">
+                                    <div class="invalid-feedback" id="dhcp-dns2-err" style="display:none"></div>
+                                </div>
+                                <div class="col-md-4 dhcp-dns-col" style="display:none">
+                                    <label for="dhcp-dns3" class="form-label">DNS 3</label>
+                                    <input type="text" class="form-control" id="dhcp-dns3"
+                                           maxlength="15" autocomplete="off" placeholder="optional">
+                                    <div class="invalid-feedback" id="dhcp-dns3-err" style="display:none"></div>
+                                </div>
+                            </div>
+                            <button type="button" class="btn btn-primary w-100 mt-3"
+                                    id="dhcp-save-btn" onclick="saveDhcp()">Save</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -231,7 +260,11 @@
         // Track the values loaded from CGI so we can detect changes.
         let loadedLanIp     = '';
         let loadedLanSubnet = '';
-        let loadedDhcpEnabled = false;
+        let loadedDhcpMode    = 2;   // 0 off, 1 relay, 2 server, 3 br0 client
+        let loadedRelayServer = '';
+        // Cards that don't apply in the current DHCP mode stay locked.
+        let dhcpServerInactive = false;   // relay / client
+        let lanIpInactive      = false;   // client: address comes from upstream
 
         // --------------------------------------------------------
         // Speed options
@@ -439,6 +472,7 @@
         }
 
         function unlockIpCard() {
+            if (lanIpInactive) return;
             document.getElementById('lan-ip').disabled          = false;
             document.getElementById('lan-subnet').disabled      = false;
             document.getElementById('lan-ip-save-btn').disabled = false;
@@ -484,7 +518,7 @@
                     overlayTxt.innerHTML =
                         'IP address changed to <strong>' + ipVal + '</strong>.<br>'
                         + 'Navigate to <a href="http://' + ipVal + '/lan.html" '
-                        + 'style="color:#fff">http://' + ipVal + '/lan.html</a>';
+                        + 'style="color:var(--accent-color, #fff)">http://' + ipVal + '/lan.html</a>';
                     // Offer auto-redirect after 4 seconds
                     setTimeout(() => {
                         window.location.href = 'http://' + ipVal + '/lan.html';
@@ -505,27 +539,7 @@
         }
 
         // --------------------------------------------------------
-        // DHCP Server card — toggle
-        // --------------------------------------------------------
-        function setDhcpToggle(enabled) {
-            const tog = document.getElementById('dhcp-toggle');
-            if (enabled) {
-                tog.classList.add('on');
-                tog.setAttribute('aria-checked', 'true');
-            } else {
-                tog.classList.remove('on');
-                tog.setAttribute('aria-checked', 'false');
-            }
-        }
-
-        function toggleDhcp() {
-            const tog = document.getElementById('dhcp-toggle');
-            const isOn = tog.classList.toggle('on');
-            tog.setAttribute('aria-checked', isOn ? 'true' : 'false');
-        }
-
-        // --------------------------------------------------------
-        // DHCP Server card — lock / unlock (independent of other cards)
+        // DHCP card, server settings — lock / unlock (independent of other cards)
         // --------------------------------------------------------
         const DHCP_FIELD_IDS = [
             'dhcp-pool-start', 'dhcp-pool-end', 'dhcp-mask', 'dhcp-gateway',
@@ -535,17 +549,16 @@
 
         function lockDhcpCard() {
             DHCP_FIELD_IDS.forEach(id => { document.getElementById(id).disabled = true; });
-            document.getElementById('dhcp-toggle').classList.add('disabled-ui');
         }
 
         function unlockDhcpCard() {
+            if (dhcpServerInactive) return;
             DHCP_FIELD_IDS.forEach(id => { document.getElementById(id).disabled = false; });
-            document.getElementById('dhcp-toggle').classList.remove('disabled-ui');
         }
 
         // --------------------------------------------------------
-        // DHCP Server card — save (settings via dhcp_save, plus
-        // dhcp_enable only if the toggle actually changed)
+        // DHCP card, server settings — save (dhcp_save). Turning DHCP on/off or
+        // switching mode is the Mode select + Apply (dhcp_mode_save) above it.
         // --------------------------------------------------------
         function saveDhcp() {
             const poolStart = document.getElementById('dhcp-pool-start').value.trim();
@@ -565,8 +578,11 @@
                 'dhcp-mask':       validateIpField(mask),
                 'dhcp-gateway':    validateIpField(gateway),
             };
+            // The DNS fields are hidden while custom DNS is off, so a bad value in one
+            // must not block Save with an error the user can't see.
             [['dhcp-dns1', dns1], ['dhcp-dns2', dns2], ['dhcp-dns3', dns3]].forEach(([id, val]) => {
-                if (val) fieldErrs[id] = validateIpField(val);
+                if (dnsOpt === '1' && val) fieldErrs[id] = validateIpField(val);
+                else setIpFieldError(id, id + '-err', null);
             });
 
             let leaseErr = null;
@@ -580,16 +596,14 @@
             const hasErr = Object.values(fieldErrs).some(Boolean) || leaseErr || domainErr;
             if (hasErr) return;
 
-            const nowEnabled = document.getElementById('dhcp-toggle').classList.contains('on');
-            const enabledChanged = (nowEnabled !== loadedDhcpEnabled);
-
             lockDhcpCard();
             lockAll();
-            if (enabledChanged) {
-                startCountdown();
-            } else {
-                showOverlay('Applying Changes.');
-            }
+            showOverlay('Applying Changes.');
+
+            // With custom DNS off the stored servers are unused; keep valid ones so
+            // re-ticking the box restores them, but never send a malformed hidden value
+            // (the backend rejects it).
+            const dnsSend = v => (dnsOpt === '1' || !validateIpField(v)) ? v : '';
 
             const saveBody = 'pool_start=' + encodeURIComponent(poolStart)
                 + '&pool_end=' + encodeURIComponent(poolEnd)
@@ -598,9 +612,9 @@
                 + '&lease=' + encodeURIComponent(lease)
                 + '&domain=' + encodeURIComponent(domain)
                 + '&dns_opt=' + dnsOpt
-                + '&dns1=' + encodeURIComponent(dns1)
-                + '&dns2=' + encodeURIComponent(dns2)
-                + '&dns3=' + encodeURIComponent(dns3);
+                + '&dns1=' + encodeURIComponent(dnsSend(dns1))
+                + '&dns2=' + encodeURIComponent(dnsSend(dns2))
+                + '&dns3=' + encodeURIComponent(dnsSend(dns3));
 
             fetch('/cgi-bin/lme.cgi?action=dhcp_save', {
                 method: 'POST',
@@ -611,23 +625,6 @@
                 if (!r.ok) return r.text().then(t => { throw new Error(t); });
             })
             .then(() => {
-                if (!enabledChanged) return null;
-                return fetch('/cgi-bin/lme.cgi?action=dhcp_enable', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: 'mode=' + (nowEnabled ? '1' : '0')
-                }).then(r => {
-                    if (!r.ok) return r.text().then(t => { throw new Error(t); });
-                    return fetch('/cgi-bin/lme.cgi?action=dhcp_status').then(r2 => r2.json());
-                }).then(data => {
-                    if (data && data.pending) {
-                        fetch('/cgi-bin/lme.cgi?action=dhcp_confirm').catch(() => {});
-                    }
-                });
-            })
-            .then(() => {
-                loadedDhcpEnabled = nowEnabled;
-                if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
                 spinner.style.display = 'none';
                 overlayTxt.textContent = 'Changes Applied.';
                 setTimeout(() => {
@@ -636,9 +633,194 @@
                 }, 1000);
             })
             .catch(err => {
-                if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
                 overlay.classList.remove('visible');
                 setTimeout(() => { unlockAll(); unlockDhcpCard(); }, 350);
+                toastr['warning']('Error: ' + (err.message || 'unknown'), 'Error');
+            });
+        }
+
+        // --------------------------------------------------------
+        // DHCP card, mode (server / relay / br0 client / off)
+        // --------------------------------------------------------
+        const DHCP_MODE_HINTS = {
+            '2': 'This device hands out addresses to LAN clients from the pool in the DHCP server settings below.',
+            '1': 'LAN clients\u2019 DHCP requests are forwarded to the upstream server. That server needs a scope '
+               + 'for this router\u2019s LAN subnet and a route back to it. The DHCP server settings are inactive in this mode.',
+            '3': 'br0 itself asks an upstream DHCP server for its address, so this device\u2019s address will change '
+               + 'and the LAN IP card and the DHCP server settings are inactive. Look the new address up on the upstream router. '
+               + 'The previous mode is restored after 90 s unless this page is opened at the new address.',
+            '0': 'No DHCP service on the LAN: clients need static addresses.'
+        };
+
+        const DHCP_MODE_IDS = ['dhcp-mode', 'dhcp-relay-server', 'dhcp-mode-save-btn'];
+        function lockDhcpMode()   { DHCP_MODE_IDS.forEach(id => { document.getElementById(id).disabled = true; }); }
+        function unlockDhcpMode() { DHCP_MODE_IDS.forEach(id => { document.getElementById(id).disabled = false; }); }
+
+        // DNS 1-3 only matter when "Use custom DNS servers" is ticked (otherwise the
+        // router hands out its own IP), so show them only then.
+        function syncDhcpDnsFields() {
+            const show = document.getElementById('dhcp-dns-opt').checked;
+            document.querySelectorAll('.dhcp-dns-col').forEach(el => { el.style.display = show ? '' : 'none'; });
+        }
+
+        function onDhcpModeChange() {
+            const m = document.getElementById('dhcp-mode').value;
+            document.getElementById('dhcp-relay-wrap').style.display = (m === '1') ? '' : 'none';
+            document.getElementById('dhcp-mode-hint').textContent = DHCP_MODE_HINTS[m] || '';
+        }
+
+        // The server settings (pool, mask, gateway, lease, domain, DNS) mean nothing while DHCP
+        // is disabled, so the whole section is hidden then. Keyed to the applied mode, so it
+        // follows Apply / a page load rather than a not-yet-applied dropdown choice.
+        function syncDhcpServerSection() {
+            document.getElementById('dhcp-server-section').style.display = (loadedDhcpMode === 0) ? 'none' : '';
+        }
+
+        // Fill every DHCP-related control from a dhcp_status response.
+        function applyDhcpStatus(data) {
+            document.getElementById('dhcp-pool-start').value = data.pool_start || '';
+            document.getElementById('dhcp-pool-end').value   = data.pool_end   || '';
+            document.getElementById('dhcp-mask').value       = data.mask       || '';
+            document.getElementById('dhcp-gateway').value    = data.gateway    || '';
+            document.getElementById('dhcp-lease').value      = data.lease      || 86400;
+            document.getElementById('dhcp-domain').value     = data.domain     || '';
+            document.getElementById('dhcp-dns-opt').checked  = (data.dns_opt == 1);
+            syncDhcpDnsFields();
+            document.getElementById('dhcp-dns1').value       = data.dns1 || '';
+            document.getElementById('dhcp-dns2').value       = data.dns2 || '';
+            document.getElementById('dhcp-dns3').value       = data.dns3 || '';
+
+            loadedDhcpMode    = (data.mode === undefined) ? (data.enabled ? 2 : 0) : +data.mode;
+            loadedRelayServer = data.relay_server || '';
+            document.getElementById('dhcp-mode').value         = String(loadedDhcpMode);
+            document.getElementById('dhcp-relay-server').value = loadedRelayServer;
+            onDhcpModeChange();
+
+            document.getElementById('dhcp-br0-wrap').style.display = (loadedDhcpMode === 3) ? '' : 'none';
+            document.getElementById('dhcp-br0-addr').textContent = data.br0_ip
+                ? data.br0_ip + (data.br0_mask ? ' / ' + data.br0_mask : '')
+                : 'waiting for a lease\u2026';
+
+            dhcpServerInactive = (loadedDhcpMode === 1 || loadedDhcpMode === 3);
+            lanIpInactive      = (loadedDhcpMode === 3);
+            document.getElementById('dhcp-server-inactive').style.display = dhcpServerInactive ? '' : 'none';
+            syncDhcpServerSection();
+        }
+
+        // Re-apply lock state after the mode (and so the inactive flags) changed.
+        function syncDhcpLocks() {
+            if (dhcpServerInactive) lockDhcpCard(); else unlockDhcpCard();
+            if (lanIpInactive)      lockIpCard();   else unlockIpCard();
+        }
+
+        function showClientModeNotice() {
+            secondsLeft = 90;
+            spinner.style.display = 'block';
+            const render = () => {
+                overlayTxt.innerHTML =
+                    'DHCP client mode: this device is asking your upstream DHCP server for an address.<br>'
+                    + 'Find its new address in that router\u2019s client list and open it within '
+                    + '<strong>' + secondsLeft + 's</strong> to keep this setting.';
+            };
+            overlay.classList.add('visible');
+            render();
+            countdownTimer = setInterval(() => {
+                secondsLeft--;
+                if (secondsLeft > 0) {
+                    render();
+                } else {
+                    clearInterval(countdownTimer);
+                    countdownTimer = null;
+                    spinner.style.display = 'none';
+                    overlayTxt.textContent = 'Reverting Changes. Reconnect at the previous address.';
+                }
+            }, 1000);
+        }
+
+        function showLeaveClientNotice(lanIp) {
+            spinner.style.display = 'none';
+            const url = 'http://' + lanIp + '/lan.html';
+            overlayTxt.innerHTML =
+                'Leaving DHCP client mode. This device returns to its configured address <strong>'
+                + lanIp + '</strong>.<br>Navigate to <a href="' + url + '" style="color:var(--accent-color, #fff)">' + url + '</a>';
+            setTimeout(() => { window.location.href = url; }, 6000);
+        }
+
+        function saveDhcpMode() {
+            const modeVal  = document.getElementById('dhcp-mode').value;
+            const relayVal = document.getElementById('dhcp-relay-server').value.trim();
+
+            let relayErr = null;
+            if (modeVal === '1') {
+                relayErr = validateIpField(relayVal);
+                if (!relayErr && (relayVal === '0.0.0.0' || relayVal === '255.255.255.255'))
+                    relayErr = 'Not a usable server address';
+                if (!relayErr && relayVal === loadedLanIp)
+                    relayErr = 'Cannot be this router\u2019s own LAN IP';
+            }
+            setIpFieldError('dhcp-relay-server', 'dhcp-relay-server-err', relayErr);
+            if (relayErr) return;
+
+            if (+modeVal === loadedDhcpMode && (modeVal !== '1' || relayVal === loadedRelayServer)) {
+                toastr['info']('DHCP mode is already set to that.');
+                return;
+            }
+
+            const enteringClient = (modeVal === '3');
+            const leavingClient  = (loadedDhcpMode === 3);
+            if (enteringClient && !window.confirm(
+                    'Switch to DHCP client mode?\n\nThis device will drop its current address and ask the '
+                  + 'upstream DHCP server for a new one. If this page is not reopened at the new address '
+                  + 'within 90 seconds, the previous mode is restored.')) {
+                return;
+            }
+
+            lockDhcpMode();
+            lockDhcpCard();
+            lockIpCard();
+            lockAll();
+            startCountdown();
+
+            fetch('/cgi-bin/lme.cgi?action=dhcp_mode_save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'mode=' + encodeURIComponent(modeVal)
+                    + '&relay_server=' + encodeURIComponent(relayVal)
+            })
+            .then(r => {
+                if (!r.ok) return r.text().then(t => { throw new Error(t); });
+                return r.json();
+            })
+            .then(res => {
+                if (res.async) {
+                    // br0's address is changing under us: this page can't confirm.
+                    // The server-side revert timer is the safety net, and opening
+                    // the page at the new address confirms it (see page init).
+                    if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+                    if (enteringClient) showClientModeNotice();
+                    else showLeaveClientNotice(res.lan_ip);
+                    return null;
+                }
+                return fetch('/cgi-bin/lme.cgi?action=dhcp_status')
+                    .then(r2 => r2.json())
+                    .then(st => {
+                        if (st && st.pending) {
+                            fetch('/cgi-bin/lme.cgi?action=dhcp_confirm').catch(() => {});
+                        }
+                        applyDhcpStatus(st);
+                        if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+                        spinner.style.display = 'none';
+                        overlayTxt.textContent = 'Changes Applied.';
+                        setTimeout(() => {
+                            overlay.classList.remove('visible');
+                            setTimeout(() => { unlockAll(); unlockDhcpMode(); syncDhcpLocks(); }, 350);
+                        }, 1000);
+                    });
+            })
+            .catch(err => {
+                if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+                overlay.classList.remove('visible');
+                setTimeout(() => { unlockAll(); unlockDhcpMode(); syncDhcpLocks(); }, 350);
                 toastr['warning']('Error: ' + (err.message || 'unknown'), 'Error');
             });
         }
@@ -650,6 +832,7 @@
             lockAll();
             lockIpCard();
             lockDhcpCard();
+            lockDhcpMode();
             showOverlay('Loading\u2026');
 
             // Fetch port status, LAN IP, and DHCP settings in parallel
@@ -675,28 +858,25 @@
             const dhcpFetch = fetch('/cgi-bin/lme.cgi?action=dhcp_status')
                 .then(r => r.json())
                 .then(data => {
-                    loadedDhcpEnabled = !!data.enabled;
-                    setDhcpToggle(loadedDhcpEnabled);
-                    document.getElementById('dhcp-pool-start').value = data.pool_start || '';
-                    document.getElementById('dhcp-pool-end').value   = data.pool_end   || '';
-                    document.getElementById('dhcp-mask').value       = data.mask       || '';
-                    document.getElementById('dhcp-gateway').value    = data.gateway    || '';
-                    document.getElementById('dhcp-lease').value      = data.lease      || 86400;
-                    document.getElementById('dhcp-domain').value     = data.domain     || '';
-                    document.getElementById('dhcp-dns-opt').checked  = (data.dns_opt == 1);
-                    document.getElementById('dhcp-dns1').value       = data.dns1 || '';
-                    document.getElementById('dhcp-dns2').value       = data.dns2 || '';
-                    document.getElementById('dhcp-dns3').value       = data.dns3 || '';
+                    applyDhcpStatus(data);
+                    // Being able to load this page proves the new DHCP mode left the
+                    // device reachable (e.g. opened at a fresh br0 client address),
+                    // same idea as the lan_confirm call above.
+                    if (data.pending) {
+                        fetch('/cgi-bin/lme.cgi?action=dhcp_confirm').catch(() => {});
+                    }
                 });
 
             Promise.all([portFetch, ipFetch, dhcpFetch])
                 .then(() => {
                     hideOverlay();
+                    unlockDhcpMode();
                     unlockIpCard();
                     unlockDhcpCard();
                 })
                 .catch(err => {
                     overlay.classList.remove('visible');
+                    unlockDhcpMode();
                     unlockIpCard();
                     unlockDhcpCard();
                     toastr['warning']('Error: ' + (err.message || 'failed to load'), 'Error');

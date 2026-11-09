@@ -56,15 +56,24 @@ BB="busybox"
 # replaced on every update. globals.env (user settings) is NOT a component, so
 # it is preserved; lmehspt.sh's seed_globals() merges any new default keys into
 # it on boot after the swap.
+# defaults.ota.env is the same idea for ota.env: shipped defaults for the OTA /
+# module / sound-download keys, sourced BEFORE the preserved, device-local
+# ota.env (which therefore always wins). Nothing is seeded into ota.env.
+# NOTE: a device whose OLD ota.sh does not list defaults.ota.env won't get it
+# from the swap that delivers this ota.sh (the old script is the one running
+# the swap); it arrives with the next update. Until then every script
+# falls back to the same values hard-coded in its own config block.
 # sch, iptables = kernel modules insmod'ed by lmehspt.sh (sch/sch_fq_codel.ko
-# for the QoS qdisc, iptables/xt_hl.ko for anti-tether's `-m ttl` match).
+# and sch/sch_cake.ko for the QoS qdisc, iptables/xt_hl.ko for anti-tether's
+# `-m ttl` match). sch/ also holds a bundled iproute2 `tc` (sch/tc) that
+# lmehspt.sh runs only when the firmware's own tc cannot create a cake qdisc.
 # Swapped like any other component; a bundle that predates one simply logs
 # "skip <name> (not in bundle)", and rollback only restores components that
 # have a .ota_old backup. A device whose OLD ota.sh doesn't list "iptables"
 # yet won't get it from the base swap that delivers this ota.sh - it arrives
 # moments later via module_ctl.sh auto_update (the hotspot module bundle ships
 # it too), and lmehspt.sh just uses its original fallbacks until then.
-COMPONENTS="hotspot www2 lmehspt.sh ota.sh defaults.env startup.sh module_ctl.sh sch iptables"
+COMPONENTS="hotspot www2 lmehspt.sh ota.sh defaults.env defaults.ota.env startup.sh module_ctl.sh sch iptables"
 # NOTE: portal images (hotspot/img/promo1..5.* and portal_logo.*) are NOT
 # listed here as fixed paths, because hotspot.cgi lets the admin upload any
 # of jpg/jpeg/png/ico/gif/webp per slot — a fixed "promo1.jpg" entry would
@@ -94,7 +103,11 @@ COMPONENTS="hotspot www2 lmehspt.sh ota.sh defaults.env startup.sh module_ctl.sh
 # it on. And once migrated, the new per-unit nodemcu_ifaces.txt was equally
 # unpreserved, so the very next OTA after that would have reset it AGAIN.
 # Both are now carried across every swap like dashboard_layout.json above.
-PRESERVE="www2/data/dashboard_layout.json www2/data/nodemcu_iface.json www2/data/nodemcu_ifaces.txt www2/uploads hotspot/audio www2/tailscale.html www2/cgi-bin/tailscale.cgi"
+# www2/data/br0_static.env: the default gateway / DNS Quick Setup saves for a
+# static-IP Access Point or Extender (sh/br0static.sh re-applies it at boot).
+# Device-owned, never shipped in the repo, so without this line the next OTA
+# would silently drop the route and the device would lose internet access.
+PRESERVE="www2/data/dashboard_layout.json www2/data/nodemcu_iface.json www2/data/nodemcu_ifaces.txt www2/data/br0_static.env www2/uploads hotspot/audio www2/tailscale.html www2/cgi-bin/tailscale.cgi"
 
 # ---- config ----------------------------------------------------------------
 OTA_REPO=""
@@ -106,6 +119,8 @@ OTA_CACERT="$ROOT/cacert.pem"      # operator-supplied bundle (optional override
 OTA_INSECURE_TLS="0"               # 1 = skip HTTPS certificate verification (escape hatch, NOT recommended)
 OTA_NOTIFY="1"
 OTA_NODEMCU="1"                    # 1 = also push firmware to the coin-slot NodeMCU
+# Shipped defaults (defaults.ota.env), then device-local overrides (ota.env).
+[ -f "$ROOT/defaults.ota.env" ] && . "$ROOT/defaults.ota.env"
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 # Fall back to the CA bundle that ships inside www2 (refreshed by every OTA).
 # Before this, no bundle was shipped anywhere, so every device silently ran
@@ -122,6 +137,18 @@ notify() {
     [ "$OTA_NOTIFY" = "1" ] || return 0
     [ -x "$ROOT/hotspot/notify.sh" ] || return 0
     ( "$ROOT/hotspot/notify.sh" "$1" >/dev/null 2>&1 </dev/null & )
+}
+
+# Is the hotspot module installed? Hotspot is an optional module (see
+# module_ctl.sh); when an operator uninstalls it, reconcile deletes hotspot/,
+# lmehspt.sh, sch/ and iptables/ after every base swap. Anything in this script
+# that reads, re-creates or restarts those paths must check this first, or it
+# either does nothing useful or quietly resurrects a half-installed hotspot/
+# directory (which module_ctl.sh's files_present() then counts as "installed").
+# Same fail-open default as startup.sh's hotspot-launch gate: a missing
+# module_ctl.sh can't answer, so assume installed rather than skip real work.
+hotspot_on() {
+    [ ! -x "$ROOT/module_ctl.sh" ] || "$ROOT/module_ctl.sh" is-active hotspot >/dev/null 2>&1
 }
 
 # ---- one-time repo migration (lmepisowifi/lmepisowifi -> lmepisowifi/tmwim2-2050-g40) ----
@@ -268,8 +295,14 @@ fetch() { # fetch <url> <outfile>
 # tick; safe to call anytime since it's a strict no-op once the file exists,
 # and any download failure just leaves it missing to retry next tick.
 ensure_default_favicon() {
+    hotspot_on || return 0    # module uninstalled: don't re-create hotspot/img
     [ -e "$ROOT/hotspot/img/favicon.ico" ] && return 0
     [ -n "$OTA_REPO" ] || return 0
+    # The favicon only serves the hotspot portal. On a device without the hotspot
+    # module (e.g. a fresh install from lmepisowifi-default.tar.gz) fetching it
+    # would recreate hotspot/, which module_ctl.sh's files_present() reads as
+    # "hotspot files are here" and then deletes again on the next reconcile.
+    [ -x "$ROOT/module_ctl.sh" ] && ! "$ROOT/module_ctl.sh" is-active hotspot >/dev/null 2>&1 && return 0
     _fi_branch="${OTA_BRANCH:-main}"
     _fi_url="https://raw.githubusercontent.com/$OTA_REPO/$_fi_branch/hotspot/img/favicon.ico"
     _fi_tmp="$DL/favicon.ico.tmp"
@@ -825,7 +858,7 @@ self_heal() {
     fi
 
     _SH_OLD_IMG="$ROOT/hotspot$BAK_SUFFIX/img"
-    if [ -d "$_SH_OLD_IMG" ]; then
+    if hotspot_on && [ -d "$_SH_OLD_IMG" ]; then
         mkdir -p "$ROOT/hotspot/img"
         # favicon.ico is the default PORTAL_LOGO target; include it alongside
         # promo images and portal_logo so devices broken by a pre-fix OTA run
@@ -869,7 +902,7 @@ self_heal() {
     # ships. For bundle-shipped slots the do_apply PRESERVE fix (slot-aware copy)
     # handles future runs correctly; self-heal covers the gap for the transition.
     _SH_OLD_AUD="$ROOT/hotspot$BAK_SUFFIX/audio"
-    if [ -d "$_SH_OLD_AUD" ]; then
+    if hotspot_on && [ -d "$_SH_OLD_AUD" ]; then
         mkdir -p "$ROOT/hotspot/audio"
         for f in "$_SH_OLD_AUD"/*; do
             [ -e "$f" ] || continue
@@ -1191,8 +1224,15 @@ restart_services() {
     for pid in $($BB ps w 2>/dev/null | grep "httpd" | grep -v grep | grep -F "/lmepisowifi/www2" | awk '{print $1}'); do
         kill "$pid" 2>/dev/null
     done
-    ( setsid $BB httpd -h "$ROOT/www2" -p 8080 >/dev/null 2>&1 & ) 2>/dev/null || \
-        ( $BB httpd -h "$ROOT/www2" -p 8080 >/dev/null 2>&1 & )
+    # Same flags as startup.sh. Without -c, httpd only finds www2/httpd.conf
+    # through its fallback lookup, which doesn't count as the root config, so
+    # the root-only directives (WebTerm, CacheControl) are ignored until the
+    # next reboot and /ws answers 404. "-c" on a missing file makes httpd
+    # exit, so only pass it when the file is there.
+    _wconf=""
+    [ -f "$ROOT/www2/httpd.conf" ] && _wconf="-c $ROOT/www2/httpd.conf"
+    ( setsid $BB httpd -h "$ROOT/www2" -p 8080 $_wconf >/dev/null 2>&1 & ) 2>/dev/null || \
+        ( $BB httpd -h "$ROOT/www2" -p 8080 $_wconf >/dev/null 2>&1 & )
 
     # portal + hotspot watchdog + firewall: lmehspt.sh tears down and
     # rebuilds. Kill any instance still running from before this update
@@ -1211,9 +1251,17 @@ restart_services() {
         kill -9 "$pid" 2>/dev/null
     done
 
-    ( setsid sh "$ROOT/lmehspt.sh" --force >/tmp/ota_lmehspt.log 2>&1 & ) 2>/dev/null || \
-        ( sh "$ROOT/lmehspt.sh" --force >/tmp/ota_lmehspt.log 2>&1 & )
-    sleep 4
+    # Only relaunch when the hotspot module is installed. With it uninstalled
+    # startup.sh deliberately doesn't start lmehspt.sh either, and "--force"
+    # would otherwise bring up the controller + firewall (reconcile normally
+    # deleted lmehspt.sh already, but not if module_ctl.sh was missing/failed).
+    if hotspot_on; then
+        ( setsid sh "$ROOT/lmehspt.sh" --force >/tmp/ota_lmehspt.log 2>&1 & ) 2>/dev/null || \
+            ( sh "$ROOT/lmehspt.sh" --force >/tmp/ota_lmehspt.log 2>&1 & )
+        sleep 4
+    else
+        log "restart: hotspot module not installed — skipping lmehspt.sh"
+    fi
 }
 
 # ---- health check: admin UI answers and portal httpd is up ----
@@ -1451,6 +1499,9 @@ _nodemcu_push_one() {
 
 sync_nodemcu() {
     [ "$OTA_NODEMCU" = "1" ] || { log "nodemcu: push disabled (OTA_NODEMCU=0)"; return 0; }
+    # globals.env (NODEMCU_IP/COIN_PSK) survives an uninstall, but the firmware
+    # image and the portal that serves it do not — don't retry/push every tick.
+    hotspot_on || { log "nodemcu: hotspot module not installed — skipping"; return 0; }
 
     _nver=$(mval nodemcu_version)
     _nmd5=$(mval nodemcu_md5)

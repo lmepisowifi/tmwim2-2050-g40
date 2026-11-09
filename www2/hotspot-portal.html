@@ -14,6 +14,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="/js/theme.js?v=1.0.0"></script>
     <link href="/css/bootstrap.min.css?v=1.0.0" rel="stylesheet">
     <link href="/css/style.css?v=1.0.0" rel="stylesheet">
     <link href="/css/toastr.min.css?v=1.0.0" rel="stylesheet">
@@ -23,7 +24,7 @@
             text-align: center; cursor: pointer;
             transition: border-color .2s, background .2s; position: relative;
         }
-        .upload-zone:hover, .upload-zone.drag { border-color: #888; background: var(--bg-surface-hover); }
+        .upload-zone:hover, .upload-zone.drag { border-color: var(--lme-border-strong, #888); background: var(--bg-surface-hover); }
         .upload-zone input[type=file] { position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%; }
         .field-hint { font-size:11.5px; color:var(--text-secondary); margin-top:3px; }
         /* Carousel slot rows */
@@ -36,7 +37,7 @@
         .promo-thumb {
             width:64px; height:44px; object-fit:cover; border-radius:5px;
             border:1px solid var(--border-color); background:var(--bg-input);
-            flex-shrink:0; display:block;
+            flex-shrink:0; display:block; cursor:zoom-in;
         }
         .promo-thumb-empty {
             width:64px; height:44px; border-radius:5px;
@@ -46,7 +47,7 @@
         }
         .promo-info { flex:1 1 140px; min-width:120px; overflow:hidden; }
         .promo-label { font-size:13px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .promo-status-active { font-size:11px; color:#4ade80; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .promo-status-active { font-size:11px; color:var(--lme-ok, #4ade80); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .promo-status-empty  { font-size:11px; color:var(--text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .promo-actions { display:flex; gap:6px; flex-shrink:0; flex-wrap:wrap; }
         /* Portal preview */
@@ -57,16 +58,61 @@
         .portal-prev-brand { font-size:10px; text-transform:uppercase; letter-spacing:.12em; color:#a1a1aa; line-height:1.2; }
         .portal-prev-title { font-size:13px; font-weight:700; color:#f4f4f5; line-height:1.2; }
         .portal-prev-carousel { border-top:1px solid #2e2e33; overflow:hidden; position:relative; display:none; }
-        .portal-prev-carousel img { width:100%; display:block; max-height:90px; object-fit:cover; }
+        .portal-prev-carousel img { width:100%; display:block; max-height:90px; object-fit:cover; cursor:zoom-in; }
+        /* Click-to-view image modal — same look as the portal's own slide pop-up (hotspot/index.html) */
+        .img-modal-overlay {
+            display:flex; visibility:hidden; opacity:0; pointer-events:none;
+            transition:opacity .35s ease, visibility .35s ease, backdrop-filter .35s ease;
+            position:fixed; inset:0; background:rgba(0,0,0,.7);
+            backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px);
+            z-index:2000; align-items:center; justify-content:center; padding:1.25rem;
+        }
+        .img-modal-overlay.open { visibility:visible; opacity:1; pointer-events:all; }
+        .img-modal-content {
+            position:relative; max-width:100%; max-height:100%;
+            display:flex; align-items:center; justify-content:center;
+            transform:scale(.95); transition:transform .3s cubic-bezier(.175,.885,.32,1.275);
+        }
+        .img-modal-overlay.open .img-modal-content { transform:scale(1); }
+        .img-modal-content img {
+            max-width:100%; max-height:90vh; border-radius:8px;
+            box-shadow:0 10px 25px rgba(0,0,0,.5); object-fit:contain;
+        }
+        .img-modal-close {
+            position:absolute; top:-12px; right:-12px;
+            background:var(--bg-surface); border:1px solid var(--border-color);
+            color:var(--text-primary); border-radius:50%; width:32px; height:32px;
+            font-size:20px; line-height:1; display:flex; align-items:center; justify-content:center;
+            cursor:pointer; box-shadow:0 2px 5px rgba(0,0,0,.3); z-index:2001;
+        }
+        .img-modal-close:hover { color:var(--accent-color); }
         .portal-prev-body { padding:14px; }
         .portal-prev-field { height:28px; background:#1d1d22; border:1px solid #2e2e33; border-radius:6px; margin-bottom:7px; }
         .portal-prev-btn { height:32px; background:#fff; border-radius:6px; width:100%; margin-bottom:7px; }
         .portal-prev-btn.outline { background:transparent; border:1px solid #2e2e33; }
+        /* Theme picker */
+        .theme-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:10px; }
+        .theme-opt {
+            display:flex; flex-direction:column; gap:8px; text-align:left; padding:10px;
+            background:var(--bg-input); border:2px solid var(--border-color); border-radius:10px;
+            color:var(--text-primary); cursor:pointer; font:inherit; min-width:0;
+            transition:border-color .15s, background .15s;
+        }
+        .theme-opt:hover { border-color:var(--lme-border-strong, #888); }
+        .theme-opt:focus-visible { outline:2px solid #3b82f6; outline-offset:2px; }
+        .theme-opt[aria-checked="true"] { border-color:#3b82f6; background:var(--bg-surface-hover); }
+        .theme-sw { display:flex; height:34px; border-radius:6px; overflow:hidden; border:1px solid rgba(128,128,128,.35); background:var(--bg-surface-hover); }
+        .theme-sw i { flex:1; display:block; }
+        .theme-name { font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px; flex-wrap:wrap; line-height:1.3; }
+        .theme-live {
+            font-size:10px; font-weight:600; letter-spacing:.04em; text-transform:uppercase; color:var(--lme-ok, #4ade80);
+            border:1px solid rgba(74,222,128,.5); border-radius:999px; padding:0 6px; line-height:16px;
+        }
         /* Hidden real file inputs for each slot */
         .slot-file-input { display:none; }
         /* Pending upload indicator */
         .promo-pending {
-            font-size:11px; color:#fbbf24; margin-top:2px; display:none;
+            font-size:11px; color:var(--lme-warn, #fbbf24); margin-top:2px; display:none;
             white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
         }
         /* Audio slots */
@@ -82,19 +128,33 @@
             display:flex; align-items:center; justify-content:center;
             color:var(--text-secondary);
         }
-        .audio-icon.has-file { border-color:#3b82f6; color:#60a5fa; }
+        .audio-icon.has-file { border-color:#3b82f6; color:var(--lme-info, #60a5fa); }
         /* min-width keeps the info column from collapsing toward 0 and wrapping
            the filename one character per line when the action buttons grow */
         .audio-info { flex:1 1 160px; min-width:140px; overflow:hidden; }
         .audio-label { font-size:13px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .audio-status-active { font-size:11px; color:#4ade80; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .audio-status-active { font-size:11px; color:var(--lme-ok, #4ade80); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .audio-status-empty  { font-size:11px; color:var(--text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .audio-pending {
-            font-size:11px; color:#fbbf24; margin-top:2px; display:none;
+            font-size:11px; color:var(--lme-warn, #fbbf24); margin-top:2px; display:none;
             white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
         }
         .audio-actions { display:flex; gap:6px; flex-shrink:0; flex-wrap:wrap; }
         .audio-file-input { display:none; }
+        /* Sound library modal (#soundModal) — list rows */
+        .sound-item {
+            display:flex; align-items:center; gap:10px; padding:8px 0;
+            border-top:1px solid var(--border-color);
+        }
+        .sound-item:first-child { border-top:none; }
+        .sound-info { flex:1 1 auto; min-width:0; }
+        .sound-name { font-size:13px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .sound-desc { font-size:11px; color:var(--text-secondary); overflow-wrap:anywhere; }
+        .sound-play { min-width:76px; flex-shrink:0; }   /* Play -> Stop must not resize the row */
+        .sound-use  { min-width:84px; flex-shrink:0; text-align:center; }
+        .sound-active { font-size:12px; color:var(--lme-ok, #4ade80); white-space:nowrap; }
+        .sound-msg  { font-size:12px; color:var(--text-secondary); padding:6px 0; }
+        .sound-foot { font-size:11px; color:var(--text-secondary); margin-top:4px; padding-top:8px; border-top:1px solid var(--border-color); }
         /* On narrow screens drop the action buttons onto their own full-width
            row so the Confirm/Upload button never runs off the edge */
         @media (max-width: 480px) {
@@ -215,6 +275,8 @@
                 Background music loops automatically when the portal loads.
                 Coin sound plays each time a coin is detected by the slot.
                 Both are silenced instantly with the speaker icon on the portal.
+                <b>Library</b> opens the sounds published in the project repository for that slot
+                &mdash; press &#9654; Play to preview one, then <b>Use</b> to install it.
             </div>
         </div>
     </div>
@@ -253,10 +315,49 @@
 
 </div><!-- /row -->
 
-<!-- ═══════════════ Custom CSS ═══════════════ -->
+<!-- ═══════════════ Theme + Custom CSS (share one live preview) ═══════════════ -->
 <div class="row g-3 mt-1" id="css-section">
 
 <div class="col-lg-7">
+    <!-- Theme -->
+    <div class="card mb-3" id="theme-card">
+        <div class="card-header d-flex align-items-center justify-content-between">
+            <span>Theme</span>
+            <small class="text-muted" style="font-size:11px;">Overall look of the customer portal</small>
+        </div>
+        <div class="card-body">
+            <div class="field-hint mb-2" style="font-size:12px;">
+                Pick a ready-made look, similar to other hotspot systems. Click a theme to see it in the preview, then
+                <b>Use this theme</b> to put it on the portal. Coin, voucher and login work exactly the same in every theme.
+            </div>
+            <div id="theme-grid" class="theme-grid" role="radiogroup" aria-label="Portal theme">
+                <div class="field-hint">Loading themes&hellip;</div>
+            </div>
+            <div id="theme-desc" class="field-hint mt-2" style="font-size:12px;min-height:2.6em;"></div>
+            <div class="d-flex flex-wrap gap-2 align-items-center mt-2">
+                <button class="btn btn-primary" id="theme-apply" disabled>Use this theme</button>
+                <button class="btn btn-outline-secondary" id="theme-cancel" disabled>Cancel</button>
+                <span id="theme-status" class="field-hint" style="margin:0;"></span>
+            </div>
+            <details class="mt-3">
+                <summary style="cursor:pointer;font-size:12.5px;color:var(--text-secondary);">About themes</summary>
+                <div class="field-hint mt-2" style="font-size:12px;line-height:1.55;">
+                    <b>Your content stays.</b> Title, brand, logo, carousel slides, audio and the footer text are used by every theme.<br>
+                    <b>Custom CSS goes on top.</b> It loads after the theme, so colour variables work as usual. If a rule of yours has no effect
+                    on a theme, put <code>html body</code> in front of the selector, e.g. <code>html body .btn { &hellip; }</code>.<br>
+                    <b>Safe by design.</b> A theme can only change how the portal looks. If one ever hides the voucher box, Insert Coin or a
+                    pop-up button, customers' phones switch it off by themselves and show the stock look.<br>
+                    <b>Try it on your phone first.</b> Open the portal address with <code>?theme=banner-classic</code> on the end (any installed theme id);
+                    <code>?notheme=1</code> shows the stock look. Nothing is saved.<br>
+                    <b>Customers</b> who already have the portal open get the new theme the next time the page loads.<br>
+                    <b>More themes:</b> each theme is a folder in <code>hotspot/themes/</code> on the device (<code>theme.info</code> + <code>theme.css</code>);
+                    see <code>THEMES.md</code> in the repository.
+                </div>
+            </details>
+        </div>
+    </div>
+
+    <!-- Custom CSS -->
     <div class="card mb-3">
         <div class="card-header d-flex align-items-center justify-content-between">
             <span>Custom CSS</span>
@@ -288,7 +389,7 @@
             <textarea id="css-editor" class="form-control" rows="16" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"
                       style="height:auto !important;min-height:280px;padding:10px 12px !important;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.45;tab-size:2;white-space:pre;overflow:auto;resize:vertical;"
                       placeholder="/* Example: make the connect button pink */&#10;:root {&#10;  --btn-primary-bg: #ff0066;&#10;  --btn-primary-border: #ff0066;&#10;  --btn-primary-color: #ffffff;&#10;}"></textarea>
-            <div id="css-errors" style="display:none;margin-top:8px;border:1px solid #ef4444;background:rgba(239,68,68,.08);border-radius:8px;padding:8px 12px;font-size:12.5px;"></div>
+            <div id="css-errors" style="display:none;margin-top:8px;border:1px solid var(--lme-danger, #ef4444);background:rgba(239,68,68,.08);border-radius:8px;padding:8px 12px;font-size:12.5px;"></div>
 
             <details class="mt-2">
                 <summary style="cursor:pointer;font-size:12.5px;color:var(--text-secondary);">Tips &amp; colour variables</summary>
@@ -377,7 +478,30 @@
 <input type="file" class="audio-file-input" id="file-coin_sound" accept="audio/mpeg,audio/ogg,audio/wav,.mp3,.ogg,.wav" onchange="onAudioFileChosen('coin_sound')">
 <input type="file" class="audio-file-input" id="file-insert_bg_music" accept="audio/mpeg,audio/ogg,audio/wav,.mp3,.ogg,.wav" onchange="onAudioFileChosen('insert_bg_music')">
 
+<!-- Sound library: one modal shared by the three audio slots (filled by JS) -->
+<div class="modal fade" id="soundModal" tabindex="-1" aria-labelledby="sound-modal-title" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable" style="max-width:480px;">
+        <div class="modal-content" style="border:1px solid var(--border-color);">
+            <div class="modal-header py-2 px-3">
+                <div class="fw-semibold" id="sound-modal-title" style="font-size:14px;">Sound library</div>
+                <button type="button" class="btn-close btn-close-white ms-auto" id="sound-modal-x" data-bs-dismiss="modal" aria-label="Close" style="font-size:12px;"></button>
+            </div>
+            <div class="modal-body px-3 py-2" id="sound-modal-body"></div>
+            <div class="modal-footer py-2 px-3" style="border-top:1px solid var(--border-color);">
+                <button type="button" class="btn btn-sm btn-outline-secondary me-auto" id="sound-modal-refresh">Refresh</button>
+                <button type="button" class="btn btn-sm btn-secondary" id="sound-modal-close" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script src="/js/jquery-3.7.1.min.js?v=1.0.0"></script>
+<div class="img-modal-overlay" id="img-modal-overlay" aria-hidden="true">
+    <div class="img-modal-content">
+        <button type="button" class="img-modal-close" id="img-modal-close" aria-label="Close">&times;</button>
+        <img id="img-modal-src" src="" alt="Full size preview">
+    </div>
+</div>
 <script src="/js/bootstrap.bundle.min.js?v=1.0.0"></script>
 <script src="/js/toastr.min.js?v=1.0.0"></script>
 <script>
@@ -730,6 +854,10 @@ function buildAudioSlots(bgMusicPath, coinSoundPath, insertBgMusicPath) {
     _audioFiles.coin_sound = coinSoundPath || null;
     _audioFiles.insert_bg_music = insertBgMusicPath || null;
 
+    // The rows (and their Play buttons) are rebuilt from scratch below, so end
+    // any running preview first.
+    stopPreviewAudio();
+
     var container = document.getElementById('audio-list');
     container.innerHTML = '';
 
@@ -755,6 +883,7 @@ function buildAudioSlots(bgMusicPath, coinSoundPath, insertBgMusicPath) {
                 + '<div class="audio-actions">'
                 +   '<button class="btn btn-sm btn-outline-secondary" id="audio-play-btn-' + slot + '" onclick="previewAudio(\'' + slot + '\')">▶ Play</button>'
                 +   '<button class="btn btn-sm btn-outline-secondary" onclick="triggerAudioFile(\'' + slot + '\')">Replace</button>'
+                +   '<button class="btn btn-sm btn-outline-secondary" onclick="openSoundPicker(\'' + slot + '\')">Library</button>'
                 +   '<button class="btn btn-sm btn-outline-danger" onclick="clearAudio(\'' + slot + '\')">Remove</button>'
                 +   '<button class="btn btn-sm btn-primary" id="audio-upload-btn-' + slot + '" onclick="uploadAudio(\'' + slot + '\')" style="display:none;">Upload</button>'
                 + '</div>';
@@ -768,6 +897,7 @@ function buildAudioSlots(bgMusicPath, coinSoundPath, insertBgMusicPath) {
                 + '</div>'
                 + '<div class="audio-actions">'
                 +   '<button class="btn btn-sm btn-outline-secondary" onclick="triggerAudioFile(\'' + slot + '\')">Upload</button>'
+                +   '<button class="btn btn-sm btn-outline-secondary" onclick="openSoundPicker(\'' + slot + '\')">Library</button>'
                 +   '<button class="btn btn-sm btn-primary" id="audio-upload-btn-' + slot + '" onclick="uploadAudio(\'' + slot + '\')" style="display:none;">Confirm</button>'
                 + '</div>';
         }
@@ -857,10 +987,21 @@ function clearAudio(slot) {
     }).catch(function(){ toastr.error('Failed to remove audio.'); });
 }
 
-var _previewSlot = null;
+/* ── Preview (one at a time, for installed files AND library sounds) ──
+   _previewKey says which Play button is live:
+     'slot:<slot>'        the file currently installed for a slot
+     'lib:<slot>:<id>'    a sound in the library picker                      */
+var _previewKey = null;
 
-function updatePreviewBtn(slot, playing) {
-    var btn = document.getElementById('audio-play-btn-' + slot);
+function previewBtnFor(key) {
+    var p = key.split(':');
+    return document.getElementById(p[0] === 'lib'
+        ? 'lib-play-' + p[1] + '-' + p.slice(2).join(':')
+        : 'audio-play-btn-' + p[1]);
+}
+
+function updatePreviewBtn(key, playing) {
+    var btn = previewBtnFor(key);
     if (!btn) return;
     if (playing) {
         btn.textContent = '■ Stop';
@@ -874,33 +1015,235 @@ function updatePreviewBtn(slot, playing) {
 }
 
 function stopPreviewAudio() {
-    if (window._previewAudio) {
-        window._previewAudio.pause();
-        window._previewAudio.currentTime = 0;
-        window._previewAudio = null;
-    }
-    if (_previewSlot) { updatePreviewBtn(_previewSlot, false); _previewSlot = null; }
+    var a = window._previewAudio;
+    window._previewAudio = null;          // cleared first: a's own handlers check it
+    if (a) { try { a.pause(); a.currentTime = 0; } catch (e) {} }
+    if (_previewKey) { updatePreviewBtn(_previewKey, false); _previewKey = null; }
+}
+
+function startPreview(key, src, failMsg) {
+    // Toggle: pressing Play on the one that is playing stops it
+    if (_previewKey === key) { stopPreviewAudio(); return; }
+    stopPreviewAudio();                   // stop whatever else was playing
+    if (!src) { toastr.warning(failMsg); return; }
+
+    var a = new Audio(src);
+    window._previewAudio = a;
+    _previewKey = key;
+    updatePreviewBtn(key, true);
+
+    // Each handler acts only while it is still THE preview, so a late event
+    // from an older sound can't stop the one that replaced it.
+    a.onended = function() { if (window._previewAudio === a) stopPreviewAudio(); };
+    a.onerror = function() { if (window._previewAudio === a) { toastr.warning(failMsg); stopPreviewAudio(); } };
+    a.play().catch(function(err) {
+        if (window._previewAudio === a) { toastr.warning('Could not play: ' + err.message); stopPreviewAudio(); }
+    });
 }
 
 function previewAudio(slot) {
-    // Toggle: clicking Play on the active slot stops it
-    if (_previewSlot === slot) { stopPreviewAudio(); return; }
-    stopPreviewAudio(); // Stop any other slot that was playing
-
     var path = _audioFiles[slot];
     if (!path) return;
-    var fn = path.split('/').pop();
-    var src = audioProxy(fn);
-    var a = new Audio(src);
-    window._previewAudio = a;
-    _previewSlot = slot;
-    updatePreviewBtn(slot, true);
+    startPreview('slot:' + slot, audioProxy(path.split('/').pop()), 'Could not play audio.');
+}
 
-    a.onended = function() { stopPreviewAudio(); };
-    a.onerror = function() { toastr.warning('Could not play audio.'); stopPreviewAudio(); };
-    a.play().catch(function(err) {
-        toastr.warning('Could not play: ' + err.message);
-        stopPreviewAudio();
+window.addEventListener('pagehide', stopPreviewAudio);
+
+/* ── Sound library (sounds published in the repo's sounds.txt) ──
+   hotspot.cgi?action=sound_catalog returns every sound with its slot, so the
+   Library modal lists only the kind that belongs to the slot it was opened from:
+   coin sounds never show up under background music and vice versa. Previews
+   stream from the CDN straight to this browser; "Use" has the router download
+   + sha256-verify the file. */
+var _soundCatalog = null;      // last catalog response (kept for the page session)
+var _soundModal = null;        // bootstrap.Modal for #soundModal (created on first open)
+var _soundModalSlot = null;    // slot the modal is showing, or null while it is closed
+var _soundBusy = false;        // a Use download is running: the modal can't be dismissed meanwhile
+
+var SOUND_ERRORS = {
+    catalog_fetch_failed: 'Could not reach the sound library. Check the router’s internet connection.',
+    download_failed:      'Could not download that sound. Check the router’s internet connection.',
+    checksum_mismatch:    'The downloaded file did not match the library manifest, so it was not installed. Try Refresh.',
+    not_found:            'That sound is no longer in the library. Press Refresh.',
+    insufficient_space:   'Not enough storage space on device.',
+    bad_size:             'That sound file is empty or too large to install.',
+    busy:                 'Another sound is still downloading. Try again in a moment.',
+    sound_ctl_missing:    'The sound library script is missing. Update the Hotspot module.'
+};
+
+function mkEl(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;   // textContent: manifest text is never parsed as HTML
+    return e;
+}
+
+function fmtSoundSize(n) {
+    n = Number(n) || 0;
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+    return Math.max(1, Math.round(n / 1024)) + ' KB';
+}
+
+function librarySoundUrl(s) {
+    var base = (_soundCatalog && _soundCatalog.base) || '';
+    if (base.indexOf('https://') !== 0) return '';
+    return base + s.file.split('/').map(encodeURIComponent).join('/');
+}
+
+function findLibrarySound(slot, id) {
+    var list = (_soundCatalog && _soundCatalog.sounds) || [];
+    for (var i = 0; i < list.length; i++) {
+        if (list[i].slot === slot && list[i].id === id) return list[i];
+    }
+    return null;
+}
+
+function loadSoundCatalog(force, cb) {
+    if (_soundCatalog && !force) { cb(null); return; }
+    fetch('/cgi-bin/hotspot.cgi?action=sound_catalog' + (force ? '&refresh=1' : ''), { cache: 'no-store' })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (d && d.ok) { _soundCatalog = d; cb(null); }
+            else cb((d && d.error) || 'unknown');
+        })
+        .catch(function() { cb('network'); });
+}
+
+// Which footer/header buttons are usable: while a Use download runs (locked)
+// nothing is, and while the list is loading only Refresh is held back.
+function soundModalLock(locked, loading) {
+    document.getElementById('sound-modal-refresh').disabled = !!(locked || loading);
+    document.getElementById('sound-modal-close').disabled   = !!locked;
+    document.getElementById('sound-modal-x').disabled       = !!locked;
+}
+
+function openSoundPicker(slot, force) {
+    stopPreviewAudio();
+    _soundModalSlot = slot;
+    document.getElementById('sound-modal-title').textContent = 'Sound library — ' + AUDIO_SLOT_META[slot].label;
+    renderSoundPicker(slot, 'loading');
+    if (!_soundModal) _soundModal = new bootstrap.Modal(document.getElementById('soundModal'));
+    _soundModal.show();                          // no-op when it is already open (Refresh)
+    loadSoundCatalog(force, function(err) {
+        if (_soundModalSlot !== slot) return;    // closed while loading
+        renderSoundPicker(slot, err ? 'error' : 'ready', err);
+    });
+}
+
+function renderSoundPicker(slot, state, err) {
+    if (_soundModalSlot !== slot) return;
+    var box = document.getElementById('sound-modal-body');
+    box.innerHTML = '';
+    soundModalLock(_soundBusy, state === 'loading');
+
+    if (state === 'loading') { box.appendChild(mkEl('div', 'sound-msg', 'Loading the sound library…')); return; }
+    if (state === 'error') {
+        box.appendChild(mkEl('div', 'sound-msg', SOUND_ERRORS[err] || SOUND_ERRORS.catalog_fetch_failed));
+        return;
+    }
+
+    var items = ((_soundCatalog && _soundCatalog.sounds) || []).filter(function(s) { return s.slot === slot; });
+    if (!items.length) box.appendChild(mkEl('div', 'sound-msg', 'No sounds are published for this slot yet.'));
+
+    items.forEach(function(s) {
+        var row = mkEl('div', 'sound-item');
+
+        var play = mkEl('button', 'btn btn-sm btn-outline-secondary sound-play', '▶ Play');
+        play.id = 'lib-play-' + slot + '-' + s.id;
+        play.onclick = function() { previewLibrarySound(slot, s.id); };
+        row.appendChild(play);
+
+        var info = mkEl('div', 'sound-info');
+        info.appendChild(mkEl('div', 'sound-name', s.name));
+        info.appendChild(mkEl('div', 'sound-desc', fmtSoundSize(s.size) + (s.description ? ' · ' + s.description : '')));
+        row.appendChild(info);
+
+        if (s.active) {
+            row.appendChild(mkEl('span', 'sound-active', '✓ In use'));
+        } else {
+            var use = mkEl('button', 'btn btn-sm btn-primary sound-use', 'Use');
+            use.onclick = function() { useLibrarySound(slot, s.id); };
+            row.appendChild(use);
+        }
+        box.appendChild(row);
+    });
+
+    box.appendChild(mkEl('div', 'sound-foot',
+        'Play streams from the sound library to this browser. Use downloads the file to the router and checks it before installing.' +
+        (_soundCatalog && _soundCatalog.stale ? ' (Showing a saved copy of the list — the router could not reach the library just now.)' : '')));
+}
+
+(function wireSoundModal() {
+    var el = document.getElementById('soundModal');
+    // A download in progress has to finish first: Esc and a backdrop click land here too.
+    el.addEventListener('hide.bs.modal', function(e) { if (_soundBusy) e.preventDefault(); });
+    // However it was closed, silence a running preview and forget the slot.
+    el.addEventListener('hidden.bs.modal', function() { stopPreviewAudio(); _soundModalSlot = null; });
+    document.getElementById('sound-modal-refresh').addEventListener('click', function() {
+        if (_soundModalSlot) openSoundPicker(_soundModalSlot, true);
+    });
+})();
+
+function previewLibrarySound(slot, id) {
+    var s = findLibrarySound(slot, id);
+    if (!s) return;
+    startPreview('lib:' + slot + ':' + id, librarySoundUrl(s),
+        'Could not play the preview. This browser needs internet access to reach the sound library.');
+}
+
+function useLibrarySound(slot, id) {
+    var s = findLibrarySound(slot, id);
+    if (!s || _soundBusy) return;
+    stopPreviewAudio();
+
+    // Lock the modal while the router downloads: a second Use would only queue
+    // behind the first and fail with "busy", and closing the modal mid-download
+    // would hide the result.
+    var box = document.getElementById('sound-modal-body');
+    var btns = box.querySelectorAll('button.sound-use');
+    var i;
+    for (i = 0; i < btns.length; i++) { btns[i].disabled = true; }
+    var mine = box.querySelector('#lib-play-' + slot + '-' + id);
+    var useBtn = mine && mine.parentNode.querySelector('button.sound-use');
+    if (useBtn) useBtn.textContent = 'Saving…';
+    _soundBusy = true;
+    soundModalLock(true, false);
+
+    function unlock() {
+        _soundBusy = false;
+        soundModalLock(false, false);
+        for (i = 0; i < btns.length; i++) { btns[i].disabled = false; }
+        if (useBtn) useBtn.textContent = 'Use';
+    }
+
+    fetch('/cgi-bin/hotspot.cgi?action=sound_select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'audio_slot=' + slot + '&sound_id=' + encodeURIComponent(id)
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d && d.ok) {
+            _soundBusy = false;                  // lifted first, or hide() would be vetoed
+            soundModalLock(false, false);
+            // A library pick replaces the slot, so drop any file chosen but not yet uploaded
+            _audioPending[slot] = null;
+            var inp = document.getElementById('file-' + slot);
+            if (inp) inp.value = '';
+            ((_soundCatalog && _soundCatalog.sounds) || []).forEach(function(x) {
+                if (x.slot === slot) x.active = (x.id === id);
+            });
+            _audioFiles[slot] = d.path;
+            if (_soundModal) _soundModal.hide();
+            buildAudioSlots(_audioFiles.bg_music, _audioFiles.coin_sound, _audioFiles.insert_bg_music);
+            toastr.success(s.name + ' is now the ' + AUDIO_SLOT_META[slot].label + '.');
+            fetchDiskSpace();
+        } else {
+            unlock();
+            toastr.error(SOUND_ERRORS[d && d.error] || ('Could not install the sound: ' + ((d && d.error) || '?')));
+            fetchDiskSpace();
+        }
+    }).catch(function() {
+        unlock();
+        toastr.error('Network error.');
     });
 }
 
@@ -909,7 +1252,11 @@ loadConfig();
 </script>
 
 <script>
-/* ═══════════════ Custom CSS editor ═══════════════
+/* ═══════════════ Theme picker + Custom CSS editor ═══════════════
+   Both drive the same live preview: the real portal in an iframe. Picking a theme only
+   changes what the preview shows until "Use this theme" is pressed (portal_theme_set);
+   the Custom CSS draft is layered on top of it, exactly as customers' phones will see it.
+
    - Every edit is sent (debounced) as a RAM-only DRAFT. The device validates it with
      the same checks Save uses, so errors show up while typing, and the preview iframe
      (the real portal, ?cssprev=1&cssdraft=1) reloads its stylesheet in place.
@@ -923,7 +1270,7 @@ loadConfig();
     var ed = $('css-editor'), frame = $('css-frame'), frameMsg = $('css-frame-msg');
     var saved = '', seq = 0, draftTimer = null, busy = false, loaded = false;
     var info = { has_css: 0, enabled: 1, has_prev: 0 };
-    var pv = { ready: false, state: 'login', theme: 'dark', auditCb: null };
+    var pv = { ready: false, state: 'login', theme: 'dark', auditCb: null, base: '' };
 
     var SNIPS = {
         colors:
@@ -962,7 +1309,8 @@ loadConfig();
         insufficient_space: 'Not enough free storage on the device (3 MB must stay free). Nothing was changed.',
         write_incomplete: 'Writing to the device storage failed part-way. Nothing was changed.',
         write_failed: 'Writing to the device storage failed. Nothing was changed.',
-        no_previous: 'There is no earlier version to go back to.'
+        no_previous: 'There is no earlier version to go back to.',
+        no_such_theme: 'That theme is not installed (any more). The list has been refreshed.'
     };
     function errText(e) { return ERR[e] || ('Request failed' + (e ? ' (' + e + ')' : '') + '.'); }
 
@@ -980,12 +1328,12 @@ loadConfig();
         var el = $('css-status'), n = utf8len(ed.value);
         var c = $('css-count');
         c.textContent = n + ' / ' + MAX + ' bytes';
-        c.style.color = n > MAX ? '#ef4444' : '';
+        c.style.color = n > MAX ? 'var(--lme-danger, #ef4444)' : '';
         if (!loaded) { el.textContent = ''; return; }
-        if (dirty())              { el.textContent = 'Unsaved changes'; el.style.color = '#fbbf24'; }
+        if (dirty())              { el.textContent = 'Unsaved changes'; el.style.color = 'var(--lme-warn, #fbbf24)'; }
         else if (!info.has_css)   { el.textContent = 'Stock look (no custom CSS)'; el.style.color = ''; }
         else if (!info.enabled)   { el.textContent = 'Saved \u00b7 switched off'; el.style.color = ''; }
-        else                      { el.textContent = 'Saved \u00b7 live on the portal'; el.style.color = '#4ade80'; }
+        else                      { el.textContent = 'Saved \u00b7 live on the portal'; el.style.color = 'var(--lme-ok, #4ade80)'; }
     }
     function refresh() {
         var en = $('css-enabled');
@@ -1059,17 +1407,30 @@ loadConfig();
         var bad = [], k;
         for (k in NAMES) if (results && results[k] && results[k].length) bad.push(NAMES[k] + ' \u2014 ' + results[k].join(', '));
         $('css-audit-res').textContent = bad.length ? '' : '\u2713 All 4 screens OK';
-        $('css-audit-res').style.color = '#4ade80';
+        $('css-audit-res').style.color = 'var(--lme-ok, #4ade80)';
         showGuard(bad.length ? bad.map(function (s) { return s; }) : []);
         var cb = pv.auditCb; pv.auditCb = null;
         if (cb) cb(bad);
     }
     function runAudit(cb) {
         if (!pv.ready) { cb(null); return; }
-        pv.auditCb = cb;
+        // A preview scrolled out of view is not rendered by the browser, which freezes the pop-ups'
+        // fade-in and makes the check report them "invisible". Phones stack the preview below the
+        // editor, so bring it on screen for the check and then put the page back where it was.
+        var r = frame.getBoundingClientRect(), vh = window.innerHeight || document.documentElement.clientHeight,
+            y0 = window.pageYOffset, moved = false;
+        if (Math.min(r.bottom, vh) - Math.max(r.top, 0) < 60) {
+            try { frame.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e) { frame.scrollIntoView(true); }
+            moved = true;
+        }
+        var done = function (bad) {
+            if (moved) { try { window.scrollTo({ top: y0, behavior: 'instant' }); } catch (e) { window.scrollTo(0, y0); } }
+            cb(bad);
+        };
+        pv.auditCb = done;
         $('css-audit-res').textContent = 'Checking\u2026'; $('css-audit-res').style.color = '';
-        post({ cmd: 'audit' });
-        setTimeout(function () { if (pv.auditCb === cb) { pv.auditCb = null; cb(null); } }, 9000);
+        setTimeout(function () { post({ cmd: 'audit' }); }, moved ? 400 : 0);
+        setTimeout(function () { if (pv.auditCb === done) { pv.auditCb = null; done(null); } }, 9000);
     }
     window.addEventListener('message', function (e) {
         var d = e.data;
@@ -1077,6 +1438,7 @@ loadConfig();
         if (d.lmeCssReady) {
             pv.ready = true; frameMsg.style.display = 'none'; $('css-audit').disabled = false;
             post({ cmd: 'theme', theme: pv.theme }); post({ cmd: 'state', state: pv.state });
+            if (th.sel !== th.cur) post({ cmd: 'portalTheme', id: th.sel });   // the iframe starts on the saved theme
         } else if (d.lmeCssGuard) { if (!pv.auditCb) showGuard(d.issues); }
         else if (d.lmeCssAudit) onAudit(d.results);
     });
@@ -1100,13 +1462,116 @@ loadConfig();
             var ip = c && c.portal_ip, port = c && c.portal_port;
             if (!ip) throw new Error('no portal ip');
             var base = 'http://' + ip + ((port && String(port) !== '80') ? ':' + port : '');
-            $('css-open-portal').href = base + '/';
+            pv.base = base; openLink();
             frame.src = base + '/?cssprev=1&cssdraft=1';
             setTimeout(function () {
                 if (!pv.ready) frameMsg.textContent = 'Preview unavailable from this connection (the portal is only reachable from the hotspot network). Your CSS is still validated here; use \u201cOpen portal\u201d from a hotspot device to see it.';
             }, 9000);
         }).catch(function () {
             frameMsg.textContent = 'Could not find the portal address, so there is no preview. Your CSS is still validated here.';
+        });
+    }
+
+    /* ── Theme picker ── */
+    var th = { list: [], cur: 'default', sel: 'default', loaded: false, busy: false };
+    var HEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+    function themeById(id) {
+        for (var i = 0; i < th.list.length; i++) if (th.list[i].id === id) return th.list[i];
+        return null;
+    }
+    function openLink() {
+        // "Open portal" shows an unsaved pick too, so it can be tried on a real phone first.
+        if (pv.base) $('css-open-portal').href = pv.base + '/' + (th.sel !== th.cur ? '?theme=' + encodeURIComponent(th.sel) : '');
+    }
+    function renderThemes() {
+        var grid = $('theme-grid');
+        grid.textContent = '';
+        if (!th.list.length) {
+            var none = document.createElement('div'); none.className = 'field-hint';
+            none.textContent = th.loaded ? 'No themes found.' : 'Loading themes…'; grid.appendChild(none);
+        }
+        th.list.forEach(function (t) {
+            var b = document.createElement('button'), sw = document.createElement('span'),
+                nm = document.createElement('span');
+            b.type = 'button'; b.className = 'theme-opt'; b.setAttribute('role', 'radio');
+            b.setAttribute('aria-checked', t.id === th.sel ? 'true' : 'false');
+            b.setAttribute('data-id', t.id);
+            sw.className = 'theme-sw';
+            (t.swatch || []).forEach(function (c) {
+                if (!HEX.test(c)) return;
+                var i = document.createElement('i'); i.style.background = c; sw.appendChild(i);
+            });
+            nm.className = 'theme-name'; nm.appendChild(document.createTextNode(t.name || t.id));
+            if (t.id === th.cur) {
+                var lv = document.createElement('span'); lv.className = 'theme-live'; lv.textContent = 'Live'; nm.appendChild(lv);
+            }
+            b.appendChild(sw); b.appendChild(nm); grid.appendChild(b);
+        });
+        var cur = themeById(th.sel), d = $('theme-desc');
+        d.textContent = '';
+        if (cur) {
+            d.appendChild(document.createTextNode(cur.description || ''));
+            var by = [];
+            if (cur.author) by.push('by ' + cur.author);
+            if (cur.license) by.push(cur.license);
+            if (by.length) {
+                var m = document.createElement('div'); m.style.opacity = '.75'; m.textContent = by.join(' · '); d.appendChild(m);
+            }
+        }
+        refreshTheme();
+    }
+    function refreshTheme() {
+        var changed = th.sel !== th.cur, st = $('theme-status');
+        $('theme-apply').disabled = !th.loaded || th.busy || !changed;
+        $('theme-cancel').disabled = !th.loaded || th.busy || !changed;
+        if (!th.loaded) { st.textContent = ''; return; }
+        if (changed) { st.textContent = 'Previewing — not live yet'; st.style.color = 'var(--lme-warn, #fbbf24)'; }
+        else { st.textContent = 'Live on the portal'; st.style.color = 'var(--lme-ok, #4ade80)'; }
+        openLink();
+    }
+    function pickTheme(id) {
+        if (th.busy || !themeById(id) || id === th.sel) return;
+        th.sel = id; renderThemes();
+        if (pv.ready) post({ cmd: 'portalTheme', id: id });
+    }
+    $('theme-grid').addEventListener('click', function (e) {
+        var b = e.target.closest ? e.target.closest('button[data-id]') : null;
+        if (b) pickTheme(b.getAttribute('data-id'));
+    });
+    $('theme-cancel').addEventListener('click', function () { pickTheme(th.cur); });
+    $('theme-apply').addEventListener('click', function () {
+        var id = th.sel, t = themeById(id);
+        if (!t || id === th.cur || th.busy) return;
+        th.busy = true; refreshTheme();
+        var done = function () { th.busy = false; refreshTheme(); };
+        // Same pre-flight as Save CSS: if this theme (plus your Custom CSS) would hide a control,
+        // phones would switch it off again, so say so before it goes live.
+        new Promise(function (res) {
+            setTimeout(function () { runAudit(function (bad) { res(bad || []); }); }, 600);
+        }).then(function (bad) {
+            if (bad.length && !window.confirm('Customers’ phones would switch this theme off on these screens:\n\n' + bad.join('\n') + '\n\nUse it anyway?')) { done(); return; }
+            return api('portal_theme_set', 'theme=' + encodeURIComponent(id)).then(function (r) {
+                if (r.ok) {
+                    th.cur = id; renderThemes();
+                    toastr.success((t.name || id) + ' is now live on the portal.');
+                } else {
+                    toastr.error(errText(r.error));
+                    if (r.error === 'no_such_theme') return loadThemes();
+                }
+            }).then(done);
+        }).catch(function () { toastr.error('Network error. The theme was not changed.'); done(); });
+    });
+    function loadThemes() {
+        return api('portal_theme_list').then(function (d) {
+            if (!d || !d.ok) throw new Error('list');
+            th.list = d.themes || []; th.cur = d.current || 'default';
+            if (!themeById(th.cur)) th.cur = 'default';
+            th.sel = (th.loaded && themeById(th.sel)) ? th.sel : th.cur;   // first load: start on the live theme
+            th.loaded = true; renderThemes();
+            if (pv.ready) post({ cmd: 'portalTheme', id: th.sel });
+        }).catch(function () {
+            th.loaded = false; th.list = []; renderThemes();
+            $('theme-grid').textContent = 'Could not load the theme list.';
         });
     }
 
@@ -1183,7 +1648,36 @@ loadConfig();
         if (loaded && dirty()) { e.preventDefault(); e.returnValue = ''; }
     });
 
+/* ── Click a carousel slide (list thumbnail or live preview) to open it in the portal-style image modal ── */
+(function () {
+    var box = document.getElementById('img-modal-overlay');
+    var big = document.getElementById('img-modal-src');
+    function openImg(src) {
+        if (!src) return;
+        big.src = src;
+        box.classList.add('open'); box.setAttribute('aria-hidden', 'false');
+    }
+    function closeImg() { box.classList.remove('open'); box.setAttribute('aria-hidden', 'true'); }
+    // Delegated, so thumbs rebuilt by buildPromoSlots() and the in-browser
+    // preview swapped in by onPromoFileChosen() (a data: URL) both work.
+    document.getElementById('promo-list').addEventListener('click', function (e) {
+        var t = e.target;
+        if (t && t.classList && t.classList.contains('promo-thumb')) openImg(t.getAttribute('src'));
+    });
+    document.getElementById('prev-carousel-img').addEventListener('click', function () {
+        openImg(this.getAttribute('src'));
+    });
+    box.addEventListener('click', function (e) {
+        if (e.target === box || e.target.className === 'img-modal-content') closeImg();
+    });
+    document.getElementById('img-modal-close').addEventListener('click', closeImg);
+    document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && box.classList.contains('open')) closeImg();
+    });
+})();
+
     refresh();
+    loadThemes();
     loadAll().then(startPreview);
 })();
 </script>

@@ -14,6 +14,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
+    <script src="/js/theme.js?v=1.0.0"></script>
     <link href="/css/bootstrap.min.css?v=1.0.0" rel="stylesheet">
     <link href="/css/style.css?v=1.0.0" rel="stylesheet">
 
@@ -25,15 +26,90 @@
     <link  href="/css/xterm.css?v=1.0.0"  rel="stylesheet"
            onerror="this.href='https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css'">
     <style>
-        html, body { height: 100%; overflow: hidden; }
+        /* Self-hosted monospace font. The device/phone's own "monospace" may not be
+           truly monospaced, and style.css forces Nunito everywhere, so xterm ended
+           up measuring one font and drawing another. font-display:block + the
+           document.fonts.load() below make xterm measure the real font. */
+        @font-face {
+            font-family: 'LME Mono';
+            src: url('/graphics/JetBrainsMono-Regular.woff2?v=1.0.0') format('woff2');
+            font-weight: 400; font-style: normal; font-display: block;
+        }
+        @font-face {
+            font-family: 'LME Mono';
+            src: url('/graphics/JetBrainsMono-Bold.woff2?v=1.0.0') format('woff2');
+            font-weight: 700; font-style: normal; font-display: block;
+        }
 
-        /* Make the page below the navbar fill remaining height */
+        html, body { height: 100%; overflow: hidden; overscroll-behavior-y: contain; }
+
+        /* Terminal chrome colours. Dark = the original hard-coded values. */
+        :root {
+            --term-bg: #0d0d0d;
+            --term-bar-bg: #1a1a1a;
+            --term-bar-border: #2a2a2a;
+            --term-bar-text: #888;
+            --term-dot-idle: #555;
+            --term-size-text: #555;
+            --term-tool-bg: #1e1e1e;
+            --term-btn-bg: #2d2d2d;
+            --term-btn-text: #ccc;
+            --term-btn-border: #3a3a3a;
+            --term-btn-active: #444;
+            --term-btn-danger: #f66;
+            --term-btn-danger-border: #633;
+        }
+        :root[data-bs-theme="light"] {
+            --term-bg: #fafafa;
+            --term-bar-bg: #eceef2;
+            --term-bar-border: #d3d6dc;
+            --term-bar-text: #5b6169;
+            --term-dot-idle: #9aa0a8;
+            --term-size-text: #6b7280;
+            --term-tool-bg: #f3f4f6;
+            --term-btn-bg: #ffffff;
+            --term-btn-text: #3c4148;
+            --term-btn-border: #c3c7ce;
+            --term-btn-active: #dfe2e7;
+            --term-btn-danger: #c62828;
+            --term-btn-danger-border: #e3a5a5;
+        }
+
+        /* style.css forces `font-family: Nunito !important` on *. That also hits
+           xterm's rows, its cell-measure element AND its per-glyph width cache
+           (a bare <div> appended to <body>, outside .xterm, positioned at
+           top:-50000px). xterm's DOM renderer sets letter-spacing on each glyph to
+           (cell width - measured glyph width), so measuring in Nunito while drawing
+           in a mono font gave wide gaps after i/l/t and jammed m/w. Pin all of them
+           to the same monospace font. !important + higher specificity beats `*`. */
+        .xterm, .xterm *, .xterm *::before, .xterm *::after,
+        body > div[style*="-50000px"], body > div[style*="-50000px"] * {
+            font-family: 'LME Mono', 'DejaVu Sans Mono', 'Liberation Mono', monospace !important;
+        }
+
+        /* Touch scrolling: xterm's DOM renderer rebuilds the row <span>s on every
+           scroll step. A touch keeps targeting the span it started on, so once that
+           span is detached all later touchmove/touchend events are lost and a swipe
+           moved exactly one line. Make the rows transparent to pointer events so the
+           (stable) .xterm-screen is the touch target. */
+        .xterm-rows, .xterm-rows * { pointer-events: none; }
+
+        /* Fill exactly the VISIBLE viewport. 100vh is the largest viewport on mobile
+           browsers (URL bar hidden), so calc(100vh - 56px) pushed the quick-action
+           toolbar and status bar below the screen. Let body be a column at 100dvh
+           (visualViewport sets it exactly, see script) and the wrapper take the rest,
+           whatever the real navbar height is. */
+        body { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+        body > nav.navbar { flex-shrink: 0; }
+
         .terminal-wrapper {
             display: flex;
             flex-direction: column;
-            height: calc(100vh - 56px); /* 56px = navbar height */
-            background: #0d0d0d;
-            padding: 6px 8px; /* <-- PADDING MOVED HERE */
+            flex: 1 1 auto;
+            min-height: 0;
+            background: var(--term-bg);
+            /* bottom: keep the toolbar/status bar clear of the fixed AGPL source notice */
+            padding: 6px 8px 22px;
         }
 
         #terminal-container {
@@ -54,15 +130,15 @@
             justify-content: space-between;
             padding: 3px 10px;
             font-size: 11px;
-            background: #1a1a1a;
-            border-top: 1px solid #2a2a2a;
-            color: #888;
+            background: var(--term-bar-bg);
+            border-top: 1px solid var(--term-bar-border);
+            color: var(--term-bar-text);
             flex-shrink: 0;
         }
         #status-dot {
             width: 8px; height: 8px;
             border-radius: 50%;
-            background: #555;
+            background: var(--term-dot-idle);
             display: inline-block;
             margin-right: 6px;
             transition: background .3s;
@@ -79,25 +155,25 @@
             -webkit-overflow-scrolling: touch;
             gap: 4px;
             padding: 5px 8px;
-            background: #1e1e1e;
-            border-top: 1px solid #2a2a2a;
+            background: var(--term-tool-bg);
+            border-top: 1px solid var(--term-bar-border);
             flex-shrink: 0;
         }
         #mobile-toolbar button {
             flex-shrink: 0;
             font-size: 11px;
             padding: 5px 10px;
-            background: #2d2d2d;
-            color: #ccc;
-            border: 1px solid #3a3a3a;
+            background: var(--term-btn-bg);
+            color: var(--term-btn-text);
+            border: 1px solid var(--term-btn-border);
             border-radius: 4px;
             white-space: nowrap;
             cursor: pointer;
             -webkit-tap-highlight-color: transparent;
             user-select: none;
         }
-        #mobile-toolbar button:active { background: #444; }
-        #mobile-toolbar button.danger { color: #f66; border-color: #633; }
+        #mobile-toolbar button:active { background: var(--term-btn-active); }
+        #mobile-toolbar button.danger { color: var(--term-btn-danger); border-color: var(--term-btn-danger-border); }
     </style>
 </head>
 <body>
@@ -127,7 +203,7 @@
 
         <div id="status-bar">
             <span><span id="status-dot"></span><span id="status-text">Connecting…</span></span>
-            <span id="status-size" style="color:#555"></span>
+            <span id="status-size" style="color:var(--term-size-text)"></span>
         </div>
     </div>
 
@@ -147,9 +223,8 @@
         }
 
         // 2. All your configuration, globals, and the initTerminal function
-        const TTYD_PORT    = 7681;          
         const RECONNECT_MS = 4000;          
-        const WS_URL       = `ws://${location.hostname}:${TTYD_PORT}/ws`;
+        const WS_URL       = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
 
         let term, fitAddon, ws, reconnectTimer;
 
@@ -234,32 +309,40 @@
         // ----------------------------------------------------------------
         // Init — called after all scripts load
         // ----------------------------------------------------------------
+        // xterm paints to its own renderer, so it can't read CSS variables: pick the
+        // palette in JS (the dark one is the original) and re-apply it on a mode switch.
+        var TERM_DARK = {
+            background:   '#0d0d0d', foreground:   '#e0e0e0', cursor:       '#00e5ff',
+            black:        '#1e1e1e', red:          '#f44336', green:        '#4caf50',
+            yellow:       '#ffeb3b', blue:         '#2196f3', magenta:      '#9c27b0',
+            cyan:         '#00bcd4', white:        '#e0e0e0',
+            brightBlack:  '#555',    brightRed:    '#ef9a9a', brightGreen:  '#a5d6a7',
+            brightYellow: '#fff176', brightBlue:   '#90caf9', brightMagenta:'#ce93d8',
+            brightCyan:   '#80deea', brightWhite:  '#ffffff'
+        };
+        var TERM_LIGHT = {
+            background:   '#fafafa', foreground:   '#1b1d21', cursor:       '#0277bd',
+            selectionBackground: 'rgba(2,119,189,0.25)',
+            black:        '#1b1d21', red:          '#c62828', green:        '#2e7d32',
+            yellow:       '#8a6d00', blue:         '#1565c0', magenta:      '#8e24aa',
+            cyan:         '#00838f', white:        '#5b6169',
+            brightBlack:  '#6b7280', brightRed:    '#d32f2f', brightGreen:  '#388e3c',
+            brightYellow: '#a67c00', brightBlue:   '#1976d2', brightMagenta:'#9c27b0',
+            brightCyan:   '#00acc1', brightWhite:  '#000000'
+        };
+        function termTheme() {
+            return document.documentElement.getAttribute('data-bs-theme') === 'light' ? TERM_LIGHT : TERM_DARK;
+        }
+        document.addEventListener('lme:themechange', function () {
+            if (term) term.options.theme = termTheme();
+        });
+
         function initTerminal() {
             term = new Terminal({
                 cursorBlink:      true,
                 fontSize:         14,
-                fontFamily:       "'Cascadia Code', 'Fira Code', 'Courier New', monospace",
-                theme: {
-                    background:   '#0d0d0d',
-                    foreground:   '#e0e0e0',
-                    cursor:       '#00e5ff',
-                    black:        '#1e1e1e',
-                    red:          '#f44336',
-                    green:        '#4caf50',
-                    yellow:       '#ffeb3b',
-                    blue:         '#2196f3',
-                    magenta:      '#9c27b0',
-                    cyan:         '#00bcd4',
-                    white:        '#e0e0e0',
-                    brightBlack:  '#555',
-                    brightRed:    '#ef9a9a',
-                    brightGreen:  '#a5d6a7',
-                    brightYellow: '#fff176',
-                    brightBlue:   '#90caf9',
-                    brightMagenta:'#ce93d8',
-                    brightCyan:   '#80deea',
-                    brightWhite:  '#ffffff',
-                },
+                fontFamily:       "'LME Mono', monospace",
+                theme:            termTheme(),
                 allowProposedApi: true,
                 scrollback:       2000,
             });
@@ -274,7 +357,7 @@
             updateSize();
             detectMobile();
 
-            // Send keystrokes to ttyd
+            // Send keystrokes to the shell
             term.onData(data => {
                 if (ws && ws.readyState === WebSocket.OPEN) ws.send('0' + data);
             });
@@ -289,12 +372,35 @@
             connect();
         }
 
+        // Track the visible viewport (URL bar / on-screen keyboard) so the toolbar
+        // and status bar never end up under the screen edge or the keyboard.
+        // The terminal's ResizeObserver refits whenever this changes the height.
+        if (window.visualViewport) {
+            const syncViewportHeight = () => {
+                document.body.style.height =
+                    Math.round(window.visualViewport.height * window.visualViewport.scale) + 'px';
+            };
+            window.visualViewport.addEventListener('resize', syncViewportHeight);
+            syncViewportHeight();
+        }
+
+        // Open the terminal only once the monospace font is ready (max 3 s), so the
+        // cell size xterm measures is the one it actually draws with.
+        function startTerminal() {
+            if (!document.fonts || !document.fonts.load) return initTerminal();
+            let started = false;
+            const go = () => { if (!started) { started = true; initTerminal(); } };
+            Promise.all([document.fonts.load("14px 'LME Mono'"),
+                         document.fonts.load("bold 14px 'LME Mono'")]).then(go, go);
+            setTimeout(go, 3000);
+        }
+
         // 3. FINALLY, call loadAll AT THE VERY END, now that initTerminal actually exists!
         loadAll([
             ['/js/xterm.js',               'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js'],
             ['/js/xterm-addon-fit.js',      'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js'],
             ['/js/xterm-addon-web-links.js','https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.js'],
-        ], initTerminal);
+        ], startTerminal);
     </script>
     <script src="/js/bootstrap.bundle.min.js?v=1.0.0"></script>
 </body>

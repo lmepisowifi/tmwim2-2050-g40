@@ -86,15 +86,21 @@ setInterval(function () {
             { label: 'Settings',         href: '/system.html'        },
             { label: 'Accounts',         href: '/accounts.html'      },
             { label: 'GPON Settings',    href: '/gpon.html'          },
+            { label: 'OMCI Settings',    href: '/omci.html'          },
             { label: 'EPON Settings',    href: '/epon.html'          },
-            { label: 'Dashboard Layout', href: '/dashboard-layout.html' },
-            { label: 'Modules',          href: '/modules.html'       },
             { label: 'Tailscale',        href: '/tailscale.html', module: 'tailscale' },
-            { label: 'Software Update',  href: '/ota.html'           },
-            { label: 'Boot Partitions',  href: '/bootpart.html'      },
-            { label: 'Firmware Upload',  href: '/fwupload.html'      },
+            { label: 'TR-069',           href: '/tr069.html'         },
             { label: 'MIB Configuration', href: '/mibconfig.html'    },
             { label: 'Reboot',           href: '/reboot.html'        },
+        ]},
+        { label: 'Firmware', children: [
+            { label: 'Boot Partitions',  href: '/bootpart.html'      },
+            { label: 'Firmware Upload',  href: '/fwupload.html'      },
+        ]},
+        { label: 'TMWI', children: [
+            { label: 'Dashboard Layout', href: '/dashboard-layout.html' },
+            { label: 'Modules',          href: '/modules.html'       },
+            { label: 'Software Update',  href: '/ota.html'           },
         ]},
     ];
     // ================================================================
@@ -176,7 +182,11 @@ setInterval(function () {
             '      <ul class="navbar-nav me-auto">',
                        buildItems(filteredNAV, hotspotRunning),
             '      </ul>',
-            '      <button class="btn btn-outline-danger" onclick="logout()">Logout</button>',
+            '      <div class="nav-actions">',
+            '        <span id="lme-theme-slot"></span>',
+            '        <button type="button" class="btn btn-outline-light" id="lme-quicksetup-btn">Quick Setup</button>',
+            '        <button class="btn btn-outline-danger" onclick="logout()">Logout</button>',
+            '      </div>',
             '    </div>',
             '  </div>',
             '</nav>',
@@ -198,27 +208,59 @@ setInterval(function () {
                 if (!item.children) return item;
                 var fc = item.children.filter(function(c) {
                     if (!modOk(c.module)) return false;   // hide pages (e.g. Tailscale) whose module isn't installed
-                    if (c.href === '/gpon.html') return showGpon;
+                    if (c.href === '/gpon.html' || c.href === '/omci.html') return showGpon;
                     if (c.href === '/epon.html') return showEpon;
                     return true;
                 });
                 return { label: item.label, href: item.href, module: item.module, children: fc };
             });
         _script.insertAdjacentHTML('beforebegin', buildNavHtml(filteredNAV, hotspotRunning));
+        var qsBtn = document.getElementById('lme-quicksetup-btn');
+        if (qsBtn) qsBtn.addEventListener('click', openQuickSetup);
+
+        // Light/dark toggle (js/theme.js is loaded from each page's <head>)
+        var themeSlot = document.getElementById('lme-theme-slot');
+        if (themeSlot && window.lmeTheme) themeSlot.appendChild(window.lmeTheme.createButton());
     }
 
-    // Fetch system_status (for GPON/EPON visibility) and hotspot status (for Hotspot sub-items)
-    // in parallel — render nav only after both resolve so items are correct first paint.
+    // Quick Setup wizard — js/quicksetup.js is only fetched the first time the
+    // button is pressed, so it costs nothing on every other page load.
+    function openQuickSetup() {
+        if (window.lmeQuickSetup) { window.lmeQuickSetup.open(); return; }
+        if (typeof bootstrap === 'undefined') { alert('Quick Setup needs the page to finish loading first. Try again in a moment.'); return; }
+        var s = document.createElement('script');
+        s.src = '/js/quicksetup.js';
+        s.onload = function () { if (window.lmeQuickSetup) window.lmeQuickSetup.open(); };
+        s.onerror = function () { alert('Could not load Quick Setup.'); };
+        document.head.appendChild(s);
+    }
+
+    // Every request below is answered from the device itself and normally
+    // returns in milliseconds, but the nav waits for all of them — so bound
+    // each one. A hung or slow endpoint then falls back to the same safe
+    // default as any other error instead of holding the whole navbar back.
+    var NAV_FETCH_TIMEOUT_MS = 5000;
+    function navFetchJson(url, fallback) {
+        var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        var timer = setTimeout(function () { if (ctl) ctl.abort(); }, NAV_FETCH_TIMEOUT_MS);
+        var opts = { cache: 'no-store' };
+        if (ctl) opts.signal = ctl.signal;
+        return fetch(url, opts)
+            .then(function (r) { return r.json(); })
+            .catch(function () { return fallback; })
+            .then(function (v) { clearTimeout(timer); return v; });
+    }
+
+    // Fetch system_status (for GPON/EPON visibility), hotspot status (for Hotspot sub-items)
+    // and the module list in parallel — render nav only after all resolve so items are
+    // correct first paint.
+    // modules.cgi gets local=1: the nav only needs each module's "installed" flag,
+    // and without it the call downloads the module registry from the internet first,
+    // which stalls for a minute or more when the device has no uplink.
     Promise.all([
-        fetch('/cgi-bin/lme.cgi?action=system_status', { cache: 'no-store' })
-            .then(function(r) { return r.json(); })
-            .catch(function() { return {}; }),
-        fetch('/cgi-bin/hotspot.cgi?action=config_get', { cache: 'no-store' })
-            .then(function(r) { return r.json(); })
-            .catch(function() { return {}; }),
-        fetch('/cgi-bin/modules.cgi?action=list', { cache: 'no-store' })
-            .then(function(r) { return r.json(); })
-            .catch(function() { return null; })
+        navFetchJson('/cgi-bin/lme.cgi?action=system_status', {}),
+        navFetchJson('/cgi-bin/hotspot.cgi?action=config_get', {}),
+        navFetchJson('/cgi-bin/modules.cgi?action=list&local=1', null)
     ]).then(function(results) {
         var sys = results[0]; var hsp = results[1]; var mod = results[2];
         var isGpon = (String(sys.pon_mode) === '1');

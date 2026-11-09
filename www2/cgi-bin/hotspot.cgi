@@ -80,6 +80,8 @@ AUTO_PAUSED_FILE="$HDATA/auto_paused.txt"
 # Below-minimum-tier coin balances banked per-MAC by coin_result.sh — see
 # that file's COIN_BANK_FILE comment for the full explanation.
 COIN_BANK_FILE="$HDATA/coin_bank.txt"
+# Free WiFi per-device claim/cooldown records - see hotspot/freewifi.sh.
+FREE_CLAIM_FILE="$HDATA/free_claims.txt"
 # WiFi Rates expiry/validity bucket tracking - see ratevalidity.sh.
 [ -f /lmepisowifi/hotspot/ratevalidity.sh ] && . /lmepisowifi/hotspot/ratevalidity.sh
 
@@ -522,7 +524,7 @@ cfg_val_ok() {
             [ "$2" = "0" ] || [ "$2" = "1" ] ;;
         QOS_QDISC)
             # Strict enum: this lands in lmehspt.sh / globals.env / coin_config.env.
-            [ "$2" = "auto" ] || [ "$2" = "fq_codel" ] || [ "$2" = "sfq" ] ;;
+            [ "$2" = "auto" ] || [ "$2" = "cake" ] || [ "$2" = "fq_codel" ] || [ "$2" = "sfq" ] ;;
         NODEMCU_IP|PORTAL_IP)
             _valid_ipv4 "$2" ;;
         NODEMCU_MAC)
@@ -693,7 +695,7 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
     ES="${EQUAL_SHARING_ENABLED:-$(read_lmehspt_var EQUAL_SHARING_ENABLED)}"
     ES_BOOL="false"; [ "${ES:-0}" = "1" ] && ES_BOOL="true"
     QD="${QOS_QDISC:-$(read_lmehspt_var QOS_QDISC)}"
-    case "$QD" in auto|fq_codel|sfq) ;; *) QD="auto" ;; esac
+    case "$QD" in auto|cake|fq_codel|sfq) ;; *) QD="auto" ;; esac
     # What lmehspt.sh's setup_qos() actually settled on (and why), published to
     # a tmpfs file on every QoS rebuild; empty until the first rebuild after boot.
     QDS="${QOS_QDISC_STATUS:-/tmp/hotspot_qdisc_status}"
@@ -738,6 +740,19 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
     VSE_BOOL="false"; [ "${VSE:-0}" = "1" ] && VSE_BOOL="true"
     VST="${VOUCHER_STRIKE_THRESHOLD:-$(read_lmehspt_var VOUCHER_STRIKE_THRESHOLD)}"
     VCD="${VOUCHER_COOLDOWN:-$(read_lmehspt_var VOUCHER_COOLDOWN)}"
+    FWE="${FREE_WIFI_ENABLED:-$(read_lmehspt_var FREE_WIFI_ENABLED)}"
+    FWE_BOOL="false"; [ "${FWE:-0}" = "1" ] && FWE_BOOL="true"
+    FWM="${FREE_WIFI_MINUTES:-$(read_lmehspt_var FREE_WIFI_MINUTES)}"
+    FWC="${FREE_WIFI_COOLDOWN:-$(read_lmehspt_var FREE_WIFI_COOLDOWN)}"
+    FWR="${FREE_WIFI_REQUIRE_INTERNET:-$(read_lmehspt_var FREE_WIFI_REQUIRE_INTERNET)}"
+    FWR_BOOL="true"; [ "${FWR:-1}" = "0" ] && FWR_BOOL="false"
+    FWX="${FREE_WIFI_EXPIRY_MODE:-$(read_lmehspt_var FREE_WIFI_EXPIRY_MODE)}"
+    case "$FWX" in none|custom|claim) ;; *) FWX="none" ;; esac
+    FWXM="${FREE_WIFI_EXPIRY_MINUTES:-$(read_lmehspt_var FREE_WIFI_EXPIRY_MINUTES)}"
+    case "$FWXM" in ""|*[!0-9]*) FWXM=60 ;; esac
+    FW_CLAIMS=0
+    [ -f "$FREE_CLAIM_FILE" ] && FW_CLAIMS=$($BB grep -c '.' "$FREE_CLAIM_FILE" 2>/dev/null)
+    case "$FW_CLAIMS" in ''|*[!0-9]*) FW_CLAIMS=0 ;; esac
 
     HSP_RUNNING="false"; hotspot_running && HSP_RUNNING="true"
     COIN_ON="false"; [ -f /tmp/coin_enabled ] && COIN_ON="true"
@@ -786,6 +801,13 @@ if echo "$QS" | $BB grep -q "action=config_get"; then
 \"voucher_strike_enabled\":$VSE_BOOL,
 \"voucher_strike_threshold\":\"$(esc_json "$VST")\",
 \"voucher_cooldown\":\"$(esc_json "$VCD")\",
+\"free_wifi_enabled\":$FWE_BOOL,
+\"free_wifi_minutes\":\"$(esc_json "${FWM:-10}")\",
+\"free_wifi_cooldown\":\"$(esc_json "${FWC:-1440}")\",
+\"free_wifi_require_internet\":$FWR_BOOL,
+\"free_wifi_expiry_mode\":\"$FWX\",
+\"free_wifi_expiry_minutes\":\"$FWXM\",
+\"free_wifi_claims\":$FW_CLAIMS,
 \"internet_up\":$INET_UP,
 \"hotspot_running\":$HSP_RUNNING}"
 fi
@@ -2386,6 +2408,124 @@ if echo "$QS" | $BB grep -q "action=pause_on_boot_set"; then
 fi
 
 # ================================================================
+# POST ?action=free_wifi_set
+#   body: any subset of  enabled=1|0  minutes=N  cooldown=N  require_internet=1|0
+#                        expiry_mode=none|custom|claim  expiry_minutes=N
+# Free WiFi (one-tap free session — see hotspot/freewifi.sh, login.sh's
+# free=1 branch, status.sh's free_minutes/free_wait). Same three-way
+# persistence as every other simple setting here (coin_config.env for the
+# live CGIs, lmehspt.sh inline default, globals.env for the flash copy).
+# Rules: minutes 1..1440; cooldown is 0 ("once per device") or minutes..
+# 525600, and never shorter than the session itself — otherwise a device
+# could pause a free session and claim a second one on top of it.
+# Expiry: expiry_mode none (never), custom (expiry_minutes, 1..525600) or
+# claim (same length as the free session) - applied per claim through the
+# rate-validity bucket, see freewifi.sh's fw_validity_mins / login.sh.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=free_wifi_set"; then
+    read -n "${CONTENT_LENGTH:-0}" POST_DATA
+    _fwf() { printf '&%s' "$POST_DATA" | $BB sed -n "s/.*&$1=\([^&]*\).*/\1/p"; }
+    _FW_EN=$(_fwf enabled);  _FW_MIN=$(_fwf minutes)
+    _FW_CD=$(_fwf cooldown); _FW_RI=$(_fwf require_internet)
+    _FW_XM=$(_fwf expiry_mode); _FW_XMIN=$(_fwf expiry_minutes)
+
+    case "$_FW_EN" in ""|0|1) ;; *) err_json "bad_value" ;; esac
+    case "$_FW_RI" in ""|0|1) ;; *) err_json "bad_value" ;; esac
+    case "$_FW_MIN" in *[!0-9]*) err_json "bad_minutes" ;; esac
+    case "$_FW_CD"  in *[!0-9]*) err_json "bad_cooldown" ;; esac
+    case "$_FW_XM"  in ""|none|custom|claim) ;; *) err_json "bad_expiry_mode" ;; esac
+    case "$_FW_XMIN" in *[!0-9]*) err_json "bad_expiry_minutes" ;; esac
+
+    _FW_CUR_MIN="${FREE_WIFI_MINUTES:-$(read_lmehspt_var FREE_WIFI_MINUTES)}"
+    _FW_CUR_CD="${FREE_WIFI_COOLDOWN:-$(read_lmehspt_var FREE_WIFI_COOLDOWN)}"
+    case "$_FW_CUR_MIN" in ""|*[!0-9]*) _FW_CUR_MIN=10 ;; esac
+    case "$_FW_CUR_CD"  in ""|*[!0-9]*) _FW_CUR_CD=1440 ;; esac
+    _FW_CUR_XM="${FREE_WIFI_EXPIRY_MODE:-$(read_lmehspt_var FREE_WIFI_EXPIRY_MODE)}"
+    _FW_CUR_XMIN="${FREE_WIFI_EXPIRY_MINUTES:-$(read_lmehspt_var FREE_WIFI_EXPIRY_MINUTES)}"
+    case "$_FW_CUR_XM" in none|custom|claim) ;; *) _FW_CUR_XM=none ;; esac
+    case "$_FW_CUR_XMIN" in ""|*[!0-9]*) _FW_CUR_XMIN=60 ;; esac
+    _FW_NEW_XM="${_FW_XM:-$_FW_CUR_XM}"
+    _FW_NEW_XMIN="${_FW_XMIN:-$_FW_CUR_XMIN}"
+    _FW_NEW_XMIN=$(printf '%s' "$_FW_NEW_XMIN" | $BB sed 's/^0*\([0-9]\)/\1/')
+    [ -n "$_FW_NEW_XMIN" ] || _FW_NEW_XMIN=0
+    [ "${#_FW_NEW_XMIN}" -le 7 ] || err_json "bad_expiry_minutes"
+    _FW_NEW_MIN="${_FW_MIN:-$_FW_CUR_MIN}"
+    _FW_NEW_CD="${_FW_CD:-$_FW_CUR_CD}"
+    # Strip leading zeros so "007" can never be read as octal by shell
+    # arithmetic later (busybox ash crashes on 08/09), and bound the digit
+    # count so a huge number can't overflow the comparisons below.
+    _FW_NEW_MIN=$(printf '%s' "$_FW_NEW_MIN" | $BB sed 's/^0*\([0-9]\)/\1/')
+    _FW_NEW_CD=$(printf '%s' "$_FW_NEW_CD"  | $BB sed 's/^0*\([0-9]\)/\1/')
+    [ -n "$_FW_NEW_MIN" ] || _FW_NEW_MIN=0
+    [ -n "$_FW_NEW_CD" ]  || _FW_NEW_CD=0
+    [ "${#_FW_NEW_MIN}" -le 6 ] || err_json "bad_minutes"
+    [ "${#_FW_NEW_CD}" -le 7 ]  || err_json "bad_cooldown"
+
+    [ "$_FW_NEW_MIN" -ge 1 ] && [ "$_FW_NEW_MIN" -le 1440 ] || err_json "bad_minutes"
+    [ "$_FW_NEW_CD" -le 525600 ] || err_json "bad_cooldown"
+    if [ "$_FW_NEW_CD" -ne 0 ] && [ "$_FW_NEW_CD" -lt "$_FW_NEW_MIN" ]; then
+        err_json "cooldown_shorter_than_session"
+    fi
+    # Custom expiry needs a real length (0 would silently mean "no expiry").
+    [ "$_FW_NEW_XMIN" -le 525600 ] || err_json "bad_expiry_minutes"
+    if [ "$_FW_NEW_XM" = "custom" ] && [ "$_FW_NEW_XMIN" -lt 1 ]; then
+        err_json "bad_expiry_minutes"
+    fi
+
+    if [ -n "$_FW_MIN" ]; then
+        save_coin_env_var "FREE_WIFI_MINUTES" "$_FW_NEW_MIN"
+        set_lmehspt_var   "FREE_WIFI_MINUTES" "$_FW_NEW_MIN"
+        set_globals_var   "FREE_WIFI_MINUTES" "$_FW_NEW_MIN"
+    fi
+    if [ -n "$_FW_CD" ]; then
+        save_coin_env_var "FREE_WIFI_COOLDOWN" "$_FW_NEW_CD"
+        set_lmehspt_var   "FREE_WIFI_COOLDOWN" "$_FW_NEW_CD"
+        set_globals_var   "FREE_WIFI_COOLDOWN" "$_FW_NEW_CD"
+    fi
+    if [ -n "$_FW_EN" ]; then
+        save_coin_env_var "FREE_WIFI_ENABLED" "$_FW_EN"
+        set_lmehspt_var   "FREE_WIFI_ENABLED" "$_FW_EN"
+        set_globals_var   "FREE_WIFI_ENABLED" "$_FW_EN"
+    fi
+    if [ -n "$_FW_RI" ]; then
+        save_coin_env_var "FREE_WIFI_REQUIRE_INTERNET" "$_FW_RI"
+        set_lmehspt_var   "FREE_WIFI_REQUIRE_INTERNET" "$_FW_RI"
+        set_globals_var   "FREE_WIFI_REQUIRE_INTERNET" "$_FW_RI"
+    fi
+    if [ -n "$_FW_XM" ]; then
+        save_coin_env_var "FREE_WIFI_EXPIRY_MODE" "$_FW_NEW_XM"
+        set_lmehspt_var   "FREE_WIFI_EXPIRY_MODE" "$_FW_NEW_XM"
+        set_globals_var   "FREE_WIFI_EXPIRY_MODE" "$_FW_NEW_XM"
+    fi
+    if [ -n "$_FW_XMIN" ]; then
+        save_coin_env_var "FREE_WIFI_EXPIRY_MINUTES" "$_FW_NEW_XMIN"
+        set_lmehspt_var   "FREE_WIFI_EXPIRY_MINUTES" "$_FW_NEW_XMIN"
+        set_globals_var   "FREE_WIFI_EXPIRY_MINUTES" "$_FW_NEW_XMIN"
+    fi
+
+    _FW_NOW_EN="${_FW_EN:-${FREE_WIFI_ENABLED:-$(read_lmehspt_var FREE_WIFI_ENABLED)}}"
+    _FW_NOW_RI="${_FW_RI:-${FREE_WIFI_REQUIRE_INTERNET:-$(read_lmehspt_var FREE_WIFI_REQUIRE_INTERNET)}}"
+    _FW_EN_B="false"; [ "${_FW_NOW_EN:-0}" = "1" ] && _FW_EN_B="true"
+    _FW_RI_B="true";  [ "${_FW_NOW_RI:-1}" = "0" ] && _FW_RI_B="false"
+    ok_json "{\"ok\":true,\"free_wifi_enabled\":$_FW_EN_B,\"free_wifi_minutes\":\"$_FW_NEW_MIN\",\"free_wifi_cooldown\":\"$_FW_NEW_CD\",\"free_wifi_require_internet\":$_FW_RI_B,\"free_wifi_expiry_mode\":\"$_FW_NEW_XM\",\"free_wifi_expiry_minutes\":\"$_FW_NEW_XMIN\"}"
+fi
+
+# ================================================================
+# POST ?action=free_wifi_reset
+# Forgets every device's Free WiFi claim so everyone can claim again
+# (e.g. a new day, an event, or after switching cooldown to "once only").
+# Doesn't touch any session that is already running.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=free_wifi_reset"; then
+    cleared=0
+    [ -f "$FREE_CLAIM_FILE" ] && cleared=$($BB grep -c '.' "$FREE_CLAIM_FILE" 2>/dev/null)
+    case "$cleared" in ''|*[!0-9]*) cleared=0 ;; esac
+    $BB rm -f "$FREE_CLAIM_FILE" "${FREE_CLAIM_FILE}.tmp" "${FREE_CLAIM_FILE}.tmp2" 2>/dev/null
+    sync
+    ok_json "{\"ok\":true,\"cleared\":$cleared}"
+fi
+
+# ================================================================
 # POST ?action=coin_internet_set   body: enabled=1|0
 # When on, coin.sh's "start" action refuses to open a brand new coin
 # session while the router has no internet connectivity (an in-flight
@@ -3621,6 +3761,52 @@ if echo "$QS" | $BB grep -q "action=portal_audio_clear"; then
 fi
 
 # ================================================================
+# GET ?action=sound_catalog[&refresh=1]
+# Lists the portal sounds published in the repo's sounds.txt manifest and
+# flags the one currently installed for its slot (matched by sha256). Every
+# sound carries its own "slot" (bg_music | insert_bg_music | coin_sound), so
+# the page can keep background music and coin sounds in separate pickers.
+# The work lives in hotspot/sound_ctl.sh.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=sound_catalog"; then
+    SOUND_CTL="/lmepisowifi/hotspot/sound_ctl.sh"
+    [ -f "$SOUND_CTL" ] || err_json "sound_ctl_missing"
+    _sc_arg=""
+    echo "$QS" | $BB grep -q "refresh=1" && _sc_arg="refresh"
+    _sc_out=$(sh "$SOUND_CTL" catalog $_sc_arg 2>/dev/null)
+    [ -n "$_sc_out" ] || err_json "sound_ctl_failed"
+    ok_json "$_sc_out"
+fi
+
+# ================================================================
+# POST ?action=sound_select
+# body: audio_slot=bg_music|insert_bg_music|coin_sound & sound_id=<id from sounds.txt>
+# Downloads the library sound, verifies its sha256 against sounds.txt and
+# installs it to /lmepisowifi/hotspot/audio/<slot>.<ext> — the same place
+# portal_audio_upload writes — replacing whatever the slot had.
+# ================================================================
+if echo "$QS" | $BB grep -q "action=sound_select"; then
+    read -n "${CONTENT_LENGTH:-0}" POST_DATA
+    fget() {
+        printf '%s' "$POST_DATA" \
+            | $BB tr '&' '\n' \
+            | $BB grep "^$1=" \
+            | $BB sed 's/^[^=]*=//' \
+            | urldecode \
+            | head -1
+    }
+    SLOT=$(fget audio_slot | $BB tr -cd 'a-z_')
+    SID=$(fget sound_id | $BB tr -cd 'a-z0-9_-' | $BB cut -c1-48)
+    case "$SLOT" in bg_music|coin_sound|insert_bg_music) ;; *) err_json "bad_slot" ;; esac
+    [ -n "$SID" ] || err_json "bad_id"
+    SOUND_CTL="/lmepisowifi/hotspot/sound_ctl.sh"
+    [ -f "$SOUND_CTL" ] || err_json "sound_ctl_missing"
+    _sc_out=$(sh "$SOUND_CTL" select "$SLOT" "$SID" 2>/dev/null)
+    [ -n "$_sc_out" ] || err_json "sound_ctl_failed"
+    ok_json "$_sc_out"
+fi
+
+# ================================================================
 # POST ?action=anti_tether_set   body: enabled=1|0
 # Enables or disables anti-tethering (TTL-based blocking of shared
 # sessions).  The iptables chain is managed directly so the change
@@ -3653,6 +3839,123 @@ if echo "$QS" | $BB grep -q "action=anti_tether_set"; then
         set_lmehspt_var   "ANTI_TETHER" "0"
         ok_json "{\"ok\":true,\"anti_tether\":false}"
     fi
+fi
+
+# ================================================================
+# Portal themes
+#
+# A theme is a folder hotspot/themes/<id>/ holding theme.info (name, blurb,
+# swatch colours) and, for anything other than the stock look, theme.css —
+# see THEMES.md. hotspot/index.html loads the chosen theme's stylesheet from
+# /cgi-bin/portal_theme.sh as its OWN <link>, so a theme can only restyle the
+# page, never replace it, and the portal drops it again by itself if it ever
+# hides a control (same safety net as the custom CSS below, which still loads
+# AFTER the theme and so can tweak it).
+#
+# The choice is one line — the theme id — in hotspot_data/portal_theme. That
+# survives OTA / module reinstalls (they re-lay hotspot/, not hotspot_data/),
+# and is deliberately NOT a portal.env key: portal_set and the logo upload
+# rewrite portal.env from scratch, which would silently reset the theme.
+#
+#   GET  ?action=portal_theme_list  -> {ok,current,themes:[{id,name,description,
+#                                       author,license,swatch:["#rrggbb",..]}]}
+#   POST ?action=portal_theme_set   body: theme=<id>     ("default" = stock look)
+# ================================================================
+PTHEME_DIR="/lmepisowifi/hotspot/themes"
+PTHEME_SEL="$HDATA/portal_theme"
+
+# ptheme_usable ID — same test the portal applies (portal_config.sh /
+# portal_theme.sh), so the admin can never pick something that would render
+# as the stock look. "default" restyles nothing and is always available.
+ptheme_usable() {
+    case "$1" in ""|*[!a-z0-9_-]*) return 1 ;; esac
+    [ "${#1}" -le 32 ] || return 1
+    [ "$1" = "default" ] && return 0
+    [ -f "$PTHEME_DIR/$1/theme.info" ] && [ -f "$PTHEME_DIR/$1/theme.css" ]
+}
+
+# ptheme_raw — the saved id, sanitised but NOT checked against the folders.
+ptheme_raw() {
+    [ -f "$PTHEME_SEL" ] || return 0
+    $BB head -n1 "$PTHEME_SEL" 2>/dev/null | $BB tr -cd 'a-z0-9_-' | $BB cut -c1-32
+}
+
+# ptheme_field FILE KEY MAXLEN — one theme.info value, trimmed, control
+# characters dropped (esc_json is applied by the caller).
+ptheme_field() {
+    $BB sed -n "s/^$2=//p" "$1" 2>/dev/null | $BB head -n1 | $BB tr -d '\000-\037' \
+        | $BB cut -c1-"$3" | $BB sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# ptheme_swatch CSV — up to four #rgb / #rrggbb colours as a JSON array body.
+ptheme_swatch() {
+    printf '%s' "$1" | $BB tr ',' '\n' | $BB sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+        | $BB grep -E '^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$' | $BB head -n4 \
+        | $BB sed 's/.*/"&"/' | $BB tr '\n' ',' | $BB sed 's/,$//'
+}
+
+# ptheme_json ID — the list entry for one theme.
+ptheme_json() {
+    _pj_inf="$PTHEME_DIR/$1/theme.info"
+    _pj_name=""; _pj_desc=""; _pj_auth=""; _pj_lic=""; _pj_sw=""
+    if [ -f "$_pj_inf" ]; then
+        _pj_name=$(ptheme_field "$_pj_inf" name 40)
+        _pj_desc=$(ptheme_field "$_pj_inf" description 240)
+        _pj_auth=$(ptheme_field "$_pj_inf" author 40)
+        _pj_lic=$(ptheme_field "$_pj_inf" license 40)
+        _pj_sw=$(ptheme_swatch "$(ptheme_field "$_pj_inf" swatch 80)")
+    fi
+    [ -n "$_pj_name" ] || { [ "$1" = "default" ] && _pj_name="Default" || _pj_name="$1"; }
+    printf '{"id":"%s","name":"%s","description":"%s","author":"%s","license":"%s","swatch":[%s]}' \
+        "$1" "$(esc_json "$_pj_name")" "$(esc_json "$_pj_desc")" \
+        "$(esc_json "$_pj_auth")" "$(esc_json "$_pj_lic")" "$_pj_sw"
+}
+
+if echo "$QS" | $BB grep -q "action=portal_theme_list"; then
+    _pt_cur=$(ptheme_raw)
+    # legacy id (releases up to 1.5.70) -> current id, so the picker highlights
+    # the right card; "Use this theme" then rewrites the file with the new id
+    [ "$_pt_cur" = "pisofi" ] && _pt_cur="banner-classic"
+    ptheme_usable "$_pt_cur" || _pt_cur="default"
+    # Stock look first, then the rest alphabetically (the glob is sorted). A
+    # folder that is not a usable theme is skipped, so a half-copied theme
+    # simply does not show up until it is complete.
+    _pt_list=$(ptheme_json default)
+    for _pt_d in "$PTHEME_DIR"/*/; do
+        _pt_id="${_pt_d%/}"; _pt_id="${_pt_id##*/}"
+        [ "$_pt_id" = "default" ] && continue
+        ptheme_usable "$_pt_id" || continue
+        _pt_list="${_pt_list},$(ptheme_json "$_pt_id")"
+    done
+    ok_json "{\"ok\":true,\"current\":\"${_pt_cur}\",\"themes\":[${_pt_list}]}"
+fi
+
+if echo "$QS" | $BB grep -q "action=portal_theme_set"; then
+    read -n "$CONTENT_LENGTH" POST_DATA
+    # Theme ids are [a-z0-9_-] so there is nothing to url-decode: anything
+    # else (including a %-encoded id) fails ptheme_usable and is refused
+    # rather than being "cleaned" into some other theme's id.
+    _pt_new=$(printf '%s' "$POST_DATA" | $BB tr '&' '\n' | $BB sed -n 's/^theme=//p' | $BB head -n1 | $BB tr -d '\r\n')
+    ptheme_usable "$_pt_new" || err_json "no_such_theme"
+
+    if [ "$_pt_new" = "default" ]; then
+        # Removing the file (not writing "default" into it) means a stale or
+        # unusable leftover can never come back to life later, e.g. when an
+        # OTA brings that theme back.
+        rm -f "$PTHEME_SEL" 2>/dev/null
+        [ -e "$PTHEME_SEL" ] && err_json "write_failed"
+    elif [ "$(ptheme_raw)" != "$_pt_new" ]; then
+        # Only touch flash when the choice actually changes. Write beside the
+        # target and verify before it can replace anything.
+        mkdir -p "$HDATA" 2>/dev/null
+        { printf '%s\n' "$_pt_new" > "$PTHEME_SEL.tmp"; } 2>/dev/null
+        if [ "$($BB cat "$PTHEME_SEL.tmp" 2>/dev/null)" != "$_pt_new" ]; then
+            rm -f "$PTHEME_SEL.tmp" 2>/dev/null
+            err_json "write_failed"
+        fi
+        $BB mv -f "$PTHEME_SEL.tmp" "$PTHEME_SEL" 2>/dev/null || { rm -f "$PTHEME_SEL.tmp" 2>/dev/null; err_json "write_failed"; }
+    fi
+    ok_json "{\"ok\":true,\"theme\":\"${_pt_new}\"}"
 fi
 
 # ================================================================

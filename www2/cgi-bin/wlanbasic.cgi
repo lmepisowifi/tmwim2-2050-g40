@@ -98,6 +98,43 @@ json_esc() {
         | busybox sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# ── LME BSSID locking (custom MIB key) ───────────────────────────────────────
+# The SDK patch lme-bssid-locking.patch appends a LME_BSSID_LOCKING member
+# (BYTE6_T: 12 hex chars, all-zero = not locked) to every MBSSIB record and
+# makes setupWLan() + the driver honour it for the client-mode root (idx 0)
+# and the repeater/vxd (idx 5). Firmware built without that patch has no such
+# key, so the feature is detected by reading the key back: only a clean
+# 12-hex-digit value counts as "available". Every code path below (status
+# JSON, save_bssid_lock, sta_connect) goes through lme_lock_supported, so on
+# stock firmware the lock is hidden in the UI *and* inert in the backend.
+LME_BSSID_KEY="LME_BSSID_LOCKING"
+LME_LOCK_SUPPORTED=""          # "" = not probed yet, 1 = available, 0 = missing
+
+# lme_lock_get TBL_PFX IDX  → the stored lock as 12 lowercase hex chars, or
+# nothing at all when the key can't be read (missing / unparseable)
+lme_lock_get() {
+    _lv=$(mib_field "${1}.${2}.${LME_BSSID_KEY}" | busybox tr 'A-F' 'a-f')
+    case "$_lv" in
+        ""|*[!0-9a-f]*) return 0 ;;
+    esac
+    [ ${#_lv} -eq 12 ] && printf '%s' "$_lv"
+    return 0
+}
+
+# lme_lock_supported  → true when this firmware has LME_BSSID_LOCKING.
+# Probes once per request (idx 5 always exists: the table has 6 records).
+lme_lock_supported() {
+    if [ -z "$LME_LOCK_SUPPORTED" ]; then
+        if [ -n "$(lme_lock_get "$TBL_PFX" 5)" ]; then
+            LME_LOCK_SUPPORTED=1
+        else
+            LME_LOCK_SUPPORTED=0
+        fi
+        dbg "lme_lock_supported: ${TBL_PFX}.5.${LME_BSSID_KEY} -> $LME_LOCK_SUPPORTED"
+    fi
+    [ "$LME_LOCK_SUPPORTED" = "1" ]
+}
+
 get_ch_list() {
     AVAIL=$(busybox grep 'AVAIL_CH' /proc/${1}/mib_dfs 2>/dev/null \
         | busybox sed 's/.*AVAIL_CH:[[:space:]]*//' \
@@ -140,8 +177,15 @@ emit_vxd_status_json() {
     _bssdesc="/proc/${_vif}/mib_bssdesc"
     _authf="/proc/${_vif}/mib_auth"
 
-    _lock=$(mib_field "${_pfx}.5.prefer_bssid")
-    [ -z "$_lock" ] && _lock="000000000000"
+    # Lock comes from the custom LME_BSSID_LOCKING key; no readable key means
+    # the firmware lacks the feature, which the UI uses to hide the lock field.
+    _lock=$(lme_lock_get "$_pfx" 5)
+    if [ -n "$_lock" ]; then
+        _lsup=true
+    else
+        _lsup=false
+        _lock="000000000000"
+    fi
 
     _bssid=$(proc_field "$_bssdesc" "bssid")
     [ -z "$_bssid" ] && _bssid="000000000000"
@@ -161,9 +205,25 @@ emit_vxd_status_json() {
     _authtxt=$(auth_text "$_authst")
     [ -z "$_authst" ] && _authst=-1
 
-    printf '{"vxdIf":"%s","lockedBssid":"%s","connected":%s,"bssid":"%s","ssid":"%s","channel":%s,"rssi":%s,"sq":%s,"authStatus":%s,"authFinished":%s,"authText":"%s"}' \
-        "$(json_esc "$_vif")" "$_lock" "$_connected" "$_bssid" "$(json_esc "$_ssid")" \
+    printf '{"vxdIf":"%s","lockSupported":%s,"lockedBssid":"%s","connected":%s,"bssid":"%s","ssid":"%s","channel":%s,"rssi":%s,"sq":%s,"authStatus":%s,"authFinished":%s,"authText":"%s"}' \
+        "$(json_esc "$_vif")" "$_lsup" "$_lock" "$_connected" "$_bssid" "$(json_esc "$_ssid")" \
         "$_chan" "$_rssi" "$_sq" "$_authst" "$_authfin" "$(json_esc "$_authtxt")"
+}
+
+# ── Live radio state (what the driver is running RIGHT NOW) ─────────────────
+# The MIB channel is 0 in auto-channel mode, so the real operating channel has
+# to come from the driver: /proc/<if>/mib_rf "dot11channel" (ACS writes the
+# chosen channel back into it) and /proc/<if>/mib_11n "currBW(op)" (the
+# operating bandwidth: 20M / 40M / 80M / 160M / 80+80M).
+# live_radio_json WLAN_IF  → fragment: "curChannel":N,"curBw":N
+live_radio_json() {
+    _lr_if="$1"
+    _lr_ch=$(proc_field "/proc/${_lr_if}/mib_rf" "dot11channel")
+    case "$_lr_ch" in ''|*[!0-9]*) _lr_ch=0 ;; esac
+    _lr_bw=$(proc_field "/proc/${_lr_if}/mib_11n" "currBW(op)")
+    _lr_bw=${_lr_bw%%[!0-9]*}          # "40M" -> 40, "80+80M" -> 80
+    case "$_lr_bw" in ''|*[!0-9]*) _lr_bw=0 ;; esac
+    printf '"curChannel":%s,"curBw":%s' "$_lr_ch" "$_lr_bw"
 }
 
 # POST field helpers ─────────────────────────────────────────────────────────
@@ -279,6 +339,30 @@ wl_2ndch() {
     if [ "$2" = "0" ]; then printf '1'; else printf '2'; fi
 }
 
+# wl_mode_set IF WBD -> push an 802.11 mode into the driver exactly as the
+# vendor's setupWLan() does (subr_wlan.c): the MIB wlanBand code is NOT what the
+# driver gets.  The driver's `band` (net_work_type) keeps the legacy bits and
+# `deny_legacy` (legacySTADeny) is what turns them off for the "pure" modes:
+#   n only      5G: band 12 deny 4      2.4G: band 11 deny 3
+#   g only      band 3  deny 1
+#   g/n         band 11 deny 1
+#   ac only     band 76 deny 12
+#   n/ac        band 76 deny 4
+#   anything else (b, b/g, b/g/n, a, a/n, a/ac, a/n/ac): band = code, deny 0
+# wlan0 is the 5 GHz radio, wlan1 the 2.4 GHz one.
+wl_mode_set() {
+    case "$2" in
+        8)  if [ "$1" = "wlan0" ]; then _wm_b=12; _wm_d=4; else _wm_b=11; _wm_d=3; fi ;;
+        2)  _wm_b=3;  _wm_d=1  ;;
+        10) _wm_b=11; _wm_d=1  ;;
+        64) _wm_b=76; _wm_d=12 ;;
+        72) _wm_b=76; _wm_d=4  ;;
+        *)  _wm_b="$2"; _wm_d=0 ;;
+    esac
+    wl_set "$1" band "$_wm_b"
+    wl_set "$1" deny_legacy "$_wm_d"
+}
+
 # wl_bounce IF -> re-open a root interface so the driver re-reads its mib
 # (channel / width / sideband). VAP/VXD netdevs that were up are re-upped.
 wl_bounce() {
@@ -304,9 +388,7 @@ live_apply_ap() {
     _la_s="$1"; _la_a="$2"; _la_c="$3"; _la_w="$4"; _la_b="$5"; _la_m="$6"; _la_ps="$7"
     if [ "$LV_OWN" = "1" ]; then
         if [ "$LV_WBD" = "1" ] && [ -n "$_la_m" ]; then
-            if [ "$WLAN_IF" = "wlan0" ]; then _la_max=76; else _la_max=11; fi
-            wl_set "$WLAN_IF" band "$_la_m"
-            wl_set "$WLAN_IF" deny_legacy "$((_la_max - _la_m))"
+            wl_mode_set "$WLAN_IF" "$_la_m"
         fi
         if [ "$LV_CW" = "1" ] || { [ "$LV_CH" = "1" ] && [ "$_la_a" != "1" ]; }; then
             # width/sideband change or a manual channel move: write, re-open once
@@ -667,24 +749,6 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
         exit 0
     fi
 
-    # ── action=vxd_status: VXD (idx 5) BSSID lock + live connection/auth ──
-    if echo "$QUERY_STRING" | busybox grep -q "action=vxd_status"; then
-        dbg "GET vxd_status: band=$BAND vxd_if=$VXD_IF"
-        printf "Status: 200 OK\r\n"
-        printf "Content-Type: application/json\r\n\r\n"
-        emit_vxd_status_json "$VXD_IF" "$TBL_PFX"
-        exit 0
-    fi
-
-    # ── action=vxd_status: VXD (idx 5) BSSID lock + live connection/auth ──
-    if echo "$QUERY_STRING" | busybox grep -q "action=vxd_status"; then
-        dbg "GET vxd_status: band=$BAND vxd_if=$VXD_IF"
-        printf "Status: 200 OK\r\n"
-        printf "Content-Type: application/json\r\n\r\n"
-        emit_vxd_status_json "$VXD_IF" "$TBL_PFX"
-        exit 0
-    fi
-
     # ── action=status: return full per-band JSON ─────────────────────────────
     if echo "$QUERY_STRING" | busybox grep -q "action=status"; then
 
@@ -761,11 +825,17 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
 
             SE=$(json_esc "$SSID")
             PE=$(json_esc "$PSK")
+            # LME_BSSID_LOCKING is only consumed for the root (idx 0, client mode)
+            # and the repeater VXD (idx 5); empty when the key can't be read.
+            LKB=""
+            if [ "$I" = "0" ] || [ "$I" = "5" ]; then
+                LKB=$(lme_lock_get "$TBL_PFX" "$I")
+            fi
             if   [ "$I" = "0" ]; then TY="ap"
             elif [ "$I" = "5" ]; then TY="vxd"
             else                       TY="vap"
             fi
-            IFACES_J="${IFACES_J}${ISEP}{\"idx\":${I},\"type\":\"${TY}\",\"ssid\":\"${SE}\",\"disabled\":${DIS},\"wlanMode\":${WMOD},\"wlanBand\":${WBD},\"encrypt\":${ENC},\"unicastCipher\":${UC},\"wpa2UnicastCipher\":${U2C},\"psk\":\"${PE}\",\"wep\":${WEP},\"wepKeyType\":${WKT},\"wepDefaultKey\":${WDK},\"wepKey\":\"${WEPKEY}\",\"authType\":${AUTHTYPE}}"
+            IFACES_J="${IFACES_J}${ISEP}{\"idx\":${I},\"type\":\"${TY}\",\"ssid\":\"${SE}\",\"disabled\":${DIS},\"wlanMode\":${WMOD},\"wlanBand\":${WBD},\"encrypt\":${ENC},\"unicastCipher\":${UC},\"wpa2UnicastCipher\":${U2C},\"psk\":\"${PE}\",\"wep\":${WEP},\"wepKeyType\":${WKT},\"wepDefaultKey\":${WDK},\"wepKey\":\"${WEPKEY}\",\"authType\":${AUTHTYPE},\"lockedBssid\":\"${LKB}\"}"
             ISEP=","
             I=$((I + 1))
         done
@@ -800,12 +870,15 @@ if [ "$REQUEST_METHOD" = "GET" ]; then
             i=$((i + 1))
         done
 
-        dbg "GET status OK: band=$BAND ch=$CH cw=$CW pending=$PENDING"
+        if lme_lock_supported; then LOCKSUP=true; else LOCKSUP=false; fi
+
+        dbg "GET status OK: band=$BAND ch=$CH cw=$CW pending=$PENDING bssidLock=$LOCKSUP"
 
         printf "Status: 200 OK\r\n"
         printf "Content-Type: application/json\r\n\r\n"
-        printf '{"band":"%s","channel":%s,"autoChannel":%s,"channels":[%s],"channelwidth":%s,"controlband":%s,"txpower":%s,"ifaces":%s,"pending":%s,"remaining":%d}' \
-            "$BAND" "$CH" "$AC" "$CHLIST" "$CW" "$CB" "$TP" "$IFACES_J" "$PENDING" "$REMAINING"
+        LIVE_J=$(live_radio_json "$WLAN_IF")
+        printf '{"band":"%s","channel":%s,"autoChannel":%s,"channels":[%s],"channelwidth":%s,"controlband":%s,"txpower":%s,%s,"ifaces":%s,"pending":%s,"remaining":%d,"bssidLockSupported":%s}' \
+            "$BAND" "$CH" "$AC" "$CHLIST" "$CW" "$CB" "$TP" "$LIVE_J" "$IFACES_J" "$PENDING" "$REMAINING" "$LOCKSUP"
         exit 0
     fi
 
@@ -1283,17 +1356,11 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             ifconfig "$WLAN_IF" up
         elif [ "$WBD_AND_SSID_CHANGED" = "1" ]; then
             dbg "save_ap: 802.11 mode+SSID change ($RV_WBD -> $FORM_WBD, $RV_SSID -> $FORM_SSID), using iwpriv set_mib instead of wlan_apply restart"
-            if [ "$WLAN_IF" = "wlan0" ]; then WBD_MAX=76; else WBD_MAX=11; fi
-            WBD_DENY=$((WBD_MAX - FORM_WBD))
-            iwpriv "$WLAN_IF" set_mib "band=$FORM_WBD"
-            iwpriv "$WLAN_IF" set_mib "deny_legacy=$WBD_DENY"
+            wl_mode_set "$WLAN_IF" "$FORM_WBD"
             iwpriv "$WLAN_IF" set_mib "ssid=$FORM_SSID"
         elif [ "$ONLY_WBD_CHANGED" = "1" ]; then
             dbg "save_ap: 802.11 mode-only change ($RV_WBD -> $FORM_WBD), using iwpriv set_mib instead of wlan_apply restart"
-            if [ "$WLAN_IF" = "wlan0" ]; then WBD_MAX=76; else WBD_MAX=11; fi
-            WBD_DENY=$((WBD_MAX - FORM_WBD))
-            iwpriv "$WLAN_IF" set_mib "band=$FORM_WBD"
-            iwpriv "$WLAN_IF" set_mib "deny_legacy=$WBD_DENY"
+            wl_mode_set "$WLAN_IF" "$FORM_WBD"
         elif [ "$ONLY_SSID_CHANGED" = "1" ]; then
             dbg "save_ap: SSID-only change ($RV_SSID -> $FORM_SSID), using iwpriv set_mib instead of wlan_apply restart"
             iwpriv "$WLAN_IF" set_mib "ssid=$FORM_SSID"
@@ -1442,15 +1509,41 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         exit 0
     fi
 
-    # ── action=save_bssid_lock: pin/unpin VXD (idx 5) to one specific AP ──
-    # Body: bssid=<12 hex chars>  (empty or all-zero clears the lock)
-    # Writes dot11DesiredBssid (bssid2join) via WLAN_MBSSIB_TBL.5.prefer_bssid.
-    # NOTE: the driver's own join-candidate loop has a compile-time carve-out
-    # (SMART_REPEATER_MODE / SSFROM_REPEATER_VXD) that skips this BSSID check
-    # entirely for scans it tags as VXD-repeater-originated, so treat this as
-    # a preference the firmware is *supposed* to honor, not a hard guarantee —
-    # verify empirically if a same-SSID neighbor AP exists nearby.
+    # ── action=save_bssid_lock: pin/unpin the uplink client to one specific AP ──
+    # Query: idx=0 (the root, while it is in Client / WDS mode) or idx=5 (the
+    #        repeater VXD, the default when idx is absent)
+    # Body:  bssid=<12 hex chars>  (empty or all-zero clears the lock)
+    # Writes the custom LME_BSSID_LOCKING key (WLAN[1]_MBSSIB_TBL.<idx>.*), which
+    # the patched setupWLan() feeds to the driver as dot11DesiredBssid
+    # (bssid2join); all-zero is "not locked" and is also what removes a lock
+    # applied by an earlier setupWLan(). The key is ignored for idx 0 outside
+    # Client mode and for idx 5 while the root is the client.
+    # Only available on firmware that has the key (lme-bssid-locking.patch):
+    # anywhere else this answers 501 and writes nothing.
     if [ "$ACTION" = "save_bssid_lock" ]; then
+        if ! lme_lock_supported; then
+            dbg "save_bssid_lock: ${LME_BSSID_KEY} not available on this firmware"
+            printf "Status: 501 Not Implemented\r\n"
+            printf "Content-Type: text/plain\r\n\r\n"
+            printf "BSSID locking is not supported by this firmware"
+            exit 0
+        fi
+
+        LK_IDX=$(echo "$QUERY_STRING" \
+            | busybox sed -n 's/.*idx=\([^&]*\).*/\1/p' \
+            | busybox tr -d '\r\n')
+        case "$LK_IDX" in
+            "") LK_IDX=5 ;;
+            0|5) ;;
+            *)
+                dbg "WARN save_bssid_lock: invalid index '$LK_IDX'"
+                printf "Status: 400 Bad Request\r\n"
+                printf "Content-Type: text/plain\r\n\r\n"
+                printf "BSSID lock only applies to the client (0) or VXD (5) interface"
+                exit 0
+                ;;
+        esac
+
         RAW_BSSID=$(pd_str bssid)
         BSSID=$(printf '%s' "$RAW_BSSID" | busybox tr 'A-Z' 'a-z' | busybox sed 's/[^0-9a-f]//g')
 
@@ -1464,13 +1557,17 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             exit 0
         fi
 
-        mib set "${TBL_PFX}.5.prefer_bssid" "$BSSID"
+        mib set "${TBL_PFX}.${LK_IDX}.${LME_BSSID_KEY}" "$BSSID"
         mib commit
-        dbg "save_bssid_lock: band=$BAND ${TBL_PFX}.5.prefer_bssid=$BSSID"
+        dbg "save_bssid_lock: band=$BAND ${TBL_PFX}.${LK_IDX}.${LME_BSSID_KEY}=$BSSID"
 
-        wlan_apply restart
-        dbg "save_bssid_lock: also restarting multi-ap agent service"
-        sysconf multi_ap_agent_restart
+        # Restart only what consumes the key (same as sta_connect): the VXD on
+        # its own, or the whole band when the root itself is the client.
+        wl_restart_scoped "$BAND" "$LK_IDX"
+        if [ "$LK_IDX" = "5" ]; then
+            dbg "save_bssid_lock idx=5: also restarting multi-ap agent service"
+            sysconf multi_ap_agent_restart
+        fi
 
         printf "Status: 200 OK\r\n"
         printf "Content-Type: text/plain\r\n\r\n"
@@ -1815,8 +1912,8 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     # Used by both the Site Survey "Connect" button (scanned AP) and "Connect
     # Manually" (hand-typed SSID/security, no scan result required). Writes
     # the target network's SSID + security onto the band's client-capable
-    # interface, optionally pins prefer_bssid (see save_bssid_lock), then
-    # applies.
+    # interface, optionally pins LME_BSSID_LOCKING (see save_bssid_lock; only
+    # when the firmware has that key), then applies.
     if [ "$ACTION" = "sta_connect" ]; then
         FORM_SSID=$(pd_str ssid)
         FORM_ENC=$(pd_int  encrypt           0)
@@ -1850,15 +1947,23 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             exit 0
         fi
 
-        # Optional BSSID pin: empty clears any existing lock, else must be a
-        # full 12 hex-char MAC (same rule as action=save_bssid_lock)
-        if [ -z "$FORM_BSSID" ]; then
+        # Optional BSSID pin: empty / all-zero clears any existing lock, else
+        # must be a full 12 hex-char MAC (same rule as action=save_bssid_lock).
+        # A real pin on firmware without LME_BSSID_LOCKING is refused rather
+        # than silently connecting unlocked.
+        if [ -z "$FORM_BSSID" ] || [ "$FORM_BSSID" = "000000000000" ]; then
             FORM_BSSID="000000000000"
         elif [ ${#FORM_BSSID} -ne 12 ]; then
             dbg "WARN sta_connect: invalid bssid '$FORM_BSSID_RAW' (len ${#FORM_BSSID})"
             printf "Status: 400 Bad Request\r\n"
             printf "Content-Type: text/plain\r\n\r\n"
             printf "BSSID must be 12 hex characters (or empty)"
+            exit 0
+        elif ! lme_lock_supported; then
+            dbg "WARN sta_connect: bssid pin requested but ${LME_BSSID_KEY} not available"
+            printf "Status: 501 Not Implemented\r\n"
+            printf "Content-Type: text/plain\r\n\r\n"
+            printf "BSSID locking is not supported by this firmware"
             exit 0
         fi
 
@@ -1933,7 +2038,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         # Point the interface at the target network
         mib set "${TBL_PFX}.${IDX}.ssid"          "$FORM_SSID"
         mib set "${TBL_PFX}.${IDX}.encrypt"       "$FORM_ENC"
-        mib set "${TBL_PFX}.${IDX}.prefer_bssid"  "$FORM_BSSID"
+        # Always resent (the pin, or all-zero) so an unrelated connect can't
+        # leave a stale lock behind. Valid for idx 5 and for idx 0 in client
+        # mode, which is exactly what the patched setupWLan() consumes.
+        if lme_lock_supported; then
+            mib set "${TBL_PFX}.${IDX}.${LME_BSSID_KEY}" "$FORM_BSSID"
+        fi
         if [ "$FORM_ENC" = "1" ]; then
             mib set "${TBL_PFX}.${IDX}.wep"           "$FORM_WEP"
             mib set "${TBL_PFX}.${IDX}.wepKeyType"    "$FORM_WKT"
@@ -1965,8 +2075,19 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         fi
         mib commit
 
-        dbg "sta_connect: launching wlan_apply restart"
-        wlan_apply restart
+        # Apply. Joining a different network can't be done with iwpriv alone:
+        # set_mib ssid= only stores the desired SSID (nothing re-scans or
+        # re-joins), and the new key / cipher / PMF mode have to reach the
+        # client's auth setup, which is built when the interface is started.
+        # So restart only what changed - the VXD (idx 5) on its own, or the
+        # whole band when the root itself is the client (idx 0) - through
+        # wlanapply, instead of `wlan_apply restart` (both radios + every
+        # SSID, which also drops the admin's own WiFi on the other band).
+        # wl_restart_scoped falls back to the stock restart if wlanapply is
+        # missing or fails. Always restarted, even when nothing differs: a
+        # repeated Connect is how a failed join gets retried.
+        dbg "sta_connect: applying band=$BAND idx=$IDX with a scoped restart"
+        wl_restart_scoped "$BAND" "$IDX"
         if [ "$IDX" = "5" ]; then
             dbg "sta_connect idx=5: also restarting multi-ap agent service"
             sysconf multi_ap_agent_restart

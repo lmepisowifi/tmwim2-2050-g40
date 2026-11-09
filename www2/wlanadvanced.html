@@ -14,6 +14,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="/js/theme.js?v=1.0.0"></script>
     <link href="/css/bootstrap.min.css?v=1.0.0" rel="stylesheet">
     <link href="/css/style.css?v=1.0.0" rel="stylesheet">
     <style>
@@ -22,20 +23,20 @@
             width: 46px;
             height: 26px;
             border-radius: 13px;
-            background: #444;
+            background: var(--lme-toggle-off, #444);
             position: relative;
             cursor: pointer;
             transition: background 0.25s;
             flex-shrink: 0;
         }
-        .wlan-toggle.on { background: #ffffff; }
+        .wlan-toggle.on { background: var(--lme-toggle-on, #ffffff); }
         .wlan-toggle.disabled-ui { opacity: 0.4; pointer-events: none; }
         .wlan-toggle-knob {
             position: absolute;
             width: 18px;
             height: 18px;
             border-radius: 50%;
-            background: #fff;
+            background: var(--lme-toggle-knob, #fff);
             top: 4px;
             left: 4px;
             transition: left 0.25s, background 0.25s, box-shadow 0.25s;
@@ -43,7 +44,7 @@
         }
         .wlan-toggle.on .wlan-toggle-knob {
             left: 24px;
-            background: #555;
+            background: var(--lme-toggle-knob-on, #555);
             box-shadow: 0 1px 4px rgba(0,0,0,0.3);
         }
 
@@ -126,9 +127,9 @@
             letter-spacing: 0.06em; text-transform: uppercase;
             white-space: nowrap; flex-shrink: 0;
         }
-        .mode-badge.ap  { background: rgba(255,255,255,0.10); color: #c8c8c8; }
-        .mode-badge.vap { background: rgba(120,200,120,0.13); color: #7ac87a; }
-        .mode-badge.vxd { background: rgba(80,180,255,0.13);  color: #64b4ff; }
+        .mode-badge.ap  { background: var(--lme-tint-3, rgba(255,255,255,0.10)); color: var(--text-soft, #c8c8c8); }
+        .mode-badge.vap { background: rgba(120,200,120,0.13); color: var(--lme-ok, #7ac87a); }
+        .mode-badge.vxd { background: rgba(80,180,255,0.13);  color: var(--lme-info, #64b4ff); }
 
         /* ---- Note text under a control ---- */
         .field-note {
@@ -195,13 +196,45 @@
                 <div class="setting-row" style="align-items:flex-start;">
                     <div style="flex:1; margin-right:8px;">
                         <div class="setting-label">Preferred band</div>
-                        <div class="setting-desc">Nudges dual-band clients toward one radio. Global — applies to 2.4 GHz and 5 GHz together.</div>
+                        <div class="setting-desc">Nudges dual-band clients toward one radio. Global — applies to 2.4 GHz and 5 GHz together. Applying restarts both radios, and only if the setting changed.</div>
                     </div>
-                    <select id="bandsteer-sel" class="form-select form-select-sm" style="max-width:190px;">
+                    <select id="bandsteer-sel" class="form-select form-select-sm" style="max-width:190px;" onchange="updateRssiLabels()">
                         <option value="0">Disabled</option>
                         <option value="1">Enabled — 5 GHz preferred</option>
                         <option value="3">Enabled — 2.4 GHz preferred</option>
                     </select>
+                </div>
+                <div class="section-divider mb-0"></div>
+
+                <!-- RSSI thresholds (MIB_STACTRL_PARAM_6 / _1 — same two values as the vendor Boa page).
+                     Labels follow the preferred band; see updateRssiLabels(). -->
+                <div class="setting-row" style="align-items:flex-start;">
+                    <div style="flex:1;margin-right:12px;">
+                        <div class="setting-label mb-1" id="bs-rssi-o-label">2.4 GHz → 5 GHz RSSI</div>
+                        <div class="input-group input-group-sm rate-input">
+                            <input type="number" class="form-control bs-rssi-input" id="bs-rssi-o"
+                                   min="-95" max="0" step="1" value="-60" placeholder="-60">
+                            <span class="input-group-text">dBm</span>
+                        </div>
+                        <div class="setting-desc mt-1" id="bs-rssi-o-desc"></div>
+                    </div>
+                    <div style="flex:1;">
+                        <div class="setting-label mb-1" id="bs-rssi-p-label">5 GHz → 2.4 GHz RSSI</div>
+                        <div class="input-group input-group-sm rate-input">
+                            <input type="number" class="form-control bs-rssi-input" id="bs-rssi-p"
+                                   min="-95" max="0" step="1" value="-75" placeholder="-75">
+                            <span class="input-group-text">dBm</span>
+                        </div>
+                        <div class="setting-desc mt-1" id="bs-rssi-p-desc"></div>
+                    </div>
+                </div>
+                <div class="field-note">
+                    −95 to 0 dBm; closer to 0 means a stronger signal. Defaults: −60 and −75.
+                    Changing only these values applies instantly, with no WiFi restart.
+                </div>
+                <!-- Shown only when this firmware build has no RSSI threshold keys -->
+                <div class="field-note" id="bs-rssi-unsupported-note" style="display:none;">
+                    ⚠️ This firmware build doesn't expose the band-steering RSSI thresholds.
                 </div>
                 <!-- Shown only when Unified SSID is OFF: band steering is unavailable -->
                 <div class="field-note" id="bandsteer-locked-note" style="display:none;">
@@ -210,7 +243,7 @@
                 </div>
                 <div class="mt-3">
                     <button type="button" class="btn btn-primary w-100" id="bandsteer-save-btn"
-                            onclick="saveBandSteering()">Save</button>
+                            onclick="saveBandSteering()">Apply</button>
                 </div>
             </div>
         </div>
@@ -225,7 +258,7 @@
                 <div class="setting-row" style="align-items:flex-start;">
                     <div style="flex:1; margin-right:8px;">
                         <div class="setting-label">Domain</div>
-                        <div class="setting-desc">Sets the allowed channels and TX power limits for 2.4 GHz and 5 GHz together. Pick the domain that matches where this router is used. Applying restarts WiFi on both radios.</div>
+                        <div class="setting-desc">Sets the allowed channels and TX power limits for 2.4 GHz and 5 GHz together. Pick the domain that matches where this router is used. Applying restarts only the radio(s) whose domain changes.</div>
                     </div>
                     <select id="regdomain-sel" class="form-select form-select-sm" style="max-width:190px;">
                         <option value="" disabled hidden>Unknown</option>
@@ -384,7 +417,7 @@
             if (bandSel) bandSel.disabled = !enabled;
             document.querySelectorAll(
                 '#ifaces-container input, #ifaces-container select, #ifaces-container button, ' +
-                '#card-bandsteer select, #card-bandsteer button, ' +
+                '#card-bandsteer select, #card-bandsteer input, #card-bandsteer button, ' +
                 '#card-regdomain select, #card-regdomain button'
             ).forEach(el => { el.disabled = !enabled; });
             document.querySelectorAll('#ifaces-container .wlan-toggle')
@@ -392,6 +425,38 @@
             // Band steering stays locked whenever Unified SSID is off, even
             // once the rest of the form is re-enabled after a load.
             if (enabled) applyBandSteerGating();
+        }
+
+        // --------------------------------------------------------
+        // Band steering RSSI thresholds
+        // --------------------------------------------------------
+        // The driver's two thresholds are defined relative to the PREFERRED band,
+        // not to a fixed radio: stactrl_param_1 (bs-rssi-p) is the level at or
+        // below which a client on the preferred band is moved to the other band,
+        // stactrl_param_6 (bs-rssi-o) the level above which a client on the other
+        // band is moved back. So the band names in the labels follow the
+        // "Preferred band" dropdown (with 5 GHz shown while steering is off).
+        function updateRssiLabels() {
+            const sel  = document.getElementById('bandsteer-sel');
+            const p24  = !!sel && sel.value === '3';
+            const pref = p24 ? '2.4 GHz' : '5 GHz';
+            const oth  = p24 ? '5 GHz'   : '2.4 GHz';
+            const set  = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
+            set('bs-rssi-o-label', oth + ' → ' + pref + ' RSSI');
+            set('bs-rssi-o-desc',  'A ' + oth + ' client moves to ' + pref + ' when its signal is stronger than this.');
+            set('bs-rssi-p-label', pref + ' → ' + oth + ' RSSI');
+            set('bs-rssi-p-desc',  'A ' + pref + ' client moves to ' + oth + ' when its signal is at or below this.');
+        }
+
+        // Whole dBm number in -95..0, or null. (-95, not Boa's -100: the driver
+        // subtracts a 5-point tolerance in unsigned arithmetic, so a lower value
+        // would wrap around.)
+        function readRssi(id) {
+            const el = document.getElementById(id);
+            const raw = el ? el.value.trim() : '';
+            if (!/^-?\d{1,3}$/.test(raw)) return null;
+            const n = parseInt(raw, 10);
+            return (n >= -95 && n <= 0) ? n : null;
         }
 
         // --------------------------------------------------------
@@ -403,6 +468,13 @@
             const btn  = document.getElementById('bandsteer-save-btn');
             const note = document.getElementById('bandsteer-locked-note');
             if (!sel || !btn || !note) return;
+            // RSSI thresholds need Unified SSID (same as steering itself) and a
+            // firmware build that actually has the keys.
+            const rssiOk = !!(currentStatus && currentStatus.rssi_supported === 1);
+            document.querySelectorAll('#card-bandsteer .bs-rssi-input')
+                .forEach(el => { el.disabled = !(unified && rssiOk); });
+            const rssiNote = document.getElementById('bs-rssi-unsupported-note');
+            if (rssiNote) rssiNote.style.display = rssiOk ? 'none' : 'block';
             if (unified) {
                 sel.disabled = false;
                 btn.disabled = false;
@@ -644,7 +716,7 @@
                                     title="Apply without restarting the WLAN"
                                     onclick="saveAdvanced(${iface.idx}, true)">Apply</button>
                         </div>
-                        <div style="font-size:11px; color:#888; margin-top:6px;">
+                        <div style="font-size:11px; color:var(--text-muted, #888); margin-top:6px;">
                             <b>Apply</b> applies TX beamforming, multicast-to-unicast and short GI with
                             <code>iwpriv</code> &mdash; no restart. Other changes restart only this
                             ${iface.idx === 0 ? 'radio' : 'SSID'}, not both radios.
@@ -685,6 +757,13 @@
             if (bsSel && currentStatus) {
                 bsSel.value = String(currentStatus.band_steering ?? 0);
             }
+            const rsP = document.getElementById('bs-rssi-p');
+            const rsO = document.getElementById('bs-rssi-o');
+            if (rsP && rsO && currentStatus) {
+                rsP.value = String(currentStatus.rssi_prefer ?? -75);
+                rsO.value = String(currentStatus.rssi_nonprefer ?? -60);
+            }
+            updateRssiLabels();
 
             // Regulatory domain is global too (HW_WLAN0 = 5 GHz, HW_WLAN1 = 2.4 GHz).
             const rdSel  = document.getElementById('regdomain-sel');
@@ -881,6 +960,49 @@
         }
 
         // --------------------------------------------------------
+        // Apply a global (both-radio) setting: band steering, regulatory domain.
+        // Neither can be applied live, so the CGI restarts only what changed via
+        // wlanapply. It answers "NOCHANGE" (nothing restarted) when the value is
+        // already set, and a 4xx before touching anything for an invalid value;
+        // both skip the poll. There is no revert timer for these (a valid value
+        // cannot lock the admin out), so no countdown overlay either.
+        // --------------------------------------------------------
+        function applyGlobal(postUrl, body) {
+            setFormEnabled(false);
+            showOverlay('Applying.');
+            let aborted  = false;
+            let noChange = false;
+            fetch(postUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body
+            })
+            .then(r => {
+                if (r && !r.ok) { aborted = true; return r.text().then(t => { throw new Error(t || ('HTTP ' + r.status)); }); }
+                return r.text().then(t => { noChange = (t || '').trim() === 'NOCHANGE'; });
+            })
+            .then(() => {
+                if (noChange) {
+                    hideOverlay();
+                    setFormEnabled(true);
+                    toastr["info"]('Already set. Nothing was restarted.', "No change");
+                } else {
+                    setTimeout(() => pollUntilBack(), 1500);
+                }
+            })
+            .catch(err => {
+                if (aborted) {
+                    hideOverlay();
+                    setFormEnabled(true);
+                    toastr["warning"](err.message || 'Apply failed', "Error");
+                } else {
+                    // expected connection drop while the radio restarts
+                    setTimeout(() => pollUntilBack(), 3000);
+                }
+            });
+        }
+
+        // --------------------------------------------------------
         // Save global band steering (WIFI_STA_CONTROL — both radios)
         // --------------------------------------------------------
         function saveBandSteering() {
@@ -891,19 +1013,53 @@
                 applyBandSteerGating();
                 return;
             }
-            const body    = 'band_steering=' + encodeURIComponent(val);
+            let body = 'band_steering=' + encodeURIComponent(val);
+
+            // RSSI thresholds travel with the mode (the CGI validates both
+            // before writing either). Skipped when the build doesn't have them.
+            const rssiOn = !!(currentStatus && currentStatus.rssi_supported === 1);
+            let rp = null, ro = null;
+            if (rssiOn) {
+                rp = readRssi('bs-rssi-p');
+                ro = readRssi('bs-rssi-o');
+                if (rp === null || ro === null) {
+                    toastr["warning"]('Enter whole-number RSSI values from -95 to 0 dBm.', "Invalid RSSI");
+                    return;
+                }
+                body += '&rssi_prefer=' + rp + '&rssi_nonprefer=' + ro;
+            }
             const postUrl = CGI + '?band=' + currentBand + '&action=save_bandsteer';
 
-            setFormEnabled(false);
-            // Applying band steering restarts WiFi on both radios, so reuse the
-            // same countdown + poll-until-back flow as a live per-interface save.
-            startCountdown();
-            fetch(postUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: body
-            }).catch(() => {});
-            setTimeout(() => pollUntilBack(), 4000);
+            // Only the thresholds changed: the CGI applies them live with no WiFi
+            // restart, so skip the restart countdown and just wait for the reply.
+            const modeChanged = !currentStatus || String(currentStatus.band_steering ?? 0) !== val;
+            if (rssiOn && !modeChanged) {
+                setFormEnabled(false);
+                fetch(postUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body
+                })
+                .then(r => r.text().then(t => {
+                    if (!r.ok) throw new Error(t || ('HTTP ' + r.status));
+                }))
+                .then(() => {
+                    currentStatus.rssi_prefer = rp;
+                    currentStatus.rssi_nonprefer = ro;
+                    setFormEnabled(true);
+                    toastr["success"]('RSSI thresholds applied.', "Band Steering");
+                })
+                .catch(err => {
+                    setFormEnabled(true);
+                    toastr["warning"](err.message || 'Apply failed', "Error");
+                });
+                return;
+            }
+
+            // Mode change: WiFi restarts on both radios; applyGlobal runs the
+            // countdown + poll-until-back flow and surfaces a fast 4xx (e.g. an
+            // invalid RSSI) without polling.
+            applyGlobal(postUrl, body);
         }
 
         // --------------------------------------------------------
@@ -918,36 +1074,13 @@
             }
             const label = sel.options[sel.selectedIndex].textContent;
             if (!confirm('Set the regulatory domain to ' + label + '?\n\n' +
-                         'WiFi restarts on both radios, and the allowed channels and TX power ' +
-                         'follow the new domain. Use the domain that matches where this router operates.')) {
+                         'WiFi restarts on the radio(s) whose domain changes, and the allowed channels ' +
+                         'and TX power follow the new domain. Use the domain that matches where this router operates.')) {
                 return;
             }
             const body    = 'regdomain=' + encodeURIComponent(val);
             const postUrl = CGI + '?band=' + currentBand + '&action=save_regdomain';
-
-            setFormEnabled(false);
-            // Applying restarts WiFi on both radios: same countdown + poll-until-back
-            // flow as band steering. A fast 4xx (invalid value) returns before any
-            // restart, so surface it and skip the poll.
-            let aborted = false;
-            startCountdown();
-            fetch(postUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: body
-            })
-            .then(r => {
-                if (r && !r.ok) { aborted = true; return r.text().then(t => { throw new Error(t || ('HTTP ' + r.status)); }); }
-            })
-            .catch(err => {
-                if (aborted) {
-                    hideOverlay();
-                    setFormEnabled(true);
-                    toastr["warning"](err.message || 'Apply failed', "Error");
-                }
-                // else: expected connection drop during restart — ignore
-            });
-            setTimeout(() => { if (!aborted) pollUntilBack(); }, 4000);
+            applyGlobal(postUrl, body);
         }
 
         // --------------------------------------------------------
